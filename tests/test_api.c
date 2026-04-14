@@ -540,6 +540,41 @@ static void test_create_review_invalid_rating(void) {
     PASS();
 }
 
+static void test_booking_access_control(void) {
+    /* 未認証で GET /bookings/:id → 401 */
+    char url[300];
+    snprintf(url, sizeof(url), "%s/api/v1/bookings/%s", BASE_URL, g_booking_id);
+    Resp r = http_get(url);
+    ASSERT(r.status == 401, "no auth → 401");
+    resp_free(&r);
+
+    /* hanako が taro の予約を取得しようとする → 403 */
+    Resp r2 = http_get_auth(url, g_token2);
+    ASSERT(r2.status == 403, "other user → 403");
+    resp_free(&r2);
+
+    /* taro 自身は取得できる */
+    Resp r3 = http_get_auth(url, g_token);
+    ASSERT(r3.status == 200, "owner → 200");
+    resp_free(&r3);
+    PASS();
+}
+
+static void test_booking_list_access_control(void) {
+    /* 未認証で GET /users/1/bookings → 401 */
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/v1/users/1/bookings", BASE_URL);
+    Resp r = http_get(url);
+    ASSERT(r.status == 401, "no auth → 401");
+    resp_free(&r);
+
+    /* hanako が taro の予約一覧を取得しようとする → 403 */
+    Resp r2 = http_get_auth(url, g_token2);
+    ASSERT(r2.status == 403, "other user → 403");
+    resp_free(&r2);
+    PASS();
+}
+
 static void test_search_keyword(void) {
     char url[256];
     /* q=ダイビング URL-encoded */
@@ -916,6 +951,9 @@ int main(void) {
     test_create_bookmark();
     test_list_user_bookmarks();
     test_delete_bookmark();
+    /* ── アクセス制御 ── */
+    test_booking_access_control();
+    test_booking_list_access_control();
 
     kill(pid, 15);
 

@@ -19,8 +19,10 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     /* IP ベースレート制限 */
     char client_ip[48] = {0};
     mg_snprintf(client_ip, sizeof(client_ip), "%M", mg_print_ip, &c->rem);
-    int is_auth_ep = (strncmp(hm->uri.buf, "/api/v1/auth", 12) == 0 ||
-                      strncmp(hm->uri.buf, "/api/v1/users", 13) == 0);
+    /* auth/registration endpoints get strict limit; /users/:id/... uses general limit */
+    int uri_is_users_exact = (strncmp(hm->uri.buf, "/api/v1/users", 13) == 0 &&
+                               (hm->uri.len <= 13 || hm->uri.buf[13] != '/'));
+    int is_auth_ep = (strncmp(hm->uri.buf, "/api/v1/auth", 12) == 0 || uri_is_users_exact);
     if (rate_check(client_ip, is_auth_ep)) {
         mg_http_reply(c, 429, "Content-Type: application/json\r\n",
                       "{\"error\":\"リクエスト数が多すぎます。しばらく経ってから再試行してください\"}");

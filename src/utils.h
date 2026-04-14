@@ -13,7 +13,7 @@ int  verify_password(const char *password, const char *stored_hash);
 char *str_lower(char *s);               /* in-place lowercase */
 int   str_starts_with(const char *s, const char *prefix);
 
-/* JWT (HS256) ― CommonCrypto/CommonHMAC.h 使用
+/* JWT (HS256) ― platform.h 経由で HMAC-SHA256 を使用
    jwt_create: malloc で確保したトークン文字列を返す。呼び出し元が free() すること。
    jwt_verify: user_id を返す。無効/期限切れなら -1 */
 char *jwt_create(long user_id, const char *secret);

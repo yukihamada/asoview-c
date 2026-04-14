@@ -3,7 +3,7 @@
 > 体験・アクティビティ予約サービスの REST API — C11 シングルバイナリ
 
 ![Language](https://img.shields.io/badge/language-C11-blue)
-![Tests](https://img.shields.io/badge/tests-41%2F41%20pass-brightgreen)
+![Tests](https://img.shields.io/badge/tests-44%2F44%20pass-brightgreen)
 ![CI](https://github.com/yukihamada/asoview-c/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
@@ -60,7 +60,7 @@ docker run -p 3001:3001 -v $(pwd)/data:/data asoview-c
 
 ```bash
 make test
-# === 結果: 41 passed, 0 failed ===
+# === 結果: 44 passed, 0 failed ===
 ```
 
 ---
@@ -255,7 +255,7 @@ asoview-c/
 │   ├── mongoose.c/h    # HTTP サーバー
 │   └── cJSON.c/h       # JSON
 ├── tests/
-│   └── test_api.c      # 統合テスト（41 ケース）
+│   └── test_api.c      # 統合テスト（44 ケース）
 ├── migrations/
 │   └── schema.sql      # DB スキーマ
 ├── .github/
