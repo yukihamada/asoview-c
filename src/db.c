@@ -34,6 +34,10 @@ sqlite3 *db_open(const char *path) {
         sqlite3_close(db);
         return NULL;
     }
+    /* 既存 DB への後方互換マイグレーション（列が既にある場合は無視） */
+    sqlite3_exec(db,
+        "ALTER TABLE bookings ADD COLUMN stripe_payment_intent_id TEXT",
+        NULL, NULL, NULL);
     return db;
 }
 

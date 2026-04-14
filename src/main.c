@@ -96,6 +96,9 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (strcmp(uri, "/api/v1/search") == 0) {
         if (IS_GET) handle_search(c, hm, db);
 
+    } else if (strcmp(uri, "/api/v1/webhooks/stripe") == 0) {
+        if (IS_POST) handle_stripe_webhook(c, hm, db);
+
     /* Admin endpoints: /api/v1/admin/ ──────────────────────── */
     } else if (strcmp(uri, "/api/v1/admin/venues") == 0) {
         if (IS_POST) handle_admin_create_venue(c, hm, db);

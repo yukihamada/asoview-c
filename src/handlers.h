@@ -28,3 +28,4 @@ void handle_list_plan_reviews(struct mg_connection *c, struct mg_http_message *h
 void handle_list_venue_plans (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db, long venue_id);
 void handle_get_user         (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db, long id);
 void handle_update_user      (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db, long id);
+void handle_stripe_webhook   (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db);

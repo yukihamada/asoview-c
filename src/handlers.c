@@ -1,5 +1,6 @@
 #include "handlers.h"
 #include "utils.h"
+#include "stripe.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -683,17 +684,22 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
     char booking_id[37];
     generate_uuid(booking_id);
 
+    /* STRIPE_SECRET_KEY が設定されていれば pending_payment で作成 */
+    const char *stripe_sk = getenv("STRIPE_SECRET_KEY");
+    const char *init_status = (stripe_sk && *stripe_sk) ? "pending_payment" : "confirmed";
+
     sqlite3_stmt *ins;
     sqlite3_prepare_v2(db,
         "INSERT INTO bookings(id,user_id,plan_id,schedule_id,status,total_price,note)"
-        " VALUES(?,?,?,?,'confirmed',?,?)",
+        " VALUES(?,?,?,?,?,?,?)",
         -1, &ins, NULL);
-    sqlite3_bind_text(ins, 1, booking_id, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(ins, 2, auth_uid);   /* JWT から取得した user_id を使用 */
+    sqlite3_bind_text(ins, 1, booking_id,   -1, SQLITE_STATIC);
+    sqlite3_bind_int64(ins, 2, auth_uid);
     sqlite3_bind_int64(ins, 3, plan_id);
     sqlite3_bind_int64(ins, 4, sched_id);
-    sqlite3_bind_int64(ins, 5, total_price);
-    sqlite3_bind_text(ins, 6, note ? note : "", -1, SQLITE_STATIC);
+    sqlite3_bind_text(ins, 5, init_status,  -1, SQLITE_STATIC);
+    sqlite3_bind_int64(ins, 6, total_price);
+    sqlite3_bind_text(ins, 7, note ? note : "", -1, SQLITE_STATIC);
     int rc = sqlite3_step(ins);
     sqlite3_finalize(ins);
 
@@ -718,6 +724,37 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
         sqlite3_finalize(pi);
     }
     cJSON_Delete(body);
+
+    /* Stripe PaymentIntent 作成 */
+    char pi_id[128]         = {0};
+    char client_secret[256] = {0};
+    int stripe_ok = 0;
+    if (stripe_sk && *stripe_sk) {
+        if (stripe_create_payment_intent(total_price, booking_id,
+                                         pi_id, sizeof(pi_id),
+                                         client_secret, sizeof(client_secret)) == 0) {
+            /* booking に stripe_payment_intent_id を保存 */
+            sqlite3_stmt *upd;
+            sqlite3_prepare_v2(db,
+                "UPDATE bookings SET stripe_payment_intent_id=? WHERE id=?",
+                -1, &upd, NULL);
+            sqlite3_bind_text(upd, 1, pi_id,      -1, SQLITE_STATIC);
+            sqlite3_bind_text(upd, 2, booking_id, -1, SQLITE_STATIC);
+            sqlite3_step(upd);
+            sqlite3_finalize(upd);
+            stripe_ok = 1;
+        } else {
+            /* Stripe 呼び出し失敗 → booking を削除してエラーを返す */
+            sqlite3_stmt *del;
+            sqlite3_prepare_v2(db,
+                "DELETE FROM bookings WHERE id=?", -1, &del, NULL);
+            sqlite3_bind_text(del, 1, booking_id, -1, SQLITE_STATIC);
+            sqlite3_step(del);
+            sqlite3_finalize(del);
+            send_error_json(c, 502, "Stripe への接続に失敗しました");
+            return;
+        }
+    }
 
     /* 返却 */
     sqlite3_stmt *sel;
@@ -746,6 +783,11 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
         else cJSON_AddNullToObject(bk, "note");
         cJSON_AddStringToObject(bk, "created_at",(const char*)sqlite3_column_text(sel, 10));
         cJSON_AddItemToObject(bk, "participants", fetch_participants(db, bid));
+        /* Stripe client_secret をレスポンスに含める */
+        if (stripe_ok && client_secret[0]) {
+            cJSON_AddStringToObject(bk, "client_secret",        client_secret);
+            cJSON_AddStringToObject(bk, "stripe_payment_intent_id", pi_id);
+        }
     }
     sqlite3_finalize(sel);
 
@@ -1133,4 +1175,83 @@ void handle_update_user(struct mg_connection *c, struct mg_http_message *hm,
     sqlite3_finalize(sel);
     send_cjson(c, 200, u);
     cJSON_Delete(u);
+}
+
+/* ─── POST /api/v1/webhooks/stripe ─────────────────────────────────────────── */
+
+void handle_stripe_webhook(struct mg_connection *c, struct mg_http_message *hm,
+                            sqlite3 *db) {
+    const char *webhook_secret = getenv("STRIPE_WEBHOOK_SECRET");
+    if (!webhook_secret || !*webhook_secret) {
+        send_error_json(c, 503, "Stripe webhook not configured"); return;
+    }
+
+    /* Stripe-Signature ヘッダー取得 */
+    struct mg_str *sig_hdr = mg_http_get_header(hm, "Stripe-Signature");
+    if (!sig_hdr || sig_hdr->len == 0) {
+        send_error_json(c, 400, "Stripe-Signature header missing"); return;
+    }
+    char sig_buf[512] = {0};
+    size_t sig_copy = sig_hdr->len < sizeof(sig_buf) - 1
+                      ? sig_hdr->len : sizeof(sig_buf) - 1;
+    memcpy(sig_buf, sig_hdr->buf, sig_copy);
+    sig_buf[sig_copy] = '\0';
+
+    /* 署名検証 */
+    if (!stripe_verify_webhook(sig_buf,
+                                hm->body.buf, hm->body.len,
+                                webhook_secret)) {
+        send_error_json(c, 400, "webhook signature invalid"); return;
+    }
+
+    /* イベント解析 */
+    cJSON *event = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!event) { send_error_json(c, 400, "invalid JSON"); return; }
+
+    const char *evt_type = cJSON_GetStringValue(cJSON_GetObjectItem(event, "type"));
+    if (!evt_type) { cJSON_Delete(event); send_error_json(c, 400, "missing event type"); return; }
+
+    if (strcmp(evt_type, "payment_intent.succeeded") == 0) {
+        /* data.object.metadata.booking_id を取得 */
+        cJSON *data   = cJSON_GetObjectItem(event, "data");
+        cJSON *object = data ? cJSON_GetObjectItem(data, "object") : NULL;
+        cJSON *meta   = object ? cJSON_GetObjectItem(object, "metadata") : NULL;
+        const char *booking_id = meta
+            ? cJSON_GetStringValue(cJSON_GetObjectItem(meta, "booking_id"))
+            : NULL;
+
+        if (booking_id && *booking_id) {
+            sqlite3_stmt *upd;
+            sqlite3_prepare_v2(db,
+                "UPDATE bookings SET status='confirmed' WHERE id=? AND status='pending_payment'",
+                -1, &upd, NULL);
+            sqlite3_bind_text(upd, 1, booking_id, -1, SQLITE_STATIC);
+            sqlite3_step(upd);
+            sqlite3_finalize(upd);
+            fprintf(stdout, "[stripe] booking %s confirmed via webhook\n", booking_id);
+        }
+
+    } else if (strcmp(evt_type, "payment_intent.payment_failed") == 0) {
+        cJSON *data   = cJSON_GetObjectItem(event, "data");
+        cJSON *object = data ? cJSON_GetObjectItem(data, "object") : NULL;
+        cJSON *meta   = object ? cJSON_GetObjectItem(object, "metadata") : NULL;
+        const char *booking_id = meta
+            ? cJSON_GetStringValue(cJSON_GetObjectItem(meta, "booking_id"))
+            : NULL;
+
+        if (booking_id && *booking_id) {
+            sqlite3_stmt *upd;
+            sqlite3_prepare_v2(db,
+                "UPDATE bookings SET status='cancelled' WHERE id=? AND status='pending_payment'",
+                -1, &upd, NULL);
+            sqlite3_bind_text(upd, 1, booking_id, -1, SQLITE_STATIC);
+            sqlite3_step(upd);
+            sqlite3_finalize(upd);
+            fprintf(stdout, "[stripe] booking %s cancelled (payment failed)\n", booking_id);
+        }
+    }
+
+    cJSON_Delete(event);
+    /* Stripe は 2xx を受け取れればよい */
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "{\"received\":true}");
 }

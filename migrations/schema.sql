@@ -90,14 +90,15 @@ CREATE TABLE IF NOT EXISTS users (
 
 -- 予約
 CREATE TABLE IF NOT EXISTS bookings (
-    id          TEXT PRIMARY KEY,   -- UUID
-    user_id     INTEGER NOT NULL REFERENCES users(id),
-    plan_id     INTEGER NOT NULL REFERENCES plans(id),
-    schedule_id INTEGER NOT NULL REFERENCES schedules(id),
-    status      TEXT NOT NULL DEFAULT 'confirmed', -- pending/confirmed/cancelled
-    total_price INTEGER NOT NULL,
-    note        TEXT,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    id                       TEXT PRIMARY KEY,   -- UUID
+    user_id                  INTEGER NOT NULL REFERENCES users(id),
+    plan_id                  INTEGER NOT NULL REFERENCES plans(id),
+    schedule_id              INTEGER NOT NULL REFERENCES schedules(id),
+    status                   TEXT NOT NULL DEFAULT 'confirmed', -- pending_payment/confirmed/cancelled
+    total_price              INTEGER NOT NULL,
+    note                     TEXT,
+    stripe_payment_intent_id TEXT,   -- pi_xxx... (Stripe PaymentIntent ID)
+    created_at               TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- 予約参加者内訳

@@ -4,10 +4,10 @@ WARN    = -Wall -Wextra -Wno-unused-parameter
 INC     = -Ideps -Isrc
 DEFS    = -DMG_ENABLE_LOG=0
 
-LDFLAGS = -lsqlite3 -framework Security -framework CoreFoundation
+LDFLAGS = -lsqlite3 -lcurl -framework Security -framework CoreFoundation
 
 SRCS    = deps/mongoose.c deps/cJSON.c \
-          src/utils.c src/db.c src/seed.c src/handlers.c src/admin.c
+          src/utils.c src/db.c src/seed.c src/handlers.c src/admin.c src/stripe.c
 
 BIN     = asoview-c
 TEST    = tests/run_tests
