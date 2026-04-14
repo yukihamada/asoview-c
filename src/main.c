@@ -29,6 +29,17 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
         return;
     }
 
+    /* CORS プリフライト */
+    if (mg_strcmp(hm->method, mg_str("OPTIONS")) == 0) {
+        mg_http_reply(c, 204,
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type, Authorization, X-Admin-Key\r\n"
+            "Access-Control-Max-Age: 86400\r\n",
+            "");
+        return;
+    }
+
     long id = 0;
     char booking_id[64] = {0};
 
@@ -95,6 +106,15 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (strcmp(uri, "/api/v1/auth/login") == 0) {
         if (IS_POST) handle_login(c, hm, db);
 
+    } else if (strcmp(uri, "/api/v1/auth/change-password") == 0) {
+        if (IS_PATCH) handle_change_password(c, hm, db);
+
+    } else if (strcmp(uri, "/api/v1/auth/forgot-password") == 0) {
+        if (IS_POST) handle_forgot_password(c, hm, db);
+
+    } else if (strcmp(uri, "/api/v1/auth/reset-password") == 0) {
+        if (IS_POST) handle_reset_password(c, hm, db);
+
     } else if (strcmp(uri, "/api/v1/bookings") == 0) {
         if (IS_POST) handle_create_booking(c, hm, db);
 
@@ -126,14 +146,16 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     /* Admin endpoints: /api/v1/admin/ ──────────────────────── */
     } else if (strcmp(uri, "/api/v1/admin/venues") == 0) {
-        if (IS_POST) handle_admin_create_venue(c, hm, db);
+        if (IS_GET)  handle_admin_list_venues(c, hm, db);
+        else if (IS_POST) handle_admin_create_venue(c, hm, db);
 
     } else if (sscanf(uri, "/api/v1/admin/venues/%ld", &id) == 1) {
         if (IS_PATCH)  handle_admin_update_venue(c, hm, db, id);
         else if (IS_DELETE) handle_admin_delete_venue(c, hm, db, id);
 
     } else if (strcmp(uri, "/api/v1/admin/plans") == 0) {
-        if (IS_POST) handle_admin_create_plan(c, hm, db);
+        if (IS_GET)  handle_admin_list_plans(c, hm, db);
+        else if (IS_POST) handle_admin_create_plan(c, hm, db);
 
     } else if (sscanf(uri, "/api/v1/admin/plans/%ld/schedules", &id) == 1
                && strstr(uri, "/schedules") != NULL) {

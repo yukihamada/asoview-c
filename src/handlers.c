@@ -1098,16 +1098,29 @@ void handle_cancel_booking(struct mg_connection *c, struct mg_http_message *hm,
 
 void handle_list_plan_reviews(struct mg_connection *c, struct mg_http_message *hm,
                                sqlite3 *db, long plan_id) {
-    (void)hm;
+    long page  = query_long(hm, "page", 1);  if (page < 1) page = 1;
+    long limit = query_long(hm, "limit", 20); if (limit > 100) limit = 100;
+    long offset = (page - 1) * limit;
+
+    /* 総件数 */
+    sqlite3_stmt *ct;
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM reviews WHERE plan_id=?", -1, &ct, NULL);
+    sqlite3_bind_int64(ct, 1, plan_id);
+    sqlite3_step(ct);
+    long total = sqlite3_column_int64(ct, 0);
+    sqlite3_finalize(ct);
+
     sqlite3_stmt *st;
     sqlite3_prepare_v2(db,
         "SELECT r.id, r.user_id, u.name, r.rating, r.comment, r.created_at "
         "FROM reviews r "
         "LEFT JOIN users u ON u.id = r.user_id "
         "WHERE r.plan_id = ? "
-        "ORDER BY r.created_at DESC",
+        "ORDER BY r.created_at DESC LIMIT ? OFFSET ?",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, plan_id);
+    sqlite3_bind_int64(st, 2, limit);
+    sqlite3_bind_int64(st, 3, offset);
 
     cJSON *arr = cJSON_CreateArray();
     while (sqlite3_step(st) == SQLITE_ROW) {
@@ -1125,8 +1138,14 @@ void handle_list_plan_reviews(struct mg_connection *c, struct mg_http_message *h
         cJSON_AddItemToArray(arr, rv);
     }
     sqlite3_finalize(st);
-    send_cjson(c, 200, arr);
-    cJSON_Delete(arr);
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddItemToObject(res, "reviews", arr);
+    cJSON_AddNumberToObject(res, "total",  total);
+    cJSON_AddNumberToObject(res, "page",   page);
+    cJSON_AddNumberToObject(res, "limit",  limit);
+    send_cjson(c, 200, res);
+    cJSON_Delete(res);
 }
 
 /* ─── GET /api/v1/venues/:id/plans ─────────────────────────────────────────── */
@@ -1385,7 +1404,12 @@ void handle_delete_bookmark(struct mg_connection *c, struct mg_http_message *hm,
 
 void handle_list_user_bookmarks(struct mg_connection *c, struct mg_http_message *hm,
                                  sqlite3 *db, long user_id) {
-    (void)hm;
+    /* JWT 必須 + 自分のブックマークのみ */
+    long auth_uid = require_auth(c, hm);
+    if (auth_uid < 0) return;
+    if (auth_uid != user_id) {
+        send_error_json(c, 403, "他のユーザーのブックマークは取得できません"); return;
+    }
     sqlite3_stmt *st;
     sqlite3_prepare_v2(db,
         "SELECT bm.id, bm.plan_id, p.title, p.duration_minutes, v.name AS venue_name, "
@@ -1414,4 +1438,167 @@ void handle_list_user_bookmarks(struct mg_connection *c, struct mg_http_message 
     sqlite3_finalize(st);
     send_cjson(c, 200, arr);
     cJSON_Delete(arr);
+}
+
+/* ─── PATCH /api/v1/auth/change-password ───────────────────────────────────── */
+
+void handle_change_password(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db) {
+    long auth_uid = require_auth(c, hm);
+    if (auth_uid < 0) return;
+
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
+
+    const char *cur_pw = cJSON_GetStringValue(cJSON_GetObjectItem(body, "current_password"));
+    const char *new_pw = cJSON_GetStringValue(cJSON_GetObjectItem(body, "new_password"));
+
+    if (!cur_pw || !new_pw) {
+        send_error_json(c, 400, "current_password と new_password は必須");
+        cJSON_Delete(body); return;
+    }
+    if ((int)strlen(new_pw) < 8) {
+        send_error_json(c, 400, "パスワードは8文字以上で指定してください");
+        cJSON_Delete(body); return;
+    }
+
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(db, "SELECT password_hash FROM users WHERE id=?", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, auth_uid);
+    if (sqlite3_step(st) != SQLITE_ROW) {
+        sqlite3_finalize(st); cJSON_Delete(body);
+        send_error_json(c, 404, "user not found"); return;
+    }
+    char hash_buf[128] = {0};
+    const char *h = (const char*)sqlite3_column_text(st, 0);
+    if (h) strncpy(hash_buf, h, sizeof(hash_buf)-1);
+    sqlite3_finalize(st);
+
+    if (!verify_password(cur_pw, hash_buf)) {
+        cJSON_Delete(body);
+        send_error_json(c, 400, "現在のパスワードが正しくありません"); return;
+    }
+
+    char new_hash[128];
+    hash_password(new_pw, new_hash, sizeof(new_hash));
+    cJSON_Delete(body);
+
+    sqlite3_stmt *upd;
+    sqlite3_prepare_v2(db, "UPDATE users SET password_hash=? WHERE id=?", -1, &upd, NULL);
+    sqlite3_bind_text(upd, 1, new_hash, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(upd, 2, auth_uid);
+    sqlite3_step(upd); sqlite3_finalize(upd);
+
+    send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"パスワードを変更しました\"}");
+}
+
+/* ─── POST /api/v1/auth/forgot-password ────────────────────────────────────── */
+
+void handle_forgot_password(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db) {
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
+
+    const char *email = cJSON_GetStringValue(cJSON_GetObjectItem(body, "email"));
+    if (!email) {
+        send_error_json(c, 400, "email は必須"); cJSON_Delete(body); return;
+    }
+    char email_lower[256] = {0};
+    strncpy(email_lower, email, sizeof(email_lower)-1);
+    str_lower(email_lower);
+    cJSON_Delete(body);
+
+    /* メール存在有無に関わらず同じレスポンスを返す（列挙攻撃防止） */
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(db, "SELECT id FROM users WHERE email=?", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, email_lower, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) != SQLITE_ROW) {
+        sqlite3_finalize(st);
+        send_json_str(c, 200, CORS_HEADERS,
+            "{\"message\":\"登録済みの場合はリセット手順をメールで送信しました\"}");
+        return;
+    }
+    long uid = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+
+    /* 32 文字ランダムトークン（UUID のダッシュ除去） */
+    char uuid_str[37];
+    generate_uuid(uuid_str);
+    char token[33] = {0};
+    int j = 0;
+    for (int i = 0; uuid_str[i] && j < 32; i++)
+        if (uuid_str[i] != '-') token[j++] = uuid_str[i];
+
+    /* 既存トークンを削除して新規挿入（1時間有効） */
+    sqlite3_stmt *del;
+    sqlite3_prepare_v2(db, "DELETE FROM password_reset_tokens WHERE user_id=?", -1, &del, NULL);
+    sqlite3_bind_int64(del, 1, uid);
+    sqlite3_step(del); sqlite3_finalize(del);
+
+    sqlite3_stmt *ins;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO password_reset_tokens(token,user_id,expires_at)"
+        " VALUES(?,?,datetime('now','+1 hour'))",
+        -1, &ins, NULL);
+    sqlite3_bind_text(ins, 1, token, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(ins, 2, uid);
+    sqlite3_step(ins); sqlite3_finalize(ins);
+
+    /* 本番はメール送信。開発環境ではレスポンスにトークンを含める */
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddStringToObject(res, "message", "登録済みの場合はリセット手順をメールで送信しました");
+    cJSON_AddStringToObject(res, "reset_token", token); /* 開発用 */
+    send_cjson(c, 200, res);
+    cJSON_Delete(res);
+}
+
+/* ─── POST /api/v1/auth/reset-password ─────────────────────────────────────── */
+
+void handle_reset_password(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db) {
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
+
+    const char *token_raw  = cJSON_GetStringValue(cJSON_GetObjectItem(body, "token"));
+    const char *new_pw     = cJSON_GetStringValue(cJSON_GetObjectItem(body, "new_password"));
+
+    if (!token_raw || !new_pw) {
+        send_error_json(c, 400, "token と new_password は必須"); cJSON_Delete(body); return;
+    }
+    if ((int)strlen(new_pw) < 8) {
+        send_error_json(c, 400, "パスワードは8文字以上で指定してください");
+        cJSON_Delete(body); return;
+    }
+
+    /* body を解放した後でも使えるようローカルバッファにコピー */
+    char token[64] = {0};
+    strncpy(token, token_raw, sizeof(token)-1);
+
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(db,
+        "SELECT user_id FROM password_reset_tokens"
+        " WHERE token=? AND used=0 AND expires_at > datetime('now')",
+        -1, &st, NULL);
+    sqlite3_bind_text(st, 1, token, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) != SQLITE_ROW) {
+        sqlite3_finalize(st); cJSON_Delete(body);
+        send_error_json(c, 400, "トークンが無効または期限切れです"); return;
+    }
+    long uid = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+
+    char new_hash[128];
+    hash_password(new_pw, new_hash, sizeof(new_hash));
+    cJSON_Delete(body);  /* これ以降 token_raw/new_pw は使えない。token/new_hash を使う */
+
+    sqlite3_stmt *upd;
+    sqlite3_prepare_v2(db, "UPDATE users SET password_hash=? WHERE id=?", -1, &upd, NULL);
+    sqlite3_bind_text(upd, 1, new_hash, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(upd, 2, uid);
+    sqlite3_step(upd); sqlite3_finalize(upd);
+
+    sqlite3_stmt *mark;
+    sqlite3_prepare_v2(db, "UPDATE password_reset_tokens SET used=1 WHERE token=?",
+                        -1, &mark, NULL);
+    sqlite3_bind_text(mark, 1, token, -1, SQLITE_STATIC);
+    sqlite3_step(mark); sqlite3_finalize(mark);
+
+    send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"パスワードをリセットしました\"}");
 }

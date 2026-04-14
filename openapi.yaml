@@ -1,0 +1,1092 @@
+openapi: 3.1.0
+info:
+  title: asoview-c API
+  version: 1.0.0
+  description: |
+    体験・アクティビティ予約サービスの REST API
+    C11 シングルバイナリ（mongoose + cJSON + SQLite3）
+
+    ## 認証
+    - **ユーザー**: `Authorization: Bearer <JWT>` (HS256)
+    - **管理者**: `X-Admin-Key: <admin-key>`
+
+    ## レート制限
+    - 一般エンドポイント: 120 req/min/IP
+    - 認証・登録エンドポイント: 30 req/min/IP
+    - 超過時: `429 Too Many Requests`
+
+servers:
+  - url: http://localhost:3001
+    description: ローカル開発
+  - url: https://your-domain.example.com
+    description: 本番
+
+tags:
+  - name: health
+    description: サーバー状態
+  - name: areas
+    description: 地域
+  - name: categories
+    description: カテゴリ
+  - name: venues
+    description: 会場・施設
+  - name: plans
+    description: 体験プラン
+  - name: schedules
+    description: スケジュール
+  - name: reviews
+    description: レビュー
+  - name: users
+    description: ユーザー
+  - name: auth
+    description: 認証・パスワード管理
+  - name: bookings
+    description: 予約
+  - name: bookmarks
+    description: お気に入り
+  - name: search
+    description: 検索
+  - name: webhooks
+    description: Stripe Webhook
+  - name: admin
+    description: 管理者API（X-Admin-Key必須）
+
+paths:
+  /api/v1/health:
+    get:
+      tags: [health]
+      summary: サーバー状態確認
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  db: { type: string, example: ok }
+
+  /api/v1/areas:
+    get:
+      tags: [areas]
+      summary: 地域一覧
+      responses:
+        "200":
+          description: 地域リスト（階層構造）
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Area" }
+
+  /api/v1/categories:
+    get:
+      tags: [categories]
+      summary: カテゴリ一覧
+      responses:
+        "200":
+          description: カテゴリリスト（階層構造）
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Category" }
+
+  /api/v1/venues:
+    get:
+      tags: [venues]
+      summary: 会場一覧（ページング対応）
+      parameters:
+        - name: area_id
+          in: query
+          schema: { type: integer }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20, maximum: 100 }
+      responses:
+        "200":
+          description: 会場リスト
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  venues:
+                    type: array
+                    items: { $ref: "#/components/schemas/Venue" }
+                  total: { type: integer }
+                  page: { type: integer }
+                  limit: { type: integer }
+
+  /api/v1/venues/{id}:
+    get:
+      tags: [venues]
+      summary: 会場詳細
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: 会場詳細
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Venue" }
+        "404":
+          description: Not Found
+
+  /api/v1/venues/{id}/plans:
+    get:
+      tags: [venues, plans]
+      summary: 会場のプラン一覧
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: プランリスト
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Plan" }
+
+  /api/v1/plans:
+    get:
+      tags: [plans]
+      summary: プラン一覧（フィルタ・ページング対応）
+      parameters:
+        - name: category_id
+          in: query
+          schema: { type: integer }
+        - name: area_id
+          in: query
+          schema: { type: integer }
+        - name: date
+          in: query
+          schema: { type: string, format: date, example: "2026-05-01" }
+        - name: adults
+          in: query
+          schema: { type: integer }
+        - name: children
+          in: query
+          schema: { type: integer }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20, maximum: 100 }
+      responses:
+        "200":
+          description: プランリスト
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plans:
+                    type: array
+                    items: { $ref: "#/components/schemas/Plan" }
+                  total: { type: integer }
+                  page: { type: integer }
+                  limit: { type: integer }
+
+  /api/v1/plans/{id}:
+    get:
+      tags: [plans]
+      summary: プラン詳細
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: プラン詳細（価格情報を含む）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Plan" }
+        "404":
+          description: Not Found
+
+  /api/v1/plans/{id}/schedules:
+    get:
+      tags: [schedules]
+      summary: スケジュール一覧
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+        - name: date
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: スケジュールリスト
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Schedule" }
+
+  /api/v1/plans/{id}/reviews:
+    get:
+      tags: [reviews]
+      summary: プランのレビュー一覧（ページング対応）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20, maximum: 100 }
+      responses:
+        "200":
+          description: レビューリスト
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reviews:
+                    type: array
+                    items: { $ref: "#/components/schemas/Review" }
+                  total: { type: integer }
+                  page: { type: integer }
+                  limit: { type: integer }
+
+  /api/v1/users:
+    post:
+      tags: [users]
+      summary: ユーザー登録
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, name, password]
+              properties:
+                email: { type: string, format: email }
+                name: { type: string }
+                phone: { type: string }
+                password: { type: string, minLength: 8 }
+      responses:
+        "201":
+          description: 作成されたユーザー
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "400":
+          description: バリデーションエラー
+        "409":
+          description: メールアドレス重複
+
+  /api/v1/users/{id}:
+    get:
+      tags: [users]
+      summary: ユーザープロフィール取得
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: ユーザー情報
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "404":
+          description: Not Found
+    patch:
+      tags: [users]
+      summary: ユーザープロフィール更新
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                phone: { type: string }
+      responses:
+        "200":
+          description: 更新後のユーザー情報
+        "401":
+          description: 認証エラー
+        "403":
+          description: 権限エラー（他ユーザーの変更不可）
+
+  /api/v1/users/{id}/bookings:
+    get:
+      tags: [users, bookings]
+      summary: ユーザーの予約一覧
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: 予約リスト
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Booking" }
+        "401":
+          description: 認証エラー
+        "403":
+          description: 権限エラー
+
+  /api/v1/users/{id}/bookmarks:
+    get:
+      tags: [users, bookmarks]
+      summary: ユーザーのブックマーク一覧
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: ブックマークリスト
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Bookmark" }
+        "401":
+          description: 認証エラー
+        "403":
+          description: 権限エラー
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: ログイン → JWT 取得
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        "200":
+          description: JWT トークン
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user_id: { type: integer }
+                  name: { type: string }
+                  token: { type: string }
+                  message: { type: string }
+        "400":
+          description: 認証失敗
+
+  /api/v1/auth/change-password:
+    patch:
+      tags: [auth]
+      summary: パスワード変更（ログイン中）
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 8 }
+      responses:
+        "200":
+          description: 変更成功
+        "400":
+          description: 現在のパスワードが間違っている、または新パスワードが短すぎる
+        "401":
+          description: 認証エラー
+
+  /api/v1/auth/forgot-password:
+    post:
+      tags: [auth]
+      summary: パスワードリセット要求（メール送信）
+      description: |
+        登録済みメールアドレスであれば1時間有効なリセットトークンを発行。
+        列挙攻撃防止のため、メール存在有無に関わらず200を返す。
+        **開発環境**: レスポンスの `reset_token` フィールドにトークンを返す（本番では除去）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "200":
+          description: 要求受付（メール送信）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  reset_token:
+                    type: string
+                    description: 開発環境のみ返却
+
+  /api/v1/auth/reset-password:
+    post:
+      tags: [auth]
+      summary: パスワードリセット実行
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, new_password]
+              properties:
+                token: { type: string, description: forgot-password で取得した32文字トークン }
+                new_password: { type: string, minLength: 8 }
+      responses:
+        "200":
+          description: リセット成功
+        "400":
+          description: トークンが無効・期限切れ・使用済み
+
+  /api/v1/bookings:
+    post:
+      tags: [bookings]
+      summary: 予約作成
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan_id, schedule_id, participants]
+              properties:
+                plan_id: { type: integer }
+                schedule_id: { type: integer }
+                note: { type: string }
+                participants:
+                  type: array
+                  items:
+                    type: object
+                    required: [participant_type, count]
+                    properties:
+                      participant_type:
+                        type: string
+                        enum: [adult, child, senior]
+                      count: { type: integer, minimum: 1 }
+      responses:
+        "201":
+          description: 予約作成成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Booking" }
+                  - type: object
+                    properties:
+                      client_secret:
+                        type: string
+                        description: Stripe PaymentIntent client_secret（STRIPE_SECRET_KEY設定時のみ）
+                      stripe_payment_intent_id:
+                        type: string
+        "400":
+          description: バリデーションエラー
+        "401":
+          description: 認証エラー
+        "409":
+          description: 定員超過
+
+  /api/v1/bookings/{id}:
+    get:
+      tags: [bookings]
+      summary: 予約詳細
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: 予約詳細
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Booking" }
+        "401": { description: 認証エラー }
+        "403": { description: 他ユーザーの予約 }
+        "404": { description: Not Found }
+
+  /api/v1/bookings/{id}/cancel:
+    patch:
+      tags: [bookings]
+      summary: 予約キャンセル
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200": { description: キャンセル成功 }
+        "400": { description: 既にキャンセル済み }
+        "401": { description: 認証エラー }
+        "403": { description: 他ユーザーの予約 }
+        "404": { description: Not Found }
+
+  /api/v1/reviews:
+    post:
+      tags: [reviews]
+      summary: レビュー投稿（予約済みユーザーのみ）
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan_id, rating]
+              properties:
+                plan_id: { type: integer }
+                rating: { type: integer, minimum: 1, maximum: 5 }
+                comment: { type: string, maxLength: 1000 }
+                booking_id: { type: string, format: uuid }
+      responses:
+        "201": { description: レビュー作成成功 }
+        "400": { description: バリデーションエラー }
+        "401": { description: 認証エラー }
+        "403": { description: 未予約ユーザー }
+
+  /api/v1/bookmarks:
+    post:
+      tags: [bookmarks]
+      summary: ブックマーク追加
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan_id]
+              properties:
+                plan_id: { type: integer }
+      responses:
+        "201": { description: ブックマーク作成 }
+        "401": { description: 認証エラー }
+        "404": { description: プランが存在しない }
+
+  /api/v1/bookmarks/{plan_id}:
+    delete:
+      tags: [bookmarks]
+      summary: ブックマーク削除
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: plan_id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { description: 削除成功 }
+        "401": { description: 認証エラー }
+        "404": { description: Not Found }
+
+  /api/v1/search:
+    get:
+      tags: [search]
+      summary: プラン全文検索
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string }
+          description: キーワード（タイトル・説明・会場名）
+        - name: area_id
+          in: query
+          schema: { type: integer }
+        - name: category_id
+          in: query
+          schema: { type: integer }
+        - name: date
+          in: query
+          schema: { type: string, format: date }
+        - name: adults
+          in: query
+          schema: { type: integer }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20, maximum: 100 }
+      responses:
+        "200":
+          description: 検索結果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plans:
+                    type: array
+                    items: { $ref: "#/components/schemas/Plan" }
+                  total: { type: integer }
+                  page: { type: integer }
+                  limit: { type: integer }
+
+  /api/v1/webhooks/stripe:
+    post:
+      tags: [webhooks]
+      summary: Stripe Webhook 受信
+      description: |
+        `Stripe-Signature` ヘッダーで HMAC-SHA256 署名を検証。
+        replay attack 防止のため timestamp は 5 分以内であること。
+      parameters:
+        - name: Stripe-Signature
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Stripe Event オブジェクト
+      responses:
+        "200": { description: 受信成功 }
+        "400": { description: 署名検証失敗 }
+
+  /api/v1/admin/venues:
+    get:
+      tags: [admin]
+      summary: 会場一覧（管理者）
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        "200":
+          description: 全会場リスト
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  venues: { type: array, items: { $ref: "#/components/schemas/Venue" } }
+                  total: { type: integer }
+                  page: { type: integer }
+                  limit: { type: integer }
+        "403": { description: 管理者キーエラー }
+    post:
+      tags: [admin]
+      summary: 会場作成
+      security: [{ adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, area_id]
+              properties:
+                name: { type: string }
+                description: { type: string }
+                area_id: { type: integer }
+                address: { type: string }
+                latitude: { type: number }
+                longitude: { type: number }
+                phone: { type: string }
+                website: { type: string }
+      responses:
+        "201": { description: 作成成功 }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/venues/{id}:
+    patch:
+      tags: [admin]
+      summary: 会場更新
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                description: { type: string }
+                address: { type: string }
+      responses:
+        "200": { description: 更新成功 }
+        "403": { description: 管理者キーエラー }
+    delete:
+      tags: [admin]
+      summary: 会場削除（カスケード）
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { description: 削除成功 }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/plans:
+    get:
+      tags: [admin]
+      summary: プラン一覧（管理者・非アクティブ含む）
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: is_active
+          in: query
+          schema: { type: integer, enum: [0, 1] }
+          description: フィルタ（未指定=全件）
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        "200":
+          description: プランリスト
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plans: { type: array }
+                  total: { type: integer }
+                  page: { type: integer }
+                  limit: { type: integer }
+        "403": { description: 管理者キーエラー }
+    post:
+      tags: [admin]
+      summary: プラン作成
+      security: [{ adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [venue_id, category_id, title, prices]
+              properties:
+                venue_id: { type: integer }
+                category_id: { type: integer }
+                title: { type: string }
+                description: { type: string }
+                duration_minutes: { type: integer }
+                min_participants: { type: integer, default: 1 }
+                max_participants: { type: integer }
+                min_age: { type: integer }
+                prices:
+                  type: array
+                  items:
+                    type: object
+                    required: [participant_type, label, price]
+                    properties:
+                      participant_type: { type: string }
+                      label: { type: string }
+                      price: { type: integer }
+      responses:
+        "201": { description: 作成成功 }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/plans/{id}:
+    patch:
+      tags: [admin]
+      summary: プラン更新
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                description: { type: string }
+                is_active: { type: boolean }
+      responses:
+        "200": { description: 更新成功 }
+        "403": { description: 管理者キーエラー }
+    delete:
+      tags: [admin]
+      summary: プラン無効化（ソフトデリート）
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { description: 無効化成功 }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/plans/{id}/schedules:
+    post:
+      tags: [admin, schedules]
+      summary: スケジュール追加
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [date, start_time, capacity]
+              properties:
+                date: { type: string, format: date }
+                start_time: { type: string, example: "09:00" }
+                end_time: { type: string, example: "12:00" }
+                capacity: { type: integer }
+      responses:
+        "201": { description: 作成成功 }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/plans/{id}/prices:
+    put:
+      tags: [admin]
+      summary: プラン価格設定（全置換）
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: object
+                required: [participant_type, label, price]
+                properties:
+                  participant_type: { type: string }
+                  label: { type: string }
+                  price: { type: integer }
+      responses:
+        "200": { description: 更新成功 }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/schedules/{id}:
+    delete:
+      tags: [admin, schedules]
+      summary: スケジュール削除
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { description: 削除成功 }
+        "403": { description: 管理者キーエラー }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    adminKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+
+  schemas:
+    Area:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        slug: { type: string }
+        level: { type: integer, description: "0=地方, 1=都道府県, 2=市区" }
+        parent_id: { type: integer, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    Category:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        slug: { type: string }
+        icon: { type: string, nullable: true }
+        parent_id: { type: integer, nullable: true }
+
+    Venue:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        area_id: { type: integer }
+        area_name: { type: string }
+        address: { type: string, nullable: true }
+        latitude: { type: number, nullable: true }
+        longitude: { type: number, nullable: true }
+        phone: { type: string, nullable: true }
+        website: { type: string, nullable: true }
+        review_count: { type: integer }
+        review_avg: { type: number }
+        created_at: { type: string, format: date-time }
+
+    Plan:
+      type: object
+      properties:
+        id: { type: integer }
+        venue_id: { type: integer }
+        venue_name: { type: string }
+        category_id: { type: integer }
+        category_name: { type: string }
+        title: { type: string }
+        description: { type: string, nullable: true }
+        duration_minutes: { type: integer, nullable: true }
+        min_participants: { type: integer }
+        max_participants: { type: integer, nullable: true }
+        min_age: { type: integer, nullable: true }
+        images: { type: array, items: { type: string } }
+        tags: { type: array, items: { type: string } }
+        is_active: { type: boolean }
+        prices:
+          type: array
+          items: { $ref: "#/components/schemas/Price" }
+        created_at: { type: string, format: date-time }
+
+    Price:
+      type: object
+      properties:
+        id: { type: integer }
+        participant_type: { type: string, enum: [adult, child, senior] }
+        label: { type: string, example: 大人 }
+        price: { type: integer, description: 円 }
+
+    Schedule:
+      type: object
+      properties:
+        id: { type: integer }
+        plan_id: { type: integer }
+        date: { type: string, format: date }
+        start_time: { type: string, example: "09:00" }
+        end_time: { type: string, nullable: true }
+        capacity: { type: integer }
+        booked_count: { type: integer }
+        available: { type: integer }
+
+    Booking:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        user_id: { type: integer }
+        plan_id: { type: integer }
+        plan_title: { type: string }
+        schedule_id: { type: integer }
+        schedule_date: { type: string, format: date }
+        schedule_start_time: { type: string }
+        status:
+          type: string
+          enum: [pending_payment, confirmed, cancelled]
+        total_price: { type: integer }
+        note: { type: string, nullable: true }
+        participants:
+          type: array
+          items:
+            type: object
+            properties:
+              participant_type: { type: string }
+              label: { type: string }
+              count: { type: integer }
+              unit_price: { type: integer }
+              subtotal: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    Review:
+      type: object
+      properties:
+        id: { type: integer }
+        user_id: { type: integer }
+        user_name: { type: string, nullable: true }
+        rating: { type: integer, minimum: 1, maximum: 5 }
+        comment: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        email: { type: string, format: email }
+        name: { type: string }
+        phone: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    Bookmark:
+      type: object
+      properties:
+        id: { type: integer }
+        plan_id: { type: integer }
+        plan_title: { type: string }
+        duration_minutes: { type: integer, nullable: true }
+        venue_name: { type: string }
+        created_at: { type: string, format: date-time }
+
+    Error:
+      type: object
+      properties:
+        error: { type: string }

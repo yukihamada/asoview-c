@@ -131,6 +131,15 @@ CREATE TABLE IF NOT EXISTS bookmarks (
     UNIQUE(user_id, plan_id)
 );
 
+-- パスワードリセットトークン（1時間有効）
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    token      TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id),
+    expires_at TEXT NOT NULL,
+    used       INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- レビュー更新時に venue の集計を自動更新
 CREATE TRIGGER IF NOT EXISTS update_venue_review_stats
 AFTER INSERT ON reviews

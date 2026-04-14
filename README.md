@@ -3,7 +3,7 @@
 > 体験・アクティビティ予約サービスの REST API — C11 シングルバイナリ
 
 ![Language](https://img.shields.io/badge/language-C11-blue)
-![Tests](https://img.shields.io/badge/tests-44%2F44%20pass-brightgreen)
+![Tests](https://img.shields.io/badge/tests-50%2F50%20pass-brightgreen)
 ![CI](https://github.com/yukihamada/asoview-c/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
@@ -22,10 +22,13 @@
 | **SQLite3 WAL** | 組み込みDB、トリガーでレビュー統計（平均・件数）を自動更新 |
 | **ソフトデリート** | プランは `is_active=0` で論理削除。履歴・予約データを保持 |
 | **Stripe 決済** | PaymentIntent 作成 + Webhook 署名検証（HMAC-SHA256 + タイムスタンプ検証）|
-| **IP レート制限** | 一般 120 req/min・認証系 10 req/min per IP（in-memory ハッシュテーブル）|
+| **IP レート制限** | 一般 120 req/min・認証系 30 req/min per IP（in-memory ハッシュテーブル）|
 | **ブックマーク** | プランをお気に入り保存（JWT 認証必須） |
 | **豊富なシードデータ** | 20 会場・42 プラン・300+ スケジュール（2026年4〜6月）・30 件レビュー |
 | **定数時間比較** | ADMIN_KEY はタイミング攻撃対策済みの定数時間比較 |
+| **CORS** | OPTIONS プリフライト対応（`Access-Control-Allow-*` ヘッダー付与）|
+| **パスワードリセット** | 1 時間有効トークン発行 → リセット実行（使い捨て・期限切れ検証）|
+| **OpenAPI 3.1.0** | `openapi.yaml` に全エンドポイントのスキーマ・セキュリティ定義 |
 | **CI / Docker** | GitHub Actions + Dockerfile 付属 |
 
 ---
@@ -60,7 +63,7 @@ docker run -p 3001:3001 -v $(pwd)/data:/data asoview-c
 
 ```bash
 make test
-# === 結果: 44 passed, 0 failed ===
+# === 結果: 50 passed, 0 failed ===
 ```
 
 ---
@@ -82,6 +85,7 @@ SQLite3 (WAL)
     ├─ venues / plans / plan_prices
     ├─ schedules / bookings / booking_participants
     ├─ users / reviews / bookmarks
+    ├─ password_reset_tokens
     └─ areas / categories
 ```
 
@@ -124,6 +128,9 @@ SQLite3 (WAL)
 |--------|------|------|
 | `POST` | `/api/v1/users` | ユーザー登録 |
 | `POST` | `/api/v1/auth/login` | ログイン → JWT 取得 |
+| `PATCH` | `/api/v1/auth/change-password` | パスワード変更（JWT 必須）|
+| `POST` | `/api/v1/auth/forgot-password` | パスワードリセットトークン発行 |
+| `POST` | `/api/v1/auth/reset-password` | パスワードリセット実行 |
 | `GET` | `/api/v1/users/:id` | プロフィール取得 |
 | `PATCH` | `/api/v1/users/:id` | プロフィール更新（JWT 必須）|
 
@@ -154,10 +161,12 @@ SQLite3 (WAL)
 ### 管理（`X-Admin-Key` ヘッダー必須）
 
 ```
+GET     /api/v1/admin/venues
 POST    /api/v1/admin/venues
 PATCH   /api/v1/admin/venues/:id
 DELETE  /api/v1/admin/venues/:id
 
+GET     /api/v1/admin/plans
 POST    /api/v1/admin/plans
 PATCH   /api/v1/admin/plans/:id
 DELETE  /api/v1/admin/plans/:id       # ソフトデリート (is_active=0)
@@ -255,12 +264,13 @@ asoview-c/
 │   ├── mongoose.c/h    # HTTP サーバー
 │   └── cJSON.c/h       # JSON
 ├── tests/
-│   └── test_api.c      # 統合テスト（44 ケース）
+│   └── test_api.c      # 統合テスト（50 ケース）
 ├── migrations/
 │   └── schema.sql      # DB スキーマ
 ├── .github/
 │   └── workflows/
 │       └── ci.yml      # GitHub Actions CI
+├── openapi.yaml        # OpenAPI 3.1.0 仕様書（全エンドポイント）
 ├── Dockerfile
 └── Makefile
 ```
@@ -304,7 +314,7 @@ asoview-c/
 | パスワード | PBKDF2-SHA256、10,000 イテレーション |
 | ADMIN_KEY 検証 | 定数時間比較（タイミング攻撃対策）|
 | Webhook 署名 | HMAC-SHA256 + タイムスタンプ ±5 分（リプレイ攻撃防止）|
-| レート制限 | 一般 120 req/min、認証系 10 req/min per IP |
+| レート制限 | 一般 120 req/min、認証系 30 req/min per IP |
 | LIKE インジェクション | `escape_like()` + `ESCAPE '\\'` |
 | note 長さ上限 | 1,000 文字（DoS 防止）|
 | TLS 検証 | libcurl の証明書検証を有効のまま維持 |

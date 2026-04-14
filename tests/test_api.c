@@ -195,6 +195,47 @@ static Resp http_delete_admin(const char *url) {
     return r;
 }
 
+/* 任意ヘッダ付き GET */
+static Resp http_get_with_header(const char *url, const char *hdr_name, const char *hdr_val) {
+    CURL *curl = curl_easy_init();
+    Buf buf = { malloc(1), 0 };
+    char hdr[512];
+    snprintf(hdr, sizeof(hdr), "%s: %s", hdr_name, hdr_val);
+    struct curl_slist *hdrs = curl_slist_append(NULL, hdr);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_perform(curl);
+    Resp r = { buf.data, 0 };
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    return r;
+}
+
+/* Bearer トークン + Body 付き PATCH */
+static Resp http_patch_auth_body(const char *url, const char *json_body, const char *token) {
+    CURL *curl = curl_easy_init();
+    Buf buf = { malloc(1), 0 };
+    char auth_hdr[600];
+    snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s", token);
+    struct curl_slist *hdrs = curl_slist_append(NULL, "Content-Type: application/json");
+    hdrs = curl_slist_append(hdrs, auth_hdr);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_perform(curl);
+    Resp r = { buf.data, 0 };
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    return r;
+}
+
 /* ─── Tests ───────────────────────────────────────────────────────────── */
 
 static void test_health(void) {
@@ -575,6 +616,176 @@ static void test_booking_list_access_control(void) {
     PASS();
 }
 
+/* ── レビューページング ─────────────────────────────────────────────── */
+
+static void test_reviews_pagination(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/v1/plans/1/reviews?page=1&limit=5", BASE_URL);
+    Resp r = http_get(url);
+    ASSERT(r.status == 200, "expected 200");
+    cJSON *j = cJSON_Parse(r.body);
+    ASSERT(j != NULL, "valid JSON");
+    ASSERT(cJSON_GetObjectItem(j, "reviews") != NULL, "has reviews array");
+    ASSERT(cJSON_GetObjectItem(j, "total")   != NULL, "has total");
+    ASSERT(cJSON_GetObjectItem(j, "page")    != NULL, "has page");
+    ASSERT(cJSON_GetObjectItem(j, "limit")   != NULL, "has limit");
+    ASSERT((long)cJSON_GetNumberValue(cJSON_GetObjectItem(j, "limit")) == 5, "limit=5");
+    cJSON_Delete(j); resp_free(&r);
+    PASS();
+}
+
+/* ── ブックマーク認証 ────────────────────────────────────────────────── */
+
+static void test_bookmark_list_auth(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/v1/users/1/bookmarks", BASE_URL);
+    /* 未認証 → 401 */
+    Resp r = http_get(url);
+    ASSERT(r.status == 401, "no auth → 401");
+    resp_free(&r);
+    /* hanako が taro のブックマークを取得 → 403 */
+    Resp r2 = http_get_auth(url, g_token2);
+    ASSERT(r2.status == 403, "other user → 403");
+    resp_free(&r2);
+    /* taro 自身 → 200 */
+    Resp r3 = http_get_auth(url, g_token);
+    ASSERT(r3.status == 200, "owner → 200");
+    resp_free(&r3);
+    PASS();
+}
+
+/* ── Admin 一覧 ──────────────────────────────────────────────────────── */
+
+static void test_admin_list_venues(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/v1/admin/venues?page=1&limit=5", BASE_URL);
+    Resp r = http_get_with_header(url, "X-Admin-Key", "asoview-admin-dev");
+    ASSERT(r.status == 200, "expected 200");
+    cJSON *j = cJSON_Parse(r.body);
+    ASSERT(j != NULL, "valid JSON");
+    ASSERT(cJSON_IsArray(cJSON_GetObjectItem(j, "venues")), "has venues array");
+    ASSERT(cJSON_GetObjectItem(j, "total") != NULL, "has total");
+    ASSERT(cJSON_GetArraySize(cJSON_GetObjectItem(j, "venues")) <= 5, "limit respected");
+    cJSON_Delete(j); resp_free(&r);
+    PASS();
+}
+
+static void test_admin_list_plans(void) {
+    char url[256];
+    /* is_active=0 のみ → 管理者は非アクティブも見える */
+    snprintf(url, sizeof(url), "%s/api/v1/admin/plans?is_active=0&limit=50", BASE_URL);
+    Resp r = http_get_with_header(url, "X-Admin-Key", "asoview-admin-dev");
+    ASSERT(r.status == 200, "expected 200");
+    cJSON *j = cJSON_Parse(r.body);
+    ASSERT(j != NULL, "valid JSON");
+    ASSERT(cJSON_IsArray(cJSON_GetObjectItem(j, "plans")), "has plans array");
+    ASSERT(cJSON_GetObjectItem(j, "total") != NULL, "has total");
+    cJSON_Delete(j); resp_free(&r);
+    PASS();
+}
+
+/* ── パスワード変更 ──────────────────────────────────────────────────── */
+
+static void test_change_password(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/v1/auth/change-password", BASE_URL);
+
+    /* 現在のパスワードが間違っている → 400 */
+    Resp r1 = http_patch_auth_body(url,
+        "{\"current_password\":\"wrongpass\",\"new_password\":\"newpass123\"}",
+        g_token);
+    ASSERT(r1.status == 400, "wrong current password → 400");
+    resp_free(&r1);
+
+    /* 新しいパスワードが短すぎる → 400 */
+    Resp r2 = http_patch_auth_body(url,
+        "{\"current_password\":\"password123\",\"new_password\":\"short\"}",
+        g_token);
+    ASSERT(r2.status == 400, "too short → 400");
+    resp_free(&r2);
+
+    /* 正常変更 → 200 */
+    Resp r3 = http_patch_auth_body(url,
+        "{\"current_password\":\"password123\",\"new_password\":\"newpassword123\"}",
+        g_token);
+    ASSERT(r3.status == 200, "change success → 200");
+    resp_free(&r3);
+
+    /* 変更後の新しいパスワードでログイン → 成功 */
+    char login_url[256];
+    snprintf(login_url, sizeof(login_url), "%s/api/v1/auth/login", BASE_URL);
+    Resp r4 = http_post(login_url,
+        "{\"email\":\"taro@example.com\",\"password\":\"newpassword123\"}");
+    ASSERT(r4.status == 200, "login with new password → 200");
+    /* g_token を更新（以降のテストのために） */
+    cJSON *j = cJSON_Parse(r4.body);
+    if (j) {
+        const char *tok = cJSON_GetStringValue(cJSON_GetObjectItem(j, "token"));
+        if (tok && strlen(tok) > 10) strncpy(g_token, tok, sizeof(g_token)-1);
+        cJSON_Delete(j);
+    }
+    resp_free(&r4);
+    PASS();
+}
+
+/* ── パスワードリセット ───────────────────────────────────────────────── */
+
+static void test_forgot_reset_password(void) {
+    char url[256];
+
+    /* forgot-password: 存在しないメール → 200（列挙攻撃防止） */
+    snprintf(url, sizeof(url), "%s/api/v1/auth/forgot-password", BASE_URL);
+    Resp r1 = http_post(url, "{\"email\":\"noone@example.com\"}");
+    ASSERT(r1.status == 200, "unknown email → 200 (anti-enumeration)");
+    resp_free(&r1);
+
+    /* forgot-password: taro のメール → トークン取得 */
+    Resp r2 = http_post(url, "{\"email\":\"taro@example.com\"}");
+    ASSERT(r2.status == 200, "forgot-password → 200");
+    cJSON *j2 = cJSON_Parse(r2.body);
+    ASSERT(j2 != NULL, "valid JSON");
+    const char *token_ptr = cJSON_GetStringValue(cJSON_GetObjectItem(j2, "reset_token"));
+    ASSERT(token_ptr && strlen(token_ptr) == 32, "got 32-char token");
+    char reset_token[33] = {0};
+    strncpy(reset_token, token_ptr, 32);
+    cJSON_Delete(j2); resp_free(&r2);
+
+    /* reset-password: 無効トークン → 400 */
+    snprintf(url, sizeof(url), "%s/api/v1/auth/reset-password", BASE_URL);
+    Resp r3 = http_post(url,
+        "{\"token\":\"deadbeefdeadbeefdeadbeefdeadbeef\","
+        "\"new_password\":\"resetpass456\"}");
+    ASSERT(r3.status == 400, "invalid token → 400");
+    resp_free(&r3);
+
+    /* reset-password: 有効トークン → 200 */
+    char body[256];
+    snprintf(body, sizeof(body),
+        "{\"token\":\"%s\",\"new_password\":\"resetpass456\"}", reset_token);
+    Resp r4 = http_post(url, body);
+    ASSERT(r4.status == 200, "reset → 200");
+    resp_free(&r4);
+
+    /* トークン再利用 → 400 */
+    Resp r5 = http_post(url, body);
+    ASSERT(r5.status == 400, "used token → 400");
+    resp_free(&r5);
+
+    /* 新パスワードでログイン → 成功 */
+    snprintf(url, sizeof(url), "%s/api/v1/auth/login", BASE_URL);
+    Resp r6 = http_post(url,
+        "{\"email\":\"taro@example.com\",\"password\":\"resetpass456\"}");
+    ASSERT(r6.status == 200, "login with reset password → 200");
+    cJSON *j6 = cJSON_Parse(r6.body);
+    if (j6) {
+        const char *tok = cJSON_GetStringValue(cJSON_GetObjectItem(j6, "token"));
+        if (tok && strlen(tok) > 10) strncpy(g_token, tok, sizeof(g_token)-1);
+        cJSON_Delete(j6);
+    }
+    resp_free(&r6);
+    PASS();
+}
+
 static void test_search_keyword(void) {
     char url[256];
     /* q=ダイビング URL-encoded */
@@ -829,7 +1040,8 @@ static void test_create_bookmark(void) {
 
 static void test_list_user_bookmarks(void) {
     char url[256]; snprintf(url, sizeof(url), "%s/api/v1/users/1/bookmarks", BASE_URL);
-    Resp r = http_get(url);
+    /* JWT 必須になった → g_token (taro=user_id 1) で取得 */
+    Resp r = http_get_auth(url, g_token);
     ASSERT(r.status == 200, "list bookmarks 200");
     cJSON *arr = cJSON_Parse(r.body);
     ASSERT(cJSON_IsArray(arr) && cJSON_GetArraySize(arr) > 0, "has bookmarks");
@@ -954,6 +1166,13 @@ int main(void) {
     /* ── アクセス制御 ── */
     test_booking_access_control();
     test_booking_list_access_control();
+    /* ── 新機能 ── */
+    test_reviews_pagination();
+    test_bookmark_list_auth();
+    test_admin_list_venues();
+    test_admin_list_plans();
+    test_change_password();
+    test_forgot_reset_password();
 
     kill(pid, 15);
 
