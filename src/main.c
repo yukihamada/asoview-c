@@ -146,6 +146,32 @@ int main(int argc, char *argv[]) {
     if (argc >= 2) db_path = argv[1];
     if (argc >= 3) port = argv[2];
 
+    /* ── セキュリティ起動チェック ──────────────────────────────────── */
+    const char *jwt_secret   = getenv("JWT_SECRET");
+    const char *admin_key    = getenv("ADMIN_KEY");
+    const char *stripe_sk    = getenv("STRIPE_SECRET_KEY");
+    const char *stripe_whsec = getenv("STRIPE_WEBHOOK_SECRET");
+
+    if (!jwt_secret || !*jwt_secret) {
+        fprintf(stderr,
+            "[WARN] JWT_SECRET is not set — using insecure default. "
+            "Set JWT_SECRET in production!\n");
+    } else if (strlen(jwt_secret) < 32) {
+        fprintf(stderr,
+            "[WARN] JWT_SECRET is too short (%zu chars). "
+            "Use at least 32 random characters.\n", strlen(jwt_secret));
+    }
+    if (!admin_key || !*admin_key) {
+        fprintf(stderr,
+            "[WARN] ADMIN_KEY is not set — using insecure default. "
+            "Set ADMIN_KEY in production!\n");
+    }
+    if (stripe_sk && *stripe_sk && (!stripe_whsec || !*stripe_whsec)) {
+        fprintf(stderr,
+            "[WARN] STRIPE_SECRET_KEY is set but STRIPE_WEBHOOK_SECRET is missing. "
+            "Webhooks will be rejected.\n");
+    }
+
     sqlite3 *db = db_open(db_path);
     if (!db) return 1;
     seed_if_empty(db);

@@ -155,6 +155,11 @@ int stripe_verify_webhook(const char *sig_header,
 
     if (!ts[0] || !v1[0]) return 0;
 
+    /* タイムスタンプ検証: ±5分以内のイベントのみ受理（リプレイ攻撃防止） */
+    long ts_time = strtol(ts, NULL, 10);
+    long now     = (long)time(NULL);
+    if (ts_time <= 0 || (now - ts_time) > 300 || (ts_time - now) > 300) return 0;
+
     /* 署名対象: "TIMESTAMP.PAYLOAD" */
     size_t ts_len     = strlen(ts);
     size_t signed_len = ts_len + 1 + payload_len;

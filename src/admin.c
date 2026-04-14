@@ -9,15 +9,27 @@
 
 /* ─── Admin 認証 ──────────────────────────────────────────────────────────── */
 
+/* 定数時間文字列比較（タイミング攻撃対策） */
+static int const_time_strcmp(const char *a, size_t a_len,
+                              const char *b, size_t b_len) {
+    /* 長さが違えば必ず不一致。ただし長さ自体も漏らさないよう両方走査する */
+    unsigned char diff = (unsigned char)(a_len != b_len);
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t i = 0; i < n; i++) {
+        diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
+    }
+    return diff == 0 ? 1 : 0;
+}
+
 static int require_admin(struct mg_connection *c, struct mg_http_message *hm) {
     struct mg_str *hdr = mg_http_get_header(hm, "X-Admin-Key");
     if (!hdr) { send_error_json(c, 403, "管理者キーが必要です"); return 0; }
     const char *expected = getenv("ADMIN_KEY");
     if (!expected || !*expected) expected = "asoview-admin-dev";
-    char key[256] = {0};
-    size_t kl = hdr->len < sizeof(key)-1 ? hdr->len : sizeof(key)-1;
-    memcpy(key, hdr->buf, kl);
-    if (strcmp(key, expected) != 0) { send_error_json(c, 403, "管理者キーが不正です"); return 0; }
+    /* 定数時間比較でタイミング攻撃を防ぐ */
+    if (!const_time_strcmp(hdr->buf, hdr->len, expected, strlen(expected))) {
+        send_error_json(c, 403, "管理者キーが不正です"); return 0;
+    }
     return 1;
 }
 

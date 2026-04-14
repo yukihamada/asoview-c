@@ -621,6 +621,13 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
         return;
     }
 
+    /* note フィールドの長さ上限（DoS防止） */
+    if (note && strlen(note) > 1000) {
+        send_error_json(c, 400, "note は1000文字以内で入力してください");
+        cJSON_Delete(body);
+        return;
+    }
+
     /* 空き枠チェック */
     sqlite3_stmt *cap_st;
     sqlite3_prepare_v2(db,
