@@ -558,7 +558,12 @@ void handle_login(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *
 
 void handle_list_user_bookings(struct mg_connection *c, struct mg_http_message *hm,
                                 sqlite3 *db, long user_id) {
-    (void)hm;
+    /* JWT 必須 + 自分の予約のみ */
+    long auth_uid = require_auth(c, hm);
+    if (auth_uid < 0) return;
+    if (auth_uid != user_id) {
+        send_error_json(c, 403, "他のユーザーの予約一覧は取得できません"); return;
+    }
     sqlite3_stmt *st;
     sqlite3_prepare_v2(db,
         "SELECT b.id,b.user_id,b.plan_id,p.title,b.schedule_id,"
@@ -804,7 +809,9 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
 
 void handle_get_booking(struct mg_connection *c, struct mg_http_message *hm,
                         sqlite3 *db, const char *id) {
-    (void)hm;
+    /* JWT 必須 + 予約のオーナーのみ */
+    long auth_uid = require_auth(c, hm);
+    if (auth_uid < 0) return;
     sqlite3_stmt *st;
     sqlite3_prepare_v2(db,
         "SELECT b.id,b.user_id,b.plan_id,p.title,b.schedule_id,"
@@ -814,39 +821,47 @@ void handle_get_booking(struct mg_connection *c, struct mg_http_message *hm,
         -1, &st, NULL);
     sqlite3_bind_text(st, 1, id, -1, SQLITE_STATIC);
 
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        const char *bid = (const char*)sqlite3_column_text(st, 0);
-        cJSON *bk = cJSON_CreateObject();
-        cJSON_AddStringToObject(bk, "id", bid);
-        cJSON_AddNumberToObject(bk, "user_id",    sqlite3_column_int64(st, 1));
-        cJSON_AddNumberToObject(bk, "plan_id",    sqlite3_column_int64(st, 2));
-        cJSON_AddStringToObject(bk, "plan_title", (const char*)sqlite3_column_text(st, 3));
-        cJSON_AddNumberToObject(bk, "schedule_id",sqlite3_column_int64(st, 4));
-        cJSON_AddStringToObject(bk, "schedule_date",       (const char*)sqlite3_column_text(st, 5));
-        cJSON_AddStringToObject(bk, "schedule_start_time", (const char*)sqlite3_column_text(st, 6));
-        cJSON_AddStringToObject(bk, "status",     (const char*)sqlite3_column_text(st, 7));
-        cJSON_AddNumberToObject(bk, "total_price",sqlite3_column_int64(st, 8));
-        if (sqlite3_column_type(st, 9) != SQLITE_NULL)
-            cJSON_AddStringToObject(bk, "note",   (const char*)sqlite3_column_text(st, 9));
-        else cJSON_AddNullToObject(bk, "note");
-        cJSON_AddStringToObject(bk, "created_at",(const char*)sqlite3_column_text(st, 10));
-        cJSON_AddItemToObject(bk, "participants", fetch_participants(db, bid));
+    if (sqlite3_step(st) != SQLITE_ROW) {
         sqlite3_finalize(st);
-        send_cjson(c, 200, bk);
-        cJSON_Delete(bk);
-    } else {
-        sqlite3_finalize(st);
-        send_error_json(c, 404, "booking not found");
+        send_error_json(c, 404, "booking not found"); return;
     }
+    long owner_id = sqlite3_column_int64(st, 1);
+    if (owner_id != auth_uid) {
+        sqlite3_finalize(st);
+        send_error_json(c, 403, "この予約にアクセスする権限がありません"); return;
+    }
+    const char *bid = (const char*)sqlite3_column_text(st, 0);
+    cJSON *bk = cJSON_CreateObject();
+    cJSON_AddStringToObject(bk, "id", bid);
+    cJSON_AddNumberToObject(bk, "user_id",    owner_id);
+    cJSON_AddNumberToObject(bk, "plan_id",    sqlite3_column_int64(st, 2));
+    cJSON_AddStringToObject(bk, "plan_title", (const char*)sqlite3_column_text(st, 3));
+    cJSON_AddNumberToObject(bk, "schedule_id",sqlite3_column_int64(st, 4));
+    cJSON_AddStringToObject(bk, "schedule_date",       (const char*)sqlite3_column_text(st, 5));
+    cJSON_AddStringToObject(bk, "schedule_start_time", (const char*)sqlite3_column_text(st, 6));
+    cJSON_AddStringToObject(bk, "status",     (const char*)sqlite3_column_text(st, 7));
+    cJSON_AddNumberToObject(bk, "total_price",sqlite3_column_int64(st, 8));
+    if (sqlite3_column_type(st, 9) != SQLITE_NULL)
+        cJSON_AddStringToObject(bk, "note",   (const char*)sqlite3_column_text(st, 9));
+    else cJSON_AddNullToObject(bk, "note");
+    cJSON_AddStringToObject(bk, "created_at",(const char*)sqlite3_column_text(st, 10));
+    cJSON_AddItemToObject(bk, "participants", fetch_participants(db, bid));
+    sqlite3_finalize(st);
+    send_cjson(c, 200, bk);
+    cJSON_Delete(bk);
 }
 
 /* ─── Reviews ─────────────────────────────────────────────────────────────── */
 
 void handle_create_review(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db) {
+    /* JWT 認証 — user_id はトークンから取得（ボディの値は無視） */
+    long auth_uid = require_auth(c, hm);
+    if (auth_uid < 0) return;
+
     cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
     if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
 
-    long user_id = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "user_id"));
+    long user_id = auth_uid; /* JWT から取得した値のみ使用 */
     long plan_id = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "plan_id"));
     long rating  = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "rating"));
     const char *comment    = cJSON_GetStringValue(cJSON_GetObjectItem(body, "comment"));

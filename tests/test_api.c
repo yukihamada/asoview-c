@@ -58,6 +58,24 @@ static Resp http_get(const char *url) {
     return r;
 }
 
+static Resp http_get_auth(const char *url, const char *token) {
+    CURL *curl = curl_easy_init();
+    Buf buf = { malloc(1), 0 };
+    char auth_hdr[600];
+    snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s", token);
+    struct curl_slist *hdrs = curl_slist_append(NULL, auth_hdr);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_perform(curl);
+    Resp r = { buf.data, 0 };
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    return r;
+}
+
 static Resp http_post(const char *url, const char *json_body) {
     CURL *curl = curl_easy_init();
     Buf buf = { malloc(1), 0 };
@@ -444,10 +462,10 @@ static void test_create_and_get_booking(void) {
     ASSERT(bid && strlen(bid) == 36, "id is UUID");
     strncpy(g_booking_id, bid, sizeof(g_booking_id)-1);
 
-    /* GET */
+    /* GET (JWT 必須) */
     char get_url[300];
     snprintf(get_url, sizeof(get_url), "%s/api/v1/bookings/%s", BASE_URL, bid);
-    Resp r2 = http_get(get_url);
+    Resp r2 = http_get_auth(get_url, g_token);
     ASSERT(r2.status == 200, "GET booking 200");
     cJSON *j2 = cJSON_Parse(r2.body);
     ASSERT((long)cJSON_GetNumberValue(cJSON_GetObjectItem(j2, "total_price")) == 15960,
@@ -479,7 +497,7 @@ static void test_list_user_bookings(void) {
     resp_free(&rb);
 
     snprintf(url, sizeof(url), "%s/api/v1/users/2/bookings", BASE_URL);
-    Resp r = http_get(url);
+    Resp r = http_get_auth(url, g_token2);
     ASSERT(r.status == 200, "expected 200");
     cJSON *arr = cJSON_Parse(r.body);
     ASSERT(cJSON_IsArray(arr) && cJSON_GetArraySize(arr) > 0, "not empty");
@@ -489,19 +507,22 @@ static void test_list_user_bookings(void) {
 
 static void test_create_review(void) {
     char url[256]; snprintf(url, sizeof(url), "%s/api/v1/reviews", BASE_URL);
-    Resp r = http_post(url,
-        "{\"user_id\":1,\"plan_id\":1,\"rating\":5,"
-        "\"comment\":\"最高でした！\"}");
+    /* user_id は JWT から取得されるのでボディには不要 */
+    Resp r = http_post_auth(url,
+        "{\"plan_id\":1,\"rating\":5,"
+        "\"comment\":\"最高でした！\"}",
+        g_token);
     ASSERT(r.status == 201, "expected 201");
     cJSON *j = cJSON_Parse(r.body);
     ASSERT((long)cJSON_GetNumberValue(cJSON_GetObjectItem(j, "rating")) == 5, "rating=5");
+    ASSERT((long)cJSON_GetNumberValue(cJSON_GetObjectItem(j, "user_id")) == 1, "user_id from JWT");
     cJSON_Delete(j); resp_free(&r);
     PASS();
 }
 
 static void test_create_review_invalid_rating(void) {
     char url[256]; snprintf(url, sizeof(url), "%s/api/v1/reviews", BASE_URL);
-    Resp r = http_post(url, "{\"user_id\":1,\"plan_id\":1,\"rating\":6}");
+    Resp r = http_post_auth(url, "{\"plan_id\":1,\"rating\":6}", g_token);
     ASSERT(r.status == 400, "expected 400");
     resp_free(&r);
     PASS();
@@ -554,8 +575,9 @@ static void test_cancel_booking(void) {
     /* 再確認: status が cancelled */
     char get_url[300];
     snprintf(get_url, sizeof(get_url), "%s/api/v1/bookings/%s", BASE_URL, g_booking_id);
-    Resp r2 = http_get(get_url);
+    Resp r2 = http_get_auth(get_url, g_token);
     cJSON *j = cJSON_Parse(r2.body);
+    ASSERT(j != NULL, "cancel GET response is JSON");
     ASSERT(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(j, "status")), "cancelled") == 0,
            "status=cancelled");
 
@@ -806,8 +828,14 @@ int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0); /* line-buffered so output appears immediately */
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
+    /* 前回の残留プロセスをクリーンアップ */
+    system("pkill -f 'asoview-c.*3998' 2>/dev/null; true");
+    usleep(200000); /* 200ms 待機 */
+
     const char *db_path = "/tmp/asoview_c_test.db";
     unlink(db_path);
+    unlink("/tmp/asoview_c_test.db-wal");
+    unlink("/tmp/asoview_c_test.db-shm");
 
     /* Start server as child process */
     pid_t pid = fork();
