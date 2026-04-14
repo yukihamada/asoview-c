@@ -7,7 +7,7 @@ DEFS    = -DMG_ENABLE_LOG=0
 LDFLAGS = -lsqlite3 -lcurl -framework Security -framework CoreFoundation
 
 SRCS    = deps/mongoose.c deps/cJSON.c \
-          src/utils.c src/db.c src/seed.c src/handlers.c src/admin.c src/stripe.c
+          src/utils.c src/db.c src/seed.c src/handlers.c src/admin.c src/stripe.c src/rate_limit.c
 
 BIN     = asoview-c
 TEST    = tests/run_tests

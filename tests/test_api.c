@@ -472,7 +472,7 @@ static void test_list_user_bookings(void) {
     /* hanako (user2) のトークンで予約作成 */
     char url[256]; snprintf(url, sizeof(url), "%s/api/v1/bookings", BASE_URL);
     Resp rb = http_post_auth(url,
-        "{\"plan_id\":4,\"schedule_id\":12,"
+        "{\"plan_id\":4,\"schedule_id\":23,"
         "\"participants\":[{\"participant_type\":\"adult\",\"count\":1}]}",
         g_token2);
     ASSERT(rb.status == 201, "hanako booking created");
@@ -598,6 +598,7 @@ static void test_admin_no_key(void) {
 }
 
 static long g_test_venue_id = 0; /* admin_create_venue で設定 */
+static long g_test_plan_id  = 0; /* admin_create_plan で設定 */
 
 static void test_admin_create_venue(void) {
     char url[256]; snprintf(url, sizeof(url), "%s/api/v1/admin/venues", BASE_URL);
@@ -629,14 +630,14 @@ static void test_admin_create_plan_with_prices(void) {
     Resp r = http_post_admin(url, body);
     ASSERT(r.status == 201, "create plan 201");
     cJSON *j = cJSON_Parse(r.body);
-    ASSERT(cJSON_GetNumberValue(cJSON_GetObjectItem(j, "id")) > 0, "plan id > 0");
+    g_test_plan_id = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(j, "id"));
+    ASSERT(g_test_plan_id > 0, "plan id > 0");
     cJSON_Delete(j); resp_free(&r);
     PASS();
 }
 
 static void test_admin_create_schedule(void) {
-    /* plan_id は seed の最後(22) + 1 = 23 */
-    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/admin/plans/23/schedules", BASE_URL);
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/admin/plans/%ld/schedules", BASE_URL, g_test_plan_id);
     Resp r = http_post_admin(url,
         "{\"date\":\"2026-05-01\",\"start_time\":\"10:00\","
         "\"end_time\":\"11:00\",\"capacity\":5}");
@@ -648,7 +649,7 @@ static void test_admin_create_schedule(void) {
 }
 
 static void test_admin_update_plan(void) {
-    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/admin/plans/23", BASE_URL);
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/admin/plans/%ld", BASE_URL, g_test_plan_id);
     /* CURLOPT_CUSTOMREQUEST で PATCH を送る */
     CURL *curl = curl_easy_init();
     Buf buf = { malloc(1), 0 };
@@ -671,14 +672,14 @@ static void test_admin_update_plan(void) {
 }
 
 static void test_admin_set_prices(void) {
-    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/admin/plans/23/prices", BASE_URL);
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/admin/plans/%ld/prices", BASE_URL, g_test_plan_id);
     Resp r = http_put_admin(url,
         "[{\"participant_type\":\"adult\",\"label\":\"大人（更新）\",\"price\":3500}]");
     ASSERT(r.status == 200, "set prices 200");
     resp_free(&r);
 
     /* 価格が更新されたか確認 */
-    char purl[256]; snprintf(purl, sizeof(purl), "%s/api/v1/plans/23", BASE_URL);
+    char purl[256]; snprintf(purl, sizeof(purl), "%s/api/v1/plans/%ld", BASE_URL, g_test_plan_id);
     Resp r2 = http_get(purl);
     cJSON *j = cJSON_Parse(r2.body);
     cJSON *prices = cJSON_GetObjectItem(j, "prices");
@@ -691,13 +692,13 @@ static void test_admin_set_prices(void) {
 }
 
 static void test_admin_delete_plan(void) {
-    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/admin/plans/23", BASE_URL);
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/admin/plans/%ld", BASE_URL, g_test_plan_id);
     Resp r = http_delete_admin(url);
     ASSERT(r.status == 200, "delete (soft) 200");
     resp_free(&r);
 
     /* 非公開になったか確認 (is_active=0 → list に出なくなる) */
-    char purl[256]; snprintf(purl, sizeof(purl), "%s/api/v1/plans/23", BASE_URL);
+    char purl[256]; snprintf(purl, sizeof(purl), "%s/api/v1/plans/%ld", BASE_URL, g_test_plan_id);
     Resp r2 = http_get(purl);
     ASSERT(r2.status == 404, "soft-deleted plan → 404");
     resp_free(&r2);
@@ -722,6 +723,64 @@ static void test_search_area_category(void) {
     cJSON *j = cJSON_Parse(r.body);
     ASSERT(cJSON_GetArraySize(cJSON_GetObjectItem(j, "plans")) > 0, "found results");
     cJSON_Delete(j); resp_free(&r);
+    PASS();
+}
+
+/* Bearer トークン付き DELETE */
+static Resp http_delete_auth(const char *url, const char *token) {
+    CURL *curl = curl_easy_init();
+    Buf buf = { malloc(1), 0 };
+    char auth_hdr[600];
+    snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s", token);
+    struct curl_slist *hdrs = curl_slist_append(NULL, auth_hdr);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_perform(curl);
+    Resp r = { buf.data, 0 };
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    return r;
+}
+
+/* ─── ブックマークテスト ─────────────────────────────────────────────────── */
+
+static void test_create_bookmark(void) {
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/bookmarks", BASE_URL);
+    Resp r = http_post_auth(url, "{\"plan_id\":2}", g_token);
+    ASSERT(r.status == 201, "create bookmark 201");
+    cJSON *j = cJSON_Parse(r.body);
+    ASSERT((long)cJSON_GetNumberValue(cJSON_GetObjectItem(j, "plan_id")) == 2, "plan_id=2");
+    cJSON_Delete(j); resp_free(&r);
+    PASS();
+}
+
+static void test_list_user_bookmarks(void) {
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/users/1/bookmarks", BASE_URL);
+    Resp r = http_get(url);
+    ASSERT(r.status == 200, "list bookmarks 200");
+    cJSON *arr = cJSON_Parse(r.body);
+    ASSERT(cJSON_IsArray(arr) && cJSON_GetArraySize(arr) > 0, "has bookmarks");
+    cJSON *bm = cJSON_GetArrayItem(arr, 0);
+    ASSERT(cJSON_GetObjectItem(bm, "plan_title") != NULL, "has plan_title");
+    ASSERT(cJSON_GetObjectItem(bm, "venue_name") != NULL, "has venue_name");
+    cJSON_Delete(arr); resp_free(&r);
+    PASS();
+}
+
+static void test_delete_bookmark(void) {
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/bookmarks/2", BASE_URL);
+    Resp r = http_delete_auth(url, g_token);
+    ASSERT(r.status == 200, "delete bookmark 200");
+    resp_free(&r);
+
+    /* 削除後は404 */
+    Resp r2 = http_delete_auth(url, g_token);
+    ASSERT(r2.status == 404, "already deleted → 404");
+    resp_free(&r2);
     PASS();
 }
 
@@ -812,6 +871,10 @@ int main(void) {
     test_admin_set_prices();
     test_admin_delete_plan();
     test_admin_delete_venue();
+    /* ── ブックマーク ── */
+    test_create_bookmark();
+    test_list_user_bookmarks();
+    test_delete_bookmark();
 
     kill(pid, 15);
 

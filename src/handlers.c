@@ -1262,3 +1262,105 @@ void handle_stripe_webhook(struct mg_connection *c, struct mg_http_message *hm,
     /* Stripe は 2xx を受け取れればよい */
     mg_http_reply(c, 200, "Content-Type: application/json\r\n", "{\"received\":true}");
 }
+
+/* ─── POST /api/v1/bookmarks ────────────────────────────────────────────────── */
+
+void handle_create_bookmark(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db) {
+    long auth_uid = require_auth(c, hm);
+    if (auth_uid < 0) return;
+
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
+
+    long plan_id = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "plan_id"));
+    cJSON_Delete(body);
+
+    if (plan_id <= 0) {
+        send_error_json(c, 400, "plan_id は必須です"); return;
+    }
+
+    /* プランの存在確認 */
+    sqlite3_stmt *chk;
+    sqlite3_prepare_v2(db, "SELECT id FROM plans WHERE id=? AND is_active=1", -1, &chk, NULL);
+    sqlite3_bind_int64(chk, 1, plan_id);
+    if (sqlite3_step(chk) != SQLITE_ROW) {
+        sqlite3_finalize(chk);
+        send_error_json(c, 404, "plan not found"); return;
+    }
+    sqlite3_finalize(chk);
+
+    sqlite3_stmt *ins;
+    sqlite3_prepare_v2(db,
+        "INSERT OR IGNORE INTO bookmarks(user_id,plan_id) VALUES(?,?)",
+        -1, &ins, NULL);
+    sqlite3_bind_int64(ins, 1, auth_uid);
+    sqlite3_bind_int64(ins, 2, plan_id);
+    sqlite3_step(ins);
+    sqlite3_finalize(ins);
+
+    long bm_id = (long)sqlite3_last_insert_rowid(db);
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddNumberToObject(res, "id",      bm_id);
+    cJSON_AddNumberToObject(res, "user_id", auth_uid);
+    cJSON_AddNumberToObject(res, "plan_id", plan_id);
+    send_cjson(c, 201, res);
+    cJSON_Delete(res);
+}
+
+/* ─── DELETE /api/v1/bookmarks/:plan_id ────────────────────────────────────── */
+
+void handle_delete_bookmark(struct mg_connection *c, struct mg_http_message *hm,
+                             sqlite3 *db, long plan_id) {
+    long auth_uid = require_auth(c, hm);
+    if (auth_uid < 0) return;
+
+    sqlite3_stmt *del;
+    sqlite3_prepare_v2(db,
+        "DELETE FROM bookmarks WHERE user_id=? AND plan_id=?",
+        -1, &del, NULL);
+    sqlite3_bind_int64(del, 1, auth_uid);
+    sqlite3_bind_int64(del, 2, plan_id);
+    sqlite3_step(del);
+    int changes = sqlite3_changes(db);
+    sqlite3_finalize(del);
+
+    if (changes == 0) {
+        send_error_json(c, 404, "bookmark not found"); return;
+    }
+    send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"ブックマークを削除しました\"}");
+}
+
+/* ─── GET /api/v1/users/:id/bookmarks ──────────────────────────────────────── */
+
+void handle_list_user_bookmarks(struct mg_connection *c, struct mg_http_message *hm,
+                                 sqlite3 *db, long user_id) {
+    (void)hm;
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(db,
+        "SELECT bm.id, bm.plan_id, p.title, p.duration_minutes, v.name AS venue_name, "
+        "bm.created_at "
+        "FROM bookmarks bm "
+        "JOIN plans p ON p.id = bm.plan_id "
+        "JOIN venues v ON v.id = p.venue_id "
+        "WHERE bm.user_id = ? "
+        "ORDER BY bm.created_at DESC",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, user_id);
+
+    cJSON *arr = cJSON_CreateArray();
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        cJSON *bm = cJSON_CreateObject();
+        cJSON_AddNumberToObject(bm, "id",               sqlite3_column_int64(st, 0));
+        cJSON_AddNumberToObject(bm, "plan_id",          sqlite3_column_int64(st, 1));
+        cJSON_AddStringToObject(bm, "plan_title",       (const char*)sqlite3_column_text(st, 2));
+        if (sqlite3_column_type(st, 3) != SQLITE_NULL)
+            cJSON_AddNumberToObject(bm, "duration_minutes", sqlite3_column_int64(st, 3));
+        else cJSON_AddNullToObject(bm, "duration_minutes");
+        cJSON_AddStringToObject(bm, "venue_name",       (const char*)sqlite3_column_text(st, 4));
+        cJSON_AddStringToObject(bm, "created_at",       (const char*)sqlite3_column_text(st, 5));
+        cJSON_AddItemToArray(arr, bm);
+    }
+    sqlite3_finalize(st);
+    send_cjson(c, 200, arr);
+    cJSON_Delete(arr);
+}

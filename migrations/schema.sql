@@ -122,6 +122,15 @@ CREATE TABLE IF NOT EXISTS reviews (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- お気に入り（プランのブックマーク）
+CREATE TABLE IF NOT EXISTS bookmarks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id),
+    plan_id    INTEGER NOT NULL REFERENCES plans(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, plan_id)
+);
+
 -- レビュー更新時に venue の集計を自動更新
 CREATE TRIGGER IF NOT EXISTS update_venue_review_stats
 AFTER INSERT ON reviews

@@ -6,6 +6,7 @@
 #include "seed.h"
 #include "handlers.h"
 #include "admin.h"
+#include "rate_limit.h"
 
 static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     if (ev != MG_EV_HTTP_MSG) return;
@@ -14,6 +15,17 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     char uri[256] = {0};
     snprintf(uri, sizeof(uri), "%.*s", (int)hm->uri.len, hm->uri.buf);
+
+    /* IP ベースレート制限 */
+    char client_ip[48] = {0};
+    mg_snprintf(client_ip, sizeof(client_ip), "%M", mg_print_ip, &c->rem);
+    int is_auth_ep = (strncmp(hm->uri.buf, "/api/v1/auth", 12) == 0 ||
+                      strncmp(hm->uri.buf, "/api/v1/users", 13) == 0);
+    if (rate_check(client_ip, is_auth_ep)) {
+        mg_http_reply(c, 429, "Content-Type: application/json\r\n",
+                      "{\"error\":\"リクエスト数が多すぎます。しばらく経ってから再試行してください\"}");
+        return;
+    }
 
     long id = 0;
     char booking_id[64] = {0};
@@ -68,8 +80,13 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
                && strstr(uri, "/bookings") != NULL) {
         if (IS_GET) handle_list_user_bookings(c, hm, db, id);
 
+    } else if (sscanf(uri, "/api/v1/users/%ld/bookmarks", &id) == 1
+               && strstr(uri, "/bookmarks") != NULL) {
+        if (IS_GET) handle_list_user_bookmarks(c, hm, db, id);
+
     } else if (sscanf(uri, "/api/v1/users/%ld", &id) == 1
-               && strstr(uri, "/bookings") == NULL) {
+               && strstr(uri, "/bookings") == NULL
+               && strstr(uri, "/bookmarks") == NULL) {
         if (IS_GET)   handle_get_user(c, hm, db, id);
         else if (IS_PATCH) handle_update_user(c, hm, db, id);
 
@@ -98,6 +115,12 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     } else if (strcmp(uri, "/api/v1/webhooks/stripe") == 0) {
         if (IS_POST) handle_stripe_webhook(c, hm, db);
+
+    } else if (strcmp(uri, "/api/v1/bookmarks") == 0) {
+        if (IS_POST) handle_create_bookmark(c, hm, db);
+
+    } else if (sscanf(uri, "/api/v1/bookmarks/%ld", &id) == 1) {
+        if (IS_DELETE) handle_delete_bookmark(c, hm, db, id);
 
     /* Admin endpoints: /api/v1/admin/ ──────────────────────── */
     } else if (strcmp(uri, "/api/v1/admin/venues") == 0) {

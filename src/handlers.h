@@ -29,3 +29,6 @@ void handle_list_venue_plans (struct mg_connection *c, struct mg_http_message *h
 void handle_get_user         (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db, long id);
 void handle_update_user      (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db, long id);
 void handle_stripe_webhook   (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db);
+void handle_create_bookmark  (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db);
+void handle_delete_bookmark  (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db, long plan_id);
+void handle_list_user_bookmarks(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db, long user_id);
