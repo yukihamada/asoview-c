@@ -1,11 +1,10 @@
 #include "stripe.h"
+#include "platform.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <curl/curl.h>
-#include <CommonCrypto/CommonHMAC.h>
-#include <CommonCrypto/CommonDigest.h>
 
 /* ─── HTTP レスポンス蓄積バッファ ─────────────────────────────────── */
 
@@ -170,21 +169,19 @@ int stripe_verify_webhook(const char *sig_header,
     memcpy(signed_buf + ts_len + 1, payload, payload_len);
 
     /* HMAC-SHA256 */
-    unsigned char mac[CC_SHA256_DIGEST_LENGTH];
-    CCHmac(kCCHmacAlgSHA256,
-           webhook_secret, strlen(webhook_secret),
-           signed_buf, signed_len,
-           mac);
+    unsigned char mac[PLATFORM_SHA256_LEN];
+    platform_hmac_sha256(webhook_secret, strlen(webhook_secret),
+                         signed_buf, signed_len, mac);
     free(signed_buf);
 
-    char computed[CC_SHA256_DIGEST_LENGTH * 2 + 1];
-    hex_encode(mac, CC_SHA256_DIGEST_LENGTH, computed);
+    char computed[PLATFORM_SHA256_LEN * 2 + 1];
+    hex_encode(mac, PLATFORM_SHA256_LEN, computed);
 
     /* 定数時間比較（タイミング攻撃対策）*/
     int diff = 0;
     size_t expected_len = strlen(v1);
-    if (expected_len != CC_SHA256_DIGEST_LENGTH * 2) return 0;
-    for (size_t i = 0; i < CC_SHA256_DIGEST_LENGTH * 2; i++) {
+    if (expected_len != PLATFORM_SHA256_LEN * 2) return 0;
+    for (size_t i = 0; i < PLATFORM_SHA256_LEN * 2; i++) {
         diff |= (unsigned char)computed[i] ^ (unsigned char)v1[i];
     }
     return diff == 0 ? 1 : 0;

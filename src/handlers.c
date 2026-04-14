@@ -867,10 +867,46 @@ void handle_create_review(struct mg_connection *c, struct mg_http_message *hm, s
     const char *comment    = cJSON_GetStringValue(cJSON_GetObjectItem(body, "comment"));
     const char *booking_id = cJSON_GetStringValue(cJSON_GetObjectItem(body, "booking_id"));
 
+    if (plan_id <= 0) {
+        send_error_json(c, 400, "plan_id は必須です");
+        cJSON_Delete(body); return;
+    }
     if (rating < 1 || rating > 5) {
         send_error_json(c, 400, "rating は 1〜5 で指定してください");
         cJSON_Delete(body);
         return;
+    }
+
+    /* 予約確認: このユーザーがこのプランを予約済みか（confirmed または cancelled） */
+    if (booking_id && *booking_id) {
+        /* booking_id 指定ありの場合: そのbookingがユーザーのものでplan_idが一致するか */
+        sqlite3_stmt *bchk;
+        sqlite3_prepare_v2(db,
+            "SELECT id FROM bookings WHERE id=? AND user_id=? AND plan_id=?",
+            -1, &bchk, NULL);
+        sqlite3_bind_text(bchk, 1, booking_id, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(bchk, 2, auth_uid);
+        sqlite3_bind_int64(bchk, 3, plan_id);
+        int found = (sqlite3_step(bchk) == SQLITE_ROW);
+        sqlite3_finalize(bchk);
+        if (!found) {
+            send_error_json(c, 403, "指定された予約はこのプランの予約ではありません");
+            cJSON_Delete(body); return;
+        }
+    } else {
+        /* booking_id なしの場合: confirmed/cancelled 予約が少なくとも1件あるか */
+        sqlite3_stmt *bchk;
+        sqlite3_prepare_v2(db,
+            "SELECT id FROM bookings WHERE user_id=? AND plan_id=? AND status IN ('confirmed','cancelled') LIMIT 1",
+            -1, &bchk, NULL);
+        sqlite3_bind_int64(bchk, 1, auth_uid);
+        sqlite3_bind_int64(bchk, 2, plan_id);
+        int found = (sqlite3_step(bchk) == SQLITE_ROW);
+        sqlite3_finalize(bchk);
+        if (!found) {
+            send_error_json(c, 403, "このプランを予約したユーザーのみレビューを投稿できます");
+            cJSON_Delete(body); return;
+        }
     }
 
     sqlite3_stmt *st;

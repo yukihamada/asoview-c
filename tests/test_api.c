@@ -507,16 +507,28 @@ static void test_list_user_bookings(void) {
 
 static void test_create_review(void) {
     char url[256]; snprintf(url, sizeof(url), "%s/api/v1/reviews", BASE_URL);
-    /* user_id は JWT から取得されるのでボディには不要 */
-    Resp r = http_post_auth(url,
-        "{\"plan_id\":1,\"rating\":5,"
-        "\"comment\":\"最高でした！\"}",
-        g_token);
+    /* taro は plan_id=1 を予約済み（test_create_and_get_booking）。booking_id を渡す */
+    char body[256];
+    snprintf(body, sizeof(body),
+        "{\"plan_id\":1,\"rating\":5,\"comment\":\"最高でした！\",\"booking_id\":\"%s\"}",
+        g_booking_id);
+    Resp r = http_post_auth(url, body, g_token);
     ASSERT(r.status == 201, "expected 201");
     cJSON *j = cJSON_Parse(r.body);
     ASSERT((long)cJSON_GetNumberValue(cJSON_GetObjectItem(j, "rating")) == 5, "rating=5");
     ASSERT((long)cJSON_GetNumberValue(cJSON_GetObjectItem(j, "user_id")) == 1, "user_id from JWT");
     cJSON_Delete(j); resp_free(&r);
+    PASS();
+}
+
+static void test_create_review_unbooked(void) {
+    /* 予約していないユーザー(hanako)がplan_id=1にレビューしようとする → 403 */
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/reviews", BASE_URL);
+    Resp r = http_post_auth(url,
+        "{\"plan_id\":1,\"rating\":3,\"comment\":\"未予約でも投稿できる？\"}",
+        g_token2);
+    ASSERT(r.status == 403, "unbooked review → 403");
+    resp_free(&r);
     PASS();
 }
 
@@ -887,6 +899,7 @@ int main(void) {
     /* ── レビュー / 検索 ── */
     test_create_review();
     test_create_review_invalid_rating();
+    test_create_review_unbooked();
     test_search_keyword();
     test_search_no_results();
     test_search_area_category();

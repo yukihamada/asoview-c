@@ -1,18 +1,17 @@
 #include "utils.h"
+#include "platform.h"
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <time.h>
-#include <CommonCrypto/CommonKeyDerivation.h>
-#include <CommonCrypto/CommonHMAC.h>
 
 /* ─── UUID v4 ────────────────────────────────────────────────────────────── */
 
 void generate_uuid(char *buf) {
     uint8_t b[16];
-    arc4random_buf(b, sizeof(b));
+    platform_random(b, sizeof(b));
     b[6] = (b[6] & 0x0f) | 0x40; /* version 4 */
     b[8] = (b[8] & 0x3f) | 0x80; /* variant  */
     snprintf(buf, 37,
@@ -25,12 +24,11 @@ void generate_uuid(char *buf) {
 
 int hash_password(const char *password, char *hash_out, size_t out_len) {
     uint8_t salt[16], dk[32];
-    arc4random_buf(salt, sizeof(salt));
+    platform_random(salt, sizeof(salt));
 
-    CCKeyDerivationPBKDF(kCCPBKDF2, password, strlen(password),
-                         salt, sizeof(salt),
-                         kCCPRFHmacAlgSHA256, 100000,
-                         dk, sizeof(dk));
+    platform_pbkdf2_sha256(password, strlen(password),
+                           salt, sizeof(salt), 100000,
+                           dk, sizeof(dk));
 
     char salt_hex[33], dk_hex[65];
     for (int i = 0; i < 16; i++) snprintf(salt_hex + i*2, 3, "%02x", salt[i]);
@@ -48,10 +46,9 @@ int verify_password(const char *password, const char *stored_hash) {
     for (int i = 0; i < 16; i++) sscanf(salt_hex + i*2, "%2hhx", &salt[i]);
     for (int i = 0; i < 32; i++) sscanf(dk_hex   + i*2, "%2hhx", &expected[i]);
 
-    CCKeyDerivationPBKDF(kCCPBKDF2, password, strlen(password),
-                         salt, sizeof(salt),
-                         kCCPRFHmacAlgSHA256, 100000,
-                         dk, sizeof(dk));
+    platform_pbkdf2_sha256(password, strlen(password),
+                           salt, sizeof(salt), 100000,
+                           dk, sizeof(dk));
 
     /* constant-time compare */
     uint8_t diff = 0;
@@ -153,7 +150,7 @@ char *jwt_create(long user_id, const char *secret) {
 
     /* HMAC-SHA256 */
     uint8_t mac[32];
-    CCHmac(kCCHmacAlgSHA256, secret, strlen(secret), si, strlen(si), mac);
+    platform_hmac_sha256(secret, strlen(secret), si, strlen(si), mac);
     char sig[64];
     b64url_encode(mac, 32, sig);
 
@@ -174,7 +171,7 @@ long jwt_verify(const char *token, const char *secret) {
     /* verify signature */
     size_t si_len = (size_t)(p2 - token);
     uint8_t mac[32];
-    CCHmac(kCCHmacAlgSHA256, secret, strlen(secret), token, si_len, mac);
+    platform_hmac_sha256(secret, strlen(secret), token, si_len, mac);
     char expected[64];
     b64url_encode(mac, 32, expected);
     if (strcmp(expected, p2+1) != 0) return -1;

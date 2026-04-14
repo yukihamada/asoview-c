@@ -17,7 +17,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            build-essential libsqlite3-dev libcurl4-openssl-dev
+            build-essential libsqlite3-dev libcurl4-openssl-dev libssl-dev
 
       - name: Build schema embed
         run: make schema
