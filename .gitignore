@@ -1,0 +1,7 @@
+asoview-c
+tests/run_tests
+*.db
+*.db-wal
+*.db-shm
+*.o
+.DS_Store
