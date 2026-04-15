@@ -165,7 +165,7 @@ static void free_param_strings(DbStmt *st) {
 }
 
 void db_bind_int(DbStmt *st, int idx, long long v) {
-    if (idx < 1 || idx > st->nparams) return;
+    if (!st || idx < 1 || idx > st->nparams) return;
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", v);
     free(st->param_values[idx-1]);
@@ -175,7 +175,7 @@ void db_bind_int(DbStmt *st, int idx, long long v) {
 }
 
 void db_bind_text(DbStmt *st, int idx, const char *v) {
-    if (idx < 1 || idx > st->nparams) return;
+    if (!st || idx < 1 || idx > st->nparams) return;
     free(st->param_values[idx-1]);
     st->param_values[idx-1] = v ? strdup(v) : NULL;
     st->param_lengths[idx-1] = 0;
@@ -183,7 +183,7 @@ void db_bind_text(DbStmt *st, int idx, const char *v) {
 }
 
 void db_bind_double(DbStmt *st, int idx, double v) {
-    if (idx < 1 || idx > st->nparams) return;
+    if (!st || idx < 1 || idx > st->nparams) return;
     char buf[64];
     snprintf(buf, sizeof(buf), "%.17g", v);
     free(st->param_values[idx-1]);

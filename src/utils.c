@@ -92,10 +92,11 @@ void sha256_hex(const char *input, size_t input_len, char out[65]) {
 /* ─── LIKE escape ────────────────────────────────────────────────────────── */
 
 void escape_like(const char *src, char *dst, size_t dst_len) {
+    /* '!' を ESCAPE 文字として使用 (全バックエンドで安全) */
     size_t j = 0;
     for (size_t i = 0; src[i] && j + 2 < dst_len; i++) {
-        if (src[i] == '%' || src[i] == '_' || src[i] == '\\')
-            dst[j++] = '\\';
+        if (src[i] == '%' || src[i] == '_' || src[i] == '!')
+            dst[j++] = '!';
         dst[j++] = src[i];
     }
     dst[j] = '\0';

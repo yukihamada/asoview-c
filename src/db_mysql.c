@@ -207,7 +207,7 @@ DbStmt *db_prepare(DbConn *db, const char *sql) {
 }
 
 void db_bind_int(DbStmt *st, int idx, long long v) {
-    if (idx < 1 || idx > st->nparams) return;
+    if (!st || idx < 1 || idx > st->nparams) return;
     int i = idx - 1;
     st->param_ints[i] = v;
     st->param_binds[i].buffer_type   = MYSQL_TYPE_LONGLONG;
@@ -218,7 +218,7 @@ void db_bind_int(DbStmt *st, int idx, long long v) {
 }
 
 void db_bind_text(DbStmt *st, int idx, const char *v) {
-    if (idx < 1 || idx > st->nparams) return;
+    if (!st || idx < 1 || idx > st->nparams) return;
     int i = idx - 1;
     free(st->param_strs[i]);
     st->param_strs[i] = v ? strdup(v) : NULL;
@@ -237,7 +237,7 @@ void db_bind_text(DbStmt *st, int idx, const char *v) {
 }
 
 void db_bind_double(DbStmt *st, int idx, double v) {
-    if (idx < 1 || idx > st->nparams) return;
+    if (!st || idx < 1 || idx > st->nparams) return;
     int i = idx - 1;
     st->param_dbls[i] = v;
     st->param_binds[i].buffer_type   = MYSQL_TYPE_DOUBLE;

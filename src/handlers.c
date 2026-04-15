@@ -609,7 +609,7 @@ void handle_login(struct mg_connection *c, struct mg_http_message *hm, DbConn *d
     if (locked_buf[0]) {
         DbStmt *lk = NULL;
         lk = db_prepare(db,
-            "SELECT locked_until > " SQL_NOW_STR " FROM users WHERE id=?");
+            "SELECT CASE WHEN locked_until > " SQL_NOW_STR " THEN 1 ELSE 0 END FROM users WHERE id=?");
         db_bind_int(lk, 1, uid);
         db_step(lk);
         int still_locked = (int)db_col_int(lk, 0);
@@ -1106,7 +1106,7 @@ void handle_search(struct mg_connection *c, struct mg_http_message *hm, DbConn *
         "SELECT COUNT(DISTINCT p.id) FROM plans p "
         "JOIN venues v ON v.id=p.venue_id "
         "WHERE p.is_active=1 "
-        "AND (? = 0 OR p.title LIKE ? ESCAPE '\\' OR p.description LIKE ? ESCAPE '\\' OR v.name LIKE ? ESCAPE '\\') "
+        "AND (? = 0 OR p.title LIKE ? ESCAPE '!' OR p.description LIKE ? ESCAPE '!' OR v.name LIKE ? ESCAPE '!') "
         "AND (? = 0 OR p.category_id=?) "
         "AND (? = 0 OR v.area_id=?) "
         "AND (? = 0 OR EXISTS (SELECT 1 FROM schedules s "
@@ -1123,7 +1123,7 @@ void handle_search(struct mg_connection *c, struct mg_http_message *hm, DbConn *
         "ORDER BY p.id LIMIT ? OFFSET ?", PLAN_SELECT);
     snprintf(qsql_like, sizeof(qsql_like),
         "%s WHERE p.is_active=1 "
-        "AND (? = 0 OR p.title LIKE ? ESCAPE '\\' OR p.description LIKE ? ESCAPE '\\' OR v.name LIKE ? ESCAPE '\\') "
+        "AND (? = 0 OR p.title LIKE ? ESCAPE '!' OR p.description LIKE ? ESCAPE '!' OR v.name LIKE ? ESCAPE '!') "
         "AND (? = 0 OR p.category_id=?) "
         "AND (? = 0 OR v.area_id=?) "
         "AND (? = 0 OR EXISTS (SELECT 1 FROM schedules s "
