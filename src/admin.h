@@ -58,3 +58,11 @@ void handle_admin_create_tenant     (struct mg_connection *c, struct mg_http_mes
 void handle_admin_get_tenant        (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id);
 void handle_admin_update_tenant     (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id);
 void handle_admin_delete_tenant     (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id);
+/* Gift Cards */
+void handle_admin_list_giftcards    (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+void handle_admin_create_giftcard   (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+void handle_admin_delete_giftcard   (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id);
+/* Staff management */
+void handle_admin_list_staff        (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+void handle_admin_assign_staff_venue(struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+void handle_admin_remove_staff_venue(struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long user_id, long venue_id);

@@ -13,11 +13,49 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <zlib.h>
+#include <curl/curl.h>
 
 #define MAX_BUF 256
 
 /* ─── X-Request-ID（main.c から設定される） ──────────────────────────────── */
 char g_request_id[40] = "none";
+
+/* ─── Per-request フラグ（シングルスレッドなのでグローバルで安全） ────────── */
+int g_accept_gzip = 0;   /* 1 = クライアントが gzip を受け付ける */
+int g_lang_en     = 0;   /* 1 = Accept-Language: en */
+
+/* ─── i18n ヘルパー ─────────────────────────────────────────────────────── */
+#define T(ja, en) (g_lang_en ? (en) : (ja))
+
+/* ─── gzip 圧縮ヘルパー ─────────────────────────────────────────────────── */
+static int gzip_compress(const char *src, size_t src_len,
+                          char **dst_out, size_t *dst_len_out) {
+    z_stream zs = {0};
+    if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                     15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) return -1;
+    size_t bound = deflateBound(&zs, (uLong)src_len) + 64;
+    char *buf = malloc(bound);
+    if (!buf) { deflateEnd(&zs); return -1; }
+    zs.next_in  = (Bytef*)src;
+    zs.avail_in = (uInt)src_len;
+    zs.next_out  = (Bytef*)buf;
+    zs.avail_out = (uInt)bound;
+    if (deflate(&zs, Z_FINISH) != Z_STREAM_END) {
+        free(buf); deflateEnd(&zs); return -1;
+    }
+    *dst_len_out = (size_t)zs.total_out;
+    deflateEnd(&zs);
+    *dst_out = buf;
+    return 0;
+}
+
+/* ─── ETag: DJB2 ハッシュ ───────────────────────────────────────────────── */
+static uint32_t djb2_hash(const char *s, size_t len) {
+    uint32_t h = 5381;
+    for (size_t i = 0; i < len; i++) h = h * 33 ^ (unsigned char)s[i];
+    return h;
+}
 
 /* ─── 動的 CORS ヘッダー（CORS_ORIGIN 環境変数 + X-Request-ID 対応） ─────── */
 
@@ -49,9 +87,76 @@ void send_json_str(struct mg_connection *c, int status,
                   "%s", body);
 }
 
+/* ─── ETag ヘッダーを含む CORS ヘッダー文字列を生成 ─────────────────────── */
+static const char *cors_headers_with_etag(uint32_t etag_val, int gzipped) {
+    static char buf[800];
+    const char *origin = getenv("CORS_ORIGIN");
+    if (!origin || !*origin) origin = "*";
+    const char *force_https = getenv("FORCE_HTTPS");
+    int add_hsts = (force_https && (strcmp(force_https, "true") == 0 ||
+                                    strcmp(force_https, "1") == 0));
+    snprintf(buf, sizeof(buf),
+             "Content-Type: application/json\r\n"
+             "Access-Control-Allow-Origin: %s\r\n"
+             "X-Request-ID: %s\r\n"
+             "ETag: \"%08x\"\r\n"
+             "Cache-Control: public, max-age=30\r\n"
+             "%s%s",
+             origin, g_request_id, etag_val,
+             gzipped ? "Content-Encoding: gzip\r\n" : "",
+             add_hsts ? "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n" : "");
+    return buf;
+}
+
+/* 現在のリクエストの If-None-Match ヘッダーをグローバルに保持（main.c からも参照） */
+struct mg_http_message *g_hm_current = NULL;
+
 static void send_cjson(struct mg_connection *c, int status, cJSON *obj) {
     char *s = cJSON_PrintUnformatted(obj);
-    send_json_str(c, status, CORS_HEADERS, s);
+    if (!s) { send_error_json(c, 500, "OOM"); return; }
+    size_t slen = strlen(s);
+
+    /* ETag 計算 */
+    uint32_t etag_val = djb2_hash(s, slen);
+    char etag_str[16];
+    snprintf(etag_str, sizeof(etag_str), "\"%08x\"", etag_val);
+
+    /* If-None-Match チェック (GET/HEAD のみ) */
+    if (status == 200 && g_hm_current) {
+        struct mg_str *inm = mg_http_get_header(g_hm_current, "If-None-Match");
+        if (inm && inm->len == strlen(etag_str) &&
+            strncmp(inm->buf, etag_str, inm->len) == 0) {
+            mg_http_reply(c, 304, CORS_HEADERS, "");
+            cJSON_free(s);
+            return;
+        }
+    }
+
+    /* gzip 圧縮 */
+    if (g_accept_gzip && slen > 512) {
+        char *gz = NULL; size_t gz_len = 0;
+        if (gzip_compress(s, slen, &gz, &gz_len) == 0) {
+            char hbuf[1024];
+            int hlen = snprintf(hbuf, sizeof(hbuf),
+                "HTTP/1.1 %d OK\r\n%sContent-Length: %zu\r\n\r\n",
+                status, cors_headers_with_etag(etag_val, 1), gz_len);
+            mg_send(c, hbuf, (size_t)hlen);
+            mg_send(c, gz, gz_len);
+            free(gz);
+            cJSON_free(s);
+            return;
+        }
+    }
+
+    /* 通常送信（ETag 付き） — body は mg_send で送って % エスケープ問題を回避 */
+    {
+        char hbuf[1024];
+        int hlen = snprintf(hbuf, sizeof(hbuf),
+            "HTTP/1.1 %d OK\r\n%sContent-Length: %zu\r\n\r\n",
+            status, cors_headers_with_etag(etag_val, 0), slen);
+        mg_send(c, hbuf, (size_t)hlen);
+        mg_send(c, s, slen);
+    }
     cJSON_free(s);
 }
 
@@ -445,6 +550,10 @@ static cJSON *plan_row(DbStmt *st) {
     cJSON_AddItemToObject(p, "tags",   tags_arr ? tags_arr : cJSON_CreateArray());
     cJSON_AddBoolToObject(p, "is_active", (int)db_col_int(st, 13) == 1);
     cJSON_AddStringToObject(p, "created_at", db_col_text(st, 14));
+    /* キャンセルポリシー（cols 15-17） */
+    cJSON_AddNumberToObject(p, "cancel_days_full",    db_col_int(st, 15));
+    cJSON_AddNumberToObject(p, "cancel_days_partial", db_col_int(st, 16));
+    cJSON_AddNumberToObject(p, "cancel_pct_partial",  db_col_int(st, 17));
     return p;
 }
 
@@ -452,7 +561,8 @@ static const char *PLAN_SELECT =
     "SELECT p.id,p.venue_id,v.name,p.category_id,c.name,"
     "p.title,p.description,p.duration_minutes,"
     "p.min_participants,p.max_participants,p.min_age,"
-    "p.images,p.tags,p.is_active,p.created_at "
+    "p.images,p.tags,p.is_active,p.created_at,"
+    "p.cancel_days_full,p.cancel_days_partial,p.cancel_pct_partial "
     "FROM plans p "
     "JOIN venues v ON v.id=p.venue_id "
     "JOIN categories c ON c.id=p.category_id";
@@ -3087,4 +3197,477 @@ void handle_auth_2fa_verify(struct mg_connection *c, struct mg_http_message *hm,
     send_cjson(c, 200, res);
     cJSON_Delete(res);
     free(tok);
+}
+
+/* ─── PATCH /api/v1/bookings/:id/reschedule ───────────────────────────────── */
+
+void handle_reschedule_booking(struct mg_connection *c, struct mg_http_message *hm,
+                               DbConn *db, const char *id) {
+    long auth_uid = require_auth(c, hm, db);
+    if (auth_uid < 0) return;
+
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!body) { send_error_json(c, 400, T("無効な JSON", "invalid JSON")); return; }
+
+    cJSON *sid_j = cJSON_GetObjectItem(body, "schedule_id");
+    if (!sid_j || !cJSON_IsNumber(sid_j)) {
+        cJSON_Delete(body);
+        send_error_json(c, 400, T("schedule_id が必要です", "schedule_id is required"));
+        return;
+    }
+    long new_sched_id = (long)cJSON_GetNumberValue(sid_j);
+    cJSON_Delete(body);
+
+    /* 元の予約を取得 */
+    DbStmt *st = db_prepare(db,
+        "SELECT b.user_id, b.status, b.schedule_id, b.total_price, "
+        "       s.plan_id, u.email, p.title "
+        "FROM bookings b "
+        "JOIN schedules s ON s.id=b.schedule_id "
+        "JOIN plans p     ON p.id=s.plan_id "
+        "JOIN users u     ON u.id=b.user_id "
+        "WHERE b.id=?");
+    db_bind_text(st, 1, id);
+    if (db_step(st) != 1) {
+        db_finalize(st);
+        send_error_json(c, 404, T("予約が見つかりません", "booking not found")); return;
+    }
+    long owner_id     = db_col_int(st, 0);
+    char old_status[32] = {0};
+    const char *osv = db_col_text(st, 1); if (osv) strncpy(old_status, osv, sizeof(old_status)-1);
+    long old_sched_id = db_col_int(st, 2);
+    long total_people_col = db_col_int(st, 3); (void)total_people_col;
+    long plan_id      = db_col_int(st, 4);
+    char user_email[256] = {0};
+    const char *ev = db_col_text(st, 5); if (ev) strncpy(user_email, ev, sizeof(user_email)-1);
+    char plan_title[256] = {0};
+    const char *pv = db_col_text(st, 6); if (pv) strncpy(plan_title, pv, sizeof(plan_title)-1);
+    db_finalize(st);
+
+    if (owner_id != auth_uid) {
+        send_error_json(c, 403, T("この予約を変更する権限がありません", "forbidden")); return;
+    }
+    if (strcmp(old_status, "cancelled") == 0) {
+        send_error_json(c, 400, T("キャンセル済みの予約は変更できません", "booking already cancelled")); return;
+    }
+    if (old_sched_id == new_sched_id) {
+        send_error_json(c, 400, T("同じ日程です", "same schedule selected")); return;
+    }
+
+    /* 参加者合計 */
+    DbStmt *pst = db_prepare(db,
+        "SELECT COALESCE(SUM(count),0) FROM booking_participants WHERE booking_id=?");
+    db_bind_text(pst, 1, id);
+    db_step(pst);
+    long total_people = db_col_int(pst, 0);
+    db_finalize(pst);
+
+    /* 新スケジュール確認（同プランかつ空きあり） */
+    db_begin(db);
+    st = db_prepare(db,
+        "SELECT capacity, booked_count, date, start_time "
+        "FROM schedules WHERE id=? AND plan_id=?");
+    db_bind_int(st, 1, new_sched_id);
+    db_bind_int(st, 2, plan_id);
+    if (db_step(st) != 1) {
+        db_finalize(st); db_rollback(db);
+        send_error_json(c, 404, T("指定のスケジュールは存在しないか別プランです",
+                                   "schedule not found or different plan")); return;
+    }
+    long cap   = db_col_int(st, 0);
+    long booked= db_col_int(st, 1);
+    char new_date[16]  = {0}; const char *ndv = db_col_text(st, 2); if (ndv) strncpy(new_date, ndv, sizeof(new_date)-1);
+    char new_stime[8]  = {0}; const char *nsv = db_col_text(st, 3); if (nsv) strncpy(new_stime, nsv, sizeof(new_stime)-1);
+    db_finalize(st);
+
+    if (cap - booked < total_people) {
+        db_rollback(db);
+        send_error_json(c, 409, T("新しいスケジュールの空きが不足しています",
+                                   "not enough capacity in new schedule")); return;
+    }
+
+    /* 予約のスケジュールを更新 */
+    DbStmt *upd = db_prepare(db, "UPDATE bookings SET schedule_id=? WHERE id=?");
+    db_bind_int(upd, 1, new_sched_id);
+    db_bind_text(upd, 2, id);
+    db_step(upd); db_finalize(upd);
+
+    /* 旧スケジュールの booked_count を減らす */
+    DbStmt *dec = db_prepare(db,
+        "UPDATE schedules SET booked_count = MAX(0, booked_count - ?) WHERE id=?");
+    db_bind_int(dec, 1, total_people);
+    db_bind_int(dec, 2, old_sched_id);
+    db_step(dec); db_finalize(dec);
+
+    /* 新スケジュールの booked_count を増やす */
+    DbStmt *inc = db_prepare(db,
+        "UPDATE schedules SET booked_count = booked_count + ? WHERE id=?");
+    db_bind_int(inc, 1, total_people);
+    db_bind_int(inc, 2, new_sched_id);
+    db_step(inc); db_finalize(inc);
+
+    db_commit(db);
+
+    /* メール送信 */
+    if (user_email[0]) {
+        send_booking_reschedule_email(user_email, id, plan_title, new_date, new_stime);
+    }
+
+    /* 監査ログ */
+    {
+        char ip[48] = {0}; get_client_ip(c, ip, sizeof(ip));
+        char uid_str[24]; snprintf(uid_str, sizeof(uid_str), "%ld", auth_uid);
+        char detail[64]; snprintf(detail, sizeof(detail), "sched:%ld->%ld", old_sched_id, new_sched_id);
+        audit_log(db, uid_str, "booking.reschedule", "booking", id, detail, ip);
+    }
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddStringToObject(res, "message",    T("日程を変更しました", "rescheduled successfully"));
+    cJSON_AddStringToObject(res, "new_date",   new_date);
+    cJSON_AddStringToObject(res, "new_start_time", new_stime);
+    send_cjson(c, 200, res);
+    cJSON_Delete(res);
+}
+
+/* ─── GET /api/v1/gift-cards/:code ───────────────────────────────────────── */
+
+void handle_validate_giftcard(struct mg_connection *c, struct mg_http_message *hm,
+                               DbConn *db, const char *code) {
+    (void)hm;
+    DbStmt *st = db_prepare(db,
+        "SELECT id, initial_amount, remaining_balance, issued_to_email, "
+        "       expires_at, is_active, created_at "
+        "FROM gift_cards WHERE code=?");
+    db_bind_text(st, 1, code);
+    if (db_step(st) != 1) {
+        db_finalize(st);
+        send_error_json(c, 404, T("ギフト券が見つかりません", "gift card not found")); return;
+    }
+    long   gc_id    = db_col_int(st, 0);
+    long   initial  = db_col_int(st, 1);
+    long   balance  = db_col_int(st, 2);
+    int    active   = (int)db_col_int(st, 5);
+    char   expires[32] = {0}; const char *ev = db_col_text(st, 4); if (ev) strncpy(expires, ev, sizeof(expires)-1);
+    char   created_at[32] = {0}; const char *cv = db_col_text(st, 6); if (cv) strncpy(created_at, cv, sizeof(created_at)-1);
+    db_finalize(st);
+
+    if (!active) {
+        send_error_json(c, 410, T("このギフト券は無効です", "gift card is inactive")); return;
+    }
+    if (expires[0]) {
+        /* 期限チェック */
+        DbStmt *exp_st = db_prepare(db, "SELECT ? < date('now')");
+        db_bind_text(exp_st, 1, expires);
+        db_step(exp_st);
+        int expired = (int)db_col_int(exp_st, 0);
+        db_finalize(exp_st);
+        if (expired) {
+            send_error_json(c, 410, T("このギフト券は期限切れです", "gift card expired")); return;
+        }
+    }
+    if (balance <= 0) {
+        send_error_json(c, 410, T("このギフト券の残高がありません", "gift card balance is zero")); return;
+    }
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddNumberToObject(res, "id",                gc_id);
+    cJSON_AddStringToObject(res, "code",              code);
+    cJSON_AddNumberToObject(res, "initial_amount",    initial);
+    cJSON_AddNumberToObject(res, "remaining_balance", balance);
+    if (expires[0]) cJSON_AddStringToObject(res, "expires_at", expires);
+    else cJSON_AddNullToObject(res, "expires_at");
+    cJSON_AddStringToObject(res, "created_at", created_at);
+    send_cjson(c, 200, res);
+    cJSON_Delete(res);
+}
+
+/* ─── GET /api/v1/staff/bookings  (スタッフ: 担当会場の予約一覧) ──────────── */
+
+static int require_staff_auth(struct mg_connection *c, struct mg_http_message *hm,
+                               DbConn *db) {
+    long uid = require_auth(c, hm, db);
+    if (uid < 0) return -1;
+    /* ロール確認 */
+    DbStmt *st = db_prepare(db, "SELECT role FROM users WHERE id=?");
+    db_bind_int(st, 1, uid);
+    if (db_step(st) != 1) { db_finalize(st); send_error_json(c, 403, T("権限がありません", "forbidden")); return -1; }
+    char role[16] = {0}; const char *rv = db_col_text(st, 0); if (rv) strncpy(role, rv, sizeof(role)-1);
+    db_finalize(st);
+    if (strcmp(role, "staff") != 0 && strcmp(role, "admin") != 0) {
+        send_error_json(c, 403, T("スタッフ権限が必要です", "staff role required")); return -1;
+    }
+    return (int)uid;
+}
+
+void handle_staff_list_bookings(struct mg_connection *c, struct mg_http_message *hm,
+                                DbConn *db) {
+    int uid = require_staff_auth(c, hm, db);
+    if (uid < 0) return;
+
+    long page  = query_long(hm, "page", 1);  if (page < 1) page = 1;
+    long limit = query_long(hm, "limit", 20); if (limit > 100) limit = 100;
+    long offset = (page - 1) * limit;
+
+    DbStmt *st = db_prepare(db,
+        "SELECT b.id, p.title, u.name, u.email, b.status, b.total_price, "
+        "       s.date, s.start_time, b.created_at "
+        "FROM bookings b "
+        "JOIN schedules s ON s.id=b.schedule_id "
+        "JOIN plans p     ON p.id=s.plan_id "
+        "JOIN venues v    ON v.id=p.venue_id "
+        "JOIN users u     ON u.id=b.user_id "
+        "JOIN staff_venues sv ON sv.venue_id=v.id AND sv.user_id=? "
+        "ORDER BY b.created_at DESC LIMIT ? OFFSET ?");
+    db_bind_int(st, 1, uid);
+    db_bind_int(st, 2, limit);
+    db_bind_int(st, 3, offset);
+
+    cJSON *arr = cJSON_CreateArray();
+    while (db_step(st) == 1) {
+        cJSON *b = cJSON_CreateObject();
+        cJSON_AddStringToObject(b, "id",          db_col_text(st, 0));
+        cJSON_AddStringToObject(b, "plan_title",  db_col_text(st, 1));
+        cJSON_AddStringToObject(b, "user_name",   db_col_text(st, 2));
+        cJSON_AddStringToObject(b, "user_email",  db_col_text(st, 3));
+        cJSON_AddStringToObject(b, "status",      db_col_text(st, 4));
+        cJSON_AddNumberToObject(b, "total_price", db_col_int(st, 5));
+        cJSON_AddStringToObject(b, "date",        db_col_text(st, 6));
+        cJSON_AddStringToObject(b, "start_time",  db_col_text(st, 7));
+        cJSON_AddStringToObject(b, "created_at",  db_col_text(st, 8));
+        cJSON_AddItemToArray(arr, b);
+    }
+    db_finalize(st);
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddItemToObject(res, "bookings", arr);
+    send_cjson(c, 200, res);
+    cJSON_Delete(res);
+}
+
+/* ─── GET /api/v1/staff/venues  (スタッフ: 担当会場一覧) ─────────────────── */
+
+void handle_staff_list_venues(struct mg_connection *c, struct mg_http_message *hm,
+                               DbConn *db) {
+    int uid = require_staff_auth(c, hm, db);
+    if (uid < 0) return;
+
+    DbStmt *st = db_prepare(db,
+        "SELECT v.id, v.name, v.area_id, a.name, v.address, v.created_at "
+        "FROM venues v "
+        "JOIN staff_venues sv ON sv.venue_id=v.id AND sv.user_id=? "
+        "LEFT JOIN areas a ON a.id=v.area_id "
+        "ORDER BY v.name");
+    db_bind_int(st, 1, uid);
+
+    cJSON *arr = cJSON_CreateArray();
+    while (db_step(st) == 1) {
+        cJSON *v = cJSON_CreateObject();
+        cJSON_AddNumberToObject(v, "id",         db_col_int(st, 0));
+        cJSON_AddStringToObject(v, "name",       db_col_text(st, 1));
+        cJSON_AddNumberToObject(v, "area_id",    db_col_int(st, 2));
+        if (!db_col_is_null(st, 3))
+            cJSON_AddStringToObject(v, "area_name", db_col_text(st, 3));
+        else cJSON_AddNullToObject(v, "area_name");
+        if (!db_col_is_null(st, 4))
+            cJSON_AddStringToObject(v, "address", db_col_text(st, 4));
+        else cJSON_AddNullToObject(v, "address");
+        cJSON_AddStringToObject(v, "created_at", db_col_text(st, 5));
+        cJSON_AddItemToArray(arr, v);
+    }
+    db_finalize(st);
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddItemToObject(res, "venues", arr);
+    send_cjson(c, 200, res);
+    cJSON_Delete(res);
+}
+
+/* ─── Google OAuth ──────────────────────────────────────────────────────── */
+
+/* libcurl 用レスポンスバッファ */
+typedef struct { char *buf; size_t len; } OAuthBuf;
+static size_t oauth_write_cb(char *ptr, size_t sz, size_t nmemb, void *ud) {
+    OAuthBuf *b = (OAuthBuf*)ud;
+    size_t add = sz * nmemb;
+    char *tmp = realloc(b->buf, b->len + add + 1);
+    if (!tmp) return 0;
+    b->buf = tmp;
+    memcpy(b->buf + b->len, ptr, add);
+    b->len += add;
+    b->buf[b->len] = '\0';
+    return add;
+}
+
+void handle_auth_google(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    (void)hm; (void)db;
+    const char *cid      = getenv("GOOGLE_CLIENT_ID");
+    const char *redir    = getenv("GOOGLE_REDIRECT_URI");
+    if (!cid || !*cid) {
+        send_error_json(c, 503, T("Google OAuth が設定されていません", "Google OAuth not configured")); return;
+    }
+    if (!redir || !*redir) redir = "http://localhost:3001/api/v1/auth/google/callback";
+
+    char url[1024];
+    snprintf(url, sizeof(url),
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        "?client_id=%s"
+        "&redirect_uri=%s"
+        "&response_type=code"
+        "&scope=openid%%20email%%20profile"
+        "&access_type=offline",
+        cid, redir);
+
+    mg_printf(c,
+        "HTTP/1.1 302 Found\r\n"
+        "Location: %s\r\n"
+        "Content-Length: 0\r\n\r\n",
+        url);
+}
+
+void handle_auth_google_callback(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    const char *cid    = getenv("GOOGLE_CLIENT_ID");
+    const char *csec   = getenv("GOOGLE_CLIENT_SECRET");
+    const char *redir  = getenv("GOOGLE_REDIRECT_URI");
+    const char *secret = getenv("JWT_SECRET");
+    if (!secret || !*secret) secret = "dev-secret-key";
+    if (!redir || !*redir) redir = "http://localhost:3001/api/v1/auth/google/callback";
+
+    if (!cid || !csec) {
+        send_error_json(c, 503, T("Google OAuth が設定されていません", "Google OAuth not configured")); return;
+    }
+
+    char code[512] = {0};
+    if (!query_str(hm, "code", code, sizeof(code)) || !code[0]) {
+        send_error_json(c, 400, T("code が見つかりません", "missing code")); return;
+    }
+
+    /* ── Step 1: access_token を取得 ────────────────────────────────────── */
+    CURL *curl = curl_easy_init();
+    if (!curl) { send_error_json(c, 500, "curl init failed"); return; }
+
+    char post[2048];
+    snprintf(post, sizeof(post),
+        "code=%s&client_id=%s&client_secret=%s&redirect_uri=%s&grant_type=authorization_code",
+        code, cid, csec, redir);
+
+    OAuthBuf tok_resp = {NULL, 0};
+    curl_easy_setopt(curl, CURLOPT_URL, "https://oauth2.googleapis.com/token");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, oauth_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &tok_resp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    CURLcode cc = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+
+    if (cc != CURLE_OK || !tok_resp.buf) {
+        free(tok_resp.buf);
+        send_error_json(c, 502, T("Google との通信に失敗しました", "Google token exchange failed")); return;
+    }
+
+    cJSON *tok_json = cJSON_Parse(tok_resp.buf);
+    free(tok_resp.buf);
+    if (!tok_json) { send_error_json(c, 502, "token parse error"); return; }
+
+    const char *access_token = cJSON_GetStringValue(cJSON_GetObjectItem(tok_json, "access_token"));
+    if (!access_token) {
+        cJSON_Delete(tok_json);
+        send_error_json(c, 401, T("Google 認証失敗", "Google auth failed")); return;
+    }
+    char at_buf[1024];
+    strncpy(at_buf, access_token, sizeof(at_buf)-1); at_buf[sizeof(at_buf)-1] = '\0';
+    cJSON_Delete(tok_json);
+
+    /* ── Step 2: ユーザー情報を取得 ─────────────────────────────────────── */
+    curl = curl_easy_init();
+    if (!curl) { send_error_json(c, 500, "curl init failed"); return; }
+
+    char auth_hdr[1100];
+    snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s", at_buf);
+    struct curl_slist *hdrs = curl_slist_append(NULL, auth_hdr);
+
+    OAuthBuf user_resp = {NULL, 0};
+    curl_easy_setopt(curl, CURLOPT_URL, "https://www.googleapis.com/oauth2/v2/userinfo");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, oauth_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &user_resp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    cc = curl_easy_perform(curl);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+
+    if (cc != CURLE_OK || !user_resp.buf) {
+        free(user_resp.buf);
+        send_error_json(c, 502, T("ユーザー情報の取得に失敗しました", "userinfo fetch failed")); return;
+    }
+
+    cJSON *uinfo = cJSON_Parse(user_resp.buf);
+    free(user_resp.buf);
+    if (!uinfo) { send_error_json(c, 502, "userinfo parse error"); return; }
+
+    const char *google_id  = cJSON_GetStringValue(cJSON_GetObjectItem(uinfo, "id"));
+    const char *g_email    = cJSON_GetStringValue(cJSON_GetObjectItem(uinfo, "email"));
+    const char *g_name     = cJSON_GetStringValue(cJSON_GetObjectItem(uinfo, "name"));
+    if (!google_id || !g_email) {
+        cJSON_Delete(uinfo);
+        send_error_json(c, 400, T("メールアドレスが取得できませんでした", "email unavailable")); return;
+    }
+    char gid_buf[64], email_buf[256], name_buf[128];
+    strncpy(gid_buf,   google_id, sizeof(gid_buf)-1);   gid_buf[sizeof(gid_buf)-1] = '\0';
+    strncpy(email_buf, g_email,   sizeof(email_buf)-1); email_buf[sizeof(email_buf)-1] = '\0';
+    strncpy(name_buf,  g_name ? g_name : g_email, sizeof(name_buf)-1); name_buf[sizeof(name_buf)-1] = '\0';
+    cJSON_Delete(uinfo);
+
+    /* ── Step 3: ユーザーを作成 or 取得 ─────────────────────────────────── */
+    /* google_id で検索 */
+    DbStmt *st = db_prepare(db, "SELECT id FROM users WHERE google_id=?");
+    db_bind_text(st, 1, gid_buf);
+    long user_id = 0;
+    if (db_step(st) == 1) user_id = db_col_int(st, 0);
+    db_finalize(st);
+
+    if (!user_id) {
+        /* email で検索（既存アカウント連携） */
+        st = db_prepare(db, "SELECT id FROM users WHERE email=?");
+        db_bind_text(st, 1, email_buf);
+        if (db_step(st) == 1) {
+            user_id = db_col_int(st, 0);
+            db_finalize(st);
+            /* google_id を紐付け */
+            DbStmt *upd = db_prepare(db, "UPDATE users SET google_id=? WHERE id=?");
+            db_bind_text(upd, 1, gid_buf);
+            db_bind_int(upd,  2, user_id);
+            db_step(upd); db_finalize(upd);
+        } else {
+            db_finalize(st);
+            /* 新規ユーザー作成（パスワードなし） */
+            st = db_prepare(db,
+                "INSERT INTO users(email,name,password_hash,google_id) VALUES(?,?,?,?) "
+                "RETURNING id");
+            db_bind_text(st, 1, email_buf);
+            db_bind_text(st, 2, name_buf);
+            db_bind_text(st, 3, "oauth2");   /* パスワードログイン不可のマーカー */
+            db_bind_text(st, 4, gid_buf);
+            if (db_step(st) == 1) user_id = db_col_int(st, 0);
+            db_finalize(st);
+        }
+    }
+
+    if (!user_id) {
+        send_error_json(c, 500, T("ユーザーの作成に失敗しました", "user creation failed")); return;
+    }
+
+    /* JWT 発行 */
+    char *tok = jwt_create(user_id, secret);
+    char *rtok = jwt_create_refresh(user_id, secret);
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddNumberToObject(res, "user_id",       user_id);
+    cJSON_AddStringToObject(res, "name",          name_buf);
+    cJSON_AddStringToObject(res, "email",         email_buf);
+    cJSON_AddStringToObject(res, "token",         tok  ? tok  : "");
+    cJSON_AddStringToObject(res, "refresh_token", rtok ? rtok : "");
+    cJSON_AddStringToObject(res, "message",       T("Google ログイン成功", "Google login successful"));
+    send_cjson(c, 200, res);
+    cJSON_Delete(res);
+    free(tok); free(rtok);
 }

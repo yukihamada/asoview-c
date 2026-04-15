@@ -30,3 +30,18 @@ void send_booking_cancellation_email(const char *to,
                                      const char *booking_id,
                                      const char *plan_title,
                                      int refunded);
+
+/* 予約日程変更メール */
+void send_booking_reschedule_email(const char *to,
+                                   const char *booking_id,
+                                   const char *plan_title,
+                                   const char *new_date,
+                                   const char *new_start_time);
+
+/* 予約リマインダーメール（前日送信） */
+void send_booking_reminder_email(const char *to,
+                                 const char *booking_id,
+                                 const char *plan_title,
+                                 const char *date,
+                                 const char *start_time,
+                                 const char *venue_name);

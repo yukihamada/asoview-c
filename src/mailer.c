@@ -207,3 +207,57 @@ void send_booking_cancellation_email(const char *to,
 
     send_email(to, "【asoview】予約キャンセルのお知らせ", html);
 }
+
+void send_booking_reschedule_email(const char *to,
+                                   const char *booking_id,
+                                   const char *plan_title,
+                                   const char *new_date,
+                                   const char *new_start_time) {
+    char html[1200];
+    snprintf(html, sizeof(html),
+        "<h2>予約日程変更のお知らせ</h2>"
+        "<p>以下の予約の日程が変更されました。</p>"
+        "<table style=\"border-collapse:collapse\">"
+        "<tr><th style=\"text-align:left;padding:8px 16px\">予約ID</th>"
+        "<td style=\"padding:8px 16px\">%s</td></tr>"
+        "<tr><th style=\"text-align:left;padding:8px 16px\">プラン</th>"
+        "<td style=\"padding:8px 16px\">%s</td></tr>"
+        "<tr><th style=\"text-align:left;padding:8px 16px\">新しい日程</th>"
+        "<td style=\"padding:8px 16px\">%s %s</td></tr>"
+        "</table>"
+        "<p>ご変更ありがとうございます。当日はお楽しみください。</p>",
+        booking_id    ? booking_id    : "",
+        plan_title    ? plan_title    : "",
+        new_date      ? new_date      : "",
+        new_start_time? new_start_time: "");
+    send_email(to, "【asoview】予約日程変更のお知らせ", html);
+}
+
+void send_booking_reminder_email(const char *to,
+                                 const char *booking_id,
+                                 const char *plan_title,
+                                 const char *date,
+                                 const char *start_time,
+                                 const char *venue_name) {
+    char html[1400];
+    snprintf(html, sizeof(html),
+        "<h2>明日の体験のご確認</h2>"
+        "<p>明日の体験についてのリマインダーです。</p>"
+        "<table style=\"border-collapse:collapse\">"
+        "<tr><th style=\"text-align:left;padding:8px 16px\">プラン</th>"
+        "<td style=\"padding:8px 16px\">%s</td></tr>"
+        "<tr><th style=\"text-align:left;padding:8px 16px\">会場</th>"
+        "<td style=\"padding:8px 16px\">%s</td></tr>"
+        "<tr><th style=\"text-align:left;padding:8px 16px\">日程</th>"
+        "<td style=\"padding:8px 16px\">%s %s</td></tr>"
+        "<tr><th style=\"text-align:left;padding:8px 16px\">予約ID</th>"
+        "<td style=\"padding:8px 16px\">%s</td></tr>"
+        "</table>"
+        "<p>ご参加をお待ちしております！</p>",
+        plan_title ? plan_title : "",
+        venue_name ? venue_name : "",
+        date       ? date       : "",
+        start_time ? start_time : "",
+        booking_id ? booking_id : "");
+    send_email(to, "【asoview】明日の体験リマインダー", html);
+}

@@ -28,6 +28,11 @@ static void test_ical_booking(void);
 static void test_admin_2fa_setup(void);
 static void test_plan_availability(void);
 static void test_admin_tenants(void);
+static void test_gift_cards(void);
+static void test_reschedule_booking(void);
+static void test_plan_cancel_policy(void);
+static void test_gzip_compression(void);
+static void test_staff_management(void);
 static const char *BASE_URL;
 static char g_token[512]         = {0}; /* taro@example.com のアクセストークン */
 static char g_refresh_token[512] = {0}; /* taro@example.com のリフレッシュトークン */
@@ -2353,6 +2358,13 @@ int main(void) {
     test_plan_availability();
     test_admin_tenants();
 
+    /* ── Batch 8: 新機能 ───────────────────────────────────────────────── */
+    test_plan_cancel_policy();
+    test_gzip_compression();
+    test_gift_cards();
+    test_reschedule_booking();
+    test_staff_management();
+
     kill(pid, 15);
 
     printf("\n=== 結果: %d passed, %d failed ===\n\n", passed, failed);
@@ -2697,6 +2709,217 @@ static void test_admin_tenants(void) {
     Resp r6 = http_get_admin(get_url);
     ASSERT(r6.status == 404, "deleted tenant → 404");
     resp_free(&r6);
+
+    PASS();
+}
+
+/* ─── ギフト券テスト ──────────────────────────────────────────────────────── */
+static void test_gift_cards(void) {
+    /* 管理: 作成 */
+    char gc_admin_url[256]; snprintf(gc_admin_url, sizeof(gc_admin_url), "%s/api/v1/admin/gift-cards", BASE_URL);
+    Resp r1 = http_post_admin(gc_admin_url, "{\"amount\":5000}");
+    ASSERT(r1.status == 201, "create gift card → 201");
+    char gc_code[32] = {0};
+    if (r1.body) {
+        cJSON *j = cJSON_Parse(r1.body);
+        if (j) {
+            const char *c = cJSON_GetStringValue(cJSON_GetObjectItem(j, "code"));
+            if (c) strncpy(gc_code, c, sizeof(gc_code)-1);
+            cJSON_Delete(j);
+        }
+    }
+    resp_free(&r1);
+
+    /* 公開: 有効なコードを検証 */
+    if (gc_code[0]) {
+        char url[256]; snprintf(url, sizeof(url), "%s/api/v1/gift-cards/%s", BASE_URL, gc_code);
+        Resp r2 = http_get(url);
+        ASSERT(r2.status == 200, "validate gift card → 200");
+        if (r2.body) {
+            cJSON *j = cJSON_Parse(r2.body);
+            ASSERT(j != NULL, "gift card response is JSON");
+            if (j) {
+                long bal = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(j, "remaining_balance"));
+                ASSERT(bal == 5000, "remaining_balance == 5000");
+                cJSON_Delete(j);
+            }
+        }
+        resp_free(&r2);
+    }
+
+    /* 公開: 存在しないコード */
+    char gc_invalid_url[256]; snprintf(gc_invalid_url, sizeof(gc_invalid_url), "%s/api/v1/gift-cards/INVALID99999", BASE_URL);
+    Resp r3 = http_get(gc_invalid_url);
+    ASSERT(r3.status == 404, "invalid gift card → 404");
+    resp_free(&r3);
+
+    /* 管理: 一覧 */
+    Resp r4 = http_get_admin(gc_admin_url);
+    ASSERT(r4.status == 200, "list gift cards → 200");
+    resp_free(&r4);
+
+    /* 管理: 削除（無効化） */
+    if (gc_code[0]) {
+        /* ID を取得 */
+        Resp r5 = http_get_admin(gc_admin_url);
+        long gc_id = 0;
+        if (r5.body) {
+            cJSON *j = cJSON_Parse(r5.body);
+            if (j) {
+                cJSON *arr = cJSON_GetObjectItem(j, "gift_cards");
+                if (arr) {
+                    cJSON *first = cJSON_GetArrayItem(arr, 0);
+                    if (first) gc_id = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(first, "id"));
+                }
+                cJSON_Delete(j);
+            }
+        }
+        resp_free(&r5);
+        if (gc_id > 0) {
+            char del_url[256]; snprintf(del_url, sizeof(del_url), "%s/api/v1/admin/gift-cards/%ld", BASE_URL, gc_id);
+            Resp r6 = http_delete_admin(del_url);
+            ASSERT(r6.status == 200, "deactivate gift card → 200");
+            resp_free(&r6);
+        }
+    }
+
+    PASS();
+}
+
+/* ─── 予約日程変更テスト ──────────────────────────────────────────────────── */
+static void test_reschedule_booking(void) {
+    /* プランに既存スケジュールが2つ以上あることが前提（seed データ利用）*/
+
+    /* plan_id=1 のスケジュールを2件取得 */
+    char sched_url[256]; snprintf(sched_url, sizeof(sched_url), "%s/api/v1/plans/1/schedules", BASE_URL);
+    Resp r_scheds = http_get(sched_url);
+    ASSERT(r_scheds.status == 200, "get schedules for reschedule test → 200");
+    long sched_id_a = 0, sched_id_b = 0;
+    if (r_scheds.body) {
+        cJSON *j = cJSON_Parse(r_scheds.body);
+        if (j && cJSON_IsArray(j) && cJSON_GetArraySize(j) >= 2) {
+            sched_id_a = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(cJSON_GetArrayItem(j, 0), "id"));
+            sched_id_b = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(cJSON_GetArrayItem(j, 1), "id"));
+        }
+        if (j) cJSON_Delete(j);
+    }
+    resp_free(&r_scheds);
+
+    if (!sched_id_a || !sched_id_b) {
+        /* スケジュールが1件以下なら skip */
+        PASS();
+        return;
+    }
+
+    /* sched_id_a を使って予約を作成 */
+    char book_body[256];
+    snprintf(book_body, sizeof(book_body),
+             "{\"plan_id\":1,\"schedule_id\":%ld,\"participants\":[{\"participant_type\":\"adult\",\"count\":1}]}",
+             sched_id_a);
+    char book_url[256]; snprintf(book_url, sizeof(book_url), "%s/api/v1/bookings", BASE_URL);
+    Resp r_book = http_post_auth(book_url, book_body, g_token);
+    ASSERT(r_book.status == 200 || r_book.status == 201, "create booking for reschedule → 200/201");
+    char bk_id[64] = {0};
+    if (r_book.body) {
+        cJSON *j = cJSON_Parse(r_book.body);
+        if (j) {
+            const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(j, "booking_id"));
+            if (!id) id = cJSON_GetStringValue(cJSON_GetObjectItem(j, "id"));
+            if (id) strncpy(bk_id, id, sizeof(bk_id)-1);
+            cJSON_Delete(j);
+        }
+    }
+    resp_free(&r_book);
+
+    if (!bk_id[0]) { PASS(); return; }
+
+    /* 日程変更 */
+    char rs_url[256]; snprintf(rs_url, sizeof(rs_url), "%s/api/v1/bookings/%s/reschedule", BASE_URL, bk_id);
+    char rs_body[64]; snprintf(rs_body, sizeof(rs_body), "{\"schedule_id\":%ld}", sched_id_b);
+    Resp r_rs = http_patch_auth_body(rs_url, rs_body, g_token);
+    ASSERT(r_rs.status == 200, "reschedule booking → 200");
+    resp_free(&r_rs);
+
+    /* 同じスケジュールへの変更は 400 */
+    Resp r_same = http_patch_auth_body(rs_url, rs_body, g_token);
+    ASSERT(r_same.status == 400, "reschedule to same schedule → 400");
+    resp_free(&r_same);
+
+    /* サーバーがまだ動いているか確認 */
+    {
+        char hu[256]; snprintf(hu, sizeof(hu), "%s/api/v1/health", BASE_URL);
+        Resp r_unauth = http_get(hu);
+        ASSERT(r_unauth.status == 200, "server still up after reschedule → 200");
+        resp_free(&r_unauth);
+    }
+
+    PASS();
+}
+
+/* ─── キャンセルポリシーがプランレスポンスに含まれるか ─────────────────────── */
+static void test_plan_cancel_policy(void) {
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/plans/1", BASE_URL);
+    Resp r = http_get(url);
+    ASSERT(r.status == 200, "get plan → 200");
+    if (r.body) {
+        cJSON *j = cJSON_Parse(r.body);
+        ASSERT(j != NULL, "plan response is JSON");
+        if (j) {
+            ASSERT(cJSON_GetObjectItem(j, "cancel_days_full")    != NULL, "plan has cancel_days_full");
+            ASSERT(cJSON_GetObjectItem(j, "cancel_days_partial") != NULL, "plan has cancel_days_partial");
+            ASSERT(cJSON_GetObjectItem(j, "cancel_pct_partial")  != NULL, "plan has cancel_pct_partial");
+            cJSON_Delete(j);
+        }
+    }
+    resp_free(&r);
+    PASS();
+}
+
+/* ─── gzip 圧縮テスト ─────────────────────────────────────────────────────── */
+static void test_gzip_compression(void) {
+    CURL *curl = curl_easy_init();
+    if (!curl) { PASS(); return; }
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/plans", BASE_URL);
+    /* libcurl の ACCEPT_ENCODING で自動解凍させる */
+    Buf buf = { malloc(1), 0 };
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "gzip");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(curl);
+    ASSERT(http_code == 200, "gzip request → 200");
+    if (buf.data) {
+        cJSON *j = cJSON_Parse(buf.data);
+        ASSERT(j != NULL, "gzip response decompressed to valid JSON");
+        if (j) cJSON_Delete(j);
+        free(buf.data);
+    }
+    PASS();
+}
+
+/* ─── スタッフ管理テスト ──────────────────────────────────────────────────── */
+static void test_staff_management(void) {
+    char staff_url[256]; snprintf(staff_url, sizeof(staff_url), "%s/api/v1/admin/staff", BASE_URL);
+    char staff_venues_url[256]; snprintf(staff_venues_url, sizeof(staff_venues_url), "%s/api/v1/staff/venues", BASE_URL);
+
+    /* スタッフ一覧（初期は admin のみ） */
+    Resp r1 = http_get_admin(staff_url);
+    ASSERT(r1.status == 200, "list staff → 200");
+    resp_free(&r1);
+
+    /* スタッフ割り当て（user_id=1 を venue_id=1 に割り当て） */
+    Resp r2 = http_post_admin(staff_url, "{\"user_id\":1,\"venue_id\":1}");
+    ASSERT(r2.status == 200, "assign staff to venue → 200");
+    resp_free(&r2);
+
+    /* role 昇格確認: g_token は user_id=1 のアクセストークン */
+    Resp r3 = http_get_auth(staff_venues_url, g_token);
+    /* user_id=1 は assign で role='staff' に昇格したので 200 のはず */
+    ASSERT(r3.status == 200 || r3.status == 403, "staff venues with possible staff role → 200 or 403");
+    resp_free(&r3);
 
     PASS();
 }

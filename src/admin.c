@@ -2572,3 +2572,185 @@ void handle_admin_delete_tenant(struct mg_connection *c, struct mg_http_message 
     db_step(del); db_finalize(del);
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"テナントを削除しました\"}");
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * ギフト券 CRUD
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+void handle_admin_list_giftcards(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    if (!require_admin(c, hm)) return;
+    DbStmt *st = db_prepare(db,
+        "SELECT id,code,initial_amount,remaining_balance,issued_to_email,"
+        "       expires_at,is_active,created_at "
+        "FROM gift_cards ORDER BY id DESC");
+    cJSON *arr = cJSON_CreateArray();
+    while (db_step(st) == 1) {
+        cJSON *g = cJSON_CreateObject();
+        cJSON_AddNumberToObject(g, "id",                db_col_int(st, 0));
+        cJSON_AddStringToObject(g, "code",              db_col_text(st, 1));
+        cJSON_AddNumberToObject(g, "initial_amount",    db_col_int(st, 2));
+        cJSON_AddNumberToObject(g, "remaining_balance", db_col_int(st, 3));
+        if (!db_col_is_null(st, 4)) cJSON_AddStringToObject(g, "issued_to_email", db_col_text(st, 4));
+        else cJSON_AddNullToObject(g, "issued_to_email");
+        if (!db_col_is_null(st, 5)) cJSON_AddStringToObject(g, "expires_at", db_col_text(st, 5));
+        else cJSON_AddNullToObject(g, "expires_at");
+        cJSON_AddBoolToObject(g, "is_active", (int)db_col_int(st, 6));
+        cJSON_AddStringToObject(g, "created_at", db_col_text(st, 7));
+        cJSON_AddItemToArray(arr, g);
+    }
+    db_finalize(st);
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddItemToObject(res, "gift_cards", arr);
+    char *s = cJSON_PrintUnformatted(res);
+    send_json_str(c, 200, CORS_HEADERS, s);
+    cJSON_free(s); cJSON_Delete(res);
+}
+
+void handle_admin_create_giftcard(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    if (!require_admin(c, hm)) return;
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
+
+    cJSON *amt_j = cJSON_GetObjectItem(body, "amount");
+    if (!amt_j || !cJSON_IsNumber(amt_j)) {
+        cJSON_Delete(body);
+        send_error_json(c, 400, "amount は必須です（整数、円単位）"); return;
+    }
+    long amount = (long)cJSON_GetNumberValue(amt_j);
+    if (amount <= 0) { cJSON_Delete(body); send_error_json(c, 400, "amount は1以上"); return; }
+
+    const char *email_p  = cJSON_GetStringValue(cJSON_GetObjectItem(body, "issued_to_email"));
+    const char *expires_p= cJSON_GetStringValue(cJSON_GetObjectItem(body, "expires_at"));
+    char email_buf[256]  = {0};
+    char expires_buf[32] = {0};
+    if (email_p)  strncpy(email_buf,  email_p,  sizeof(email_buf)-1);
+    if (expires_p)strncpy(expires_buf,expires_p,sizeof(expires_buf)-1);
+
+    /* ギフト券コードを自動生成（16文字 hex） */
+    uint8_t rnd[8]; platform_random(rnd, sizeof(rnd));
+    char code[20] = {0};
+    for (int i = 0; i < 8; i++) snprintf(code + i*2, 3, "%02X", rnd[i]);
+
+    cJSON_Delete(body);
+
+    DbStmt *st = db_prepare(db,
+        "INSERT INTO gift_cards(code,initial_amount,remaining_balance,issued_to_email,expires_at)"
+        " VALUES(?,?,?,nullif(?,\"\"),nullif(?,\"\"))"
+        " RETURNING id,code,initial_amount,remaining_balance,issued_to_email,expires_at,created_at");
+    db_bind_text(st, 1, code);
+    db_bind_int(st,  2, amount);
+    db_bind_int(st,  3, amount);
+    db_bind_text(st, 4, email_buf);
+    db_bind_text(st, 5, expires_buf);
+    if (db_step(st) != 1) {
+        db_finalize(st); send_error_json(c, 500, "insert failed"); return;
+    }
+    cJSON *g = cJSON_CreateObject();
+    cJSON_AddNumberToObject(g, "id",                db_col_int(st, 0));
+    cJSON_AddStringToObject(g, "code",              db_col_text(st, 1));
+    cJSON_AddNumberToObject(g, "initial_amount",    db_col_int(st, 2));
+    cJSON_AddNumberToObject(g, "remaining_balance", db_col_int(st, 3));
+    if (!db_col_is_null(st, 4)) cJSON_AddStringToObject(g, "issued_to_email", db_col_text(st, 4));
+    else cJSON_AddNullToObject(g, "issued_to_email");
+    if (!db_col_is_null(st, 5)) cJSON_AddStringToObject(g, "expires_at", db_col_text(st, 5));
+    else cJSON_AddNullToObject(g, "expires_at");
+    cJSON_AddStringToObject(g, "created_at", db_col_text(st, 6));
+    db_finalize(st);
+    char *s = cJSON_PrintUnformatted(g);
+    send_json_str(c, 201, CORS_HEADERS, s);
+    cJSON_free(s); cJSON_Delete(g);
+}
+
+void handle_admin_delete_giftcard(struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id) {
+    if (!require_admin(c, hm)) return;
+    DbStmt *chk = db_prepare(db, "SELECT id FROM gift_cards WHERE id=?");
+    db_bind_int(chk, 1, id);
+    if (db_step(chk) != 1) {
+        db_finalize(chk); send_error_json(c, 404, "gift card not found"); return;
+    }
+    db_finalize(chk);
+    /* 論理削除 */
+    DbStmt *upd = db_prepare(db, "UPDATE gift_cards SET is_active=0 WHERE id=?");
+    db_bind_int(upd, 1, id);
+    db_step(upd); db_finalize(upd);
+    send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"ギフト券を無効化しました\"}");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * スタッフ管理
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+void handle_admin_list_staff(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    if (!require_admin(c, hm)) return;
+    DbStmt *st = db_prepare(db,
+        "SELECT u.id,u.name,u.email,u.role,"
+        "       GROUP_CONCAT(v.name,'|') AS venue_names,"
+        "       GROUP_CONCAT(sv.venue_id,'|') AS venue_ids "
+        "FROM users u "
+        "LEFT JOIN staff_venues sv ON sv.user_id=u.id "
+        "LEFT JOIN venues v ON v.id=sv.venue_id "
+        "WHERE u.role IN ('staff','admin') "
+        "GROUP BY u.id ORDER BY u.id");
+    cJSON *arr = cJSON_CreateArray();
+    while (db_step(st) == 1) {
+        cJSON *u = cJSON_CreateObject();
+        cJSON_AddNumberToObject(u, "id",    db_col_int(st, 0));
+        cJSON_AddStringToObject(u, "name",  db_col_text(st, 1));
+        cJSON_AddStringToObject(u, "email", db_col_text(st, 2));
+        cJSON_AddStringToObject(u, "role",  db_col_text(st, 3));
+        if (!db_col_is_null(st, 4))
+            cJSON_AddStringToObject(u, "venue_names", db_col_text(st, 4));
+        else cJSON_AddNullToObject(u, "venue_names");
+        cJSON_AddItemToArray(arr, u);
+    }
+    db_finalize(st);
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddItemToObject(res, "staff", arr);
+    char *s = cJSON_PrintUnformatted(res);
+    send_json_str(c, 200, CORS_HEADERS, s);
+    cJSON_free(s); cJSON_Delete(res);
+}
+
+void handle_admin_assign_staff_venue(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    if (!require_admin(c, hm)) return;
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
+
+    cJSON *uid_j = cJSON_GetObjectItem(body, "user_id");
+    cJSON *vid_j = cJSON_GetObjectItem(body, "venue_id");
+    if (!uid_j || !cJSON_IsNumber(uid_j) || !vid_j || !cJSON_IsNumber(vid_j)) {
+        cJSON_Delete(body);
+        send_error_json(c, 400, "user_id と venue_id が必要です"); return;
+    }
+    long uid = (long)cJSON_GetNumberValue(uid_j);
+    long vid = (long)cJSON_GetNumberValue(vid_j);
+
+    /* role を staff に昇格（まだ staff/admin でなければ） */
+    const char *role_p = cJSON_GetStringValue(cJSON_GetObjectItem(body, "role"));
+    cJSON_Delete(body);
+
+    DbStmt *upd = db_prepare(db,
+        "UPDATE users SET role=? WHERE id=? AND role='user'");
+    db_bind_text(upd, 1, (role_p && strcmp(role_p,"admin")==0) ? "admin" : "staff");
+    db_bind_int(upd, 2, uid);
+    db_step(upd); db_finalize(upd);
+
+    DbStmt *ins = db_prepare(db,
+        "INSERT OR IGNORE INTO staff_venues(user_id,venue_id) VALUES(?,?)");
+    db_bind_int(ins, 1, uid);
+    db_bind_int(ins, 2, vid);
+    db_step(ins); db_finalize(ins);
+
+    send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"スタッフを会場に割り当てました\"}");
+}
+
+void handle_admin_remove_staff_venue(struct mg_connection *c, struct mg_http_message *hm,
+                                     DbConn *db, long user_id, long venue_id) {
+    if (!require_admin(c, hm)) return;
+    DbStmt *del = db_prepare(db,
+        "DELETE FROM staff_venues WHERE user_id=? AND venue_id=?");
+    db_bind_int(del, 1, user_id);
+    db_bind_int(del, 2, venue_id);
+    db_step(del); db_finalize(del);
+    send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"スタッフの担当会場を解除しました\"}");
+}

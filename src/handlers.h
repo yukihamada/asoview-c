@@ -70,3 +70,26 @@ int      totp_verify(const char *b32_secret, const char *code_str);
 
 /* X-Request-ID（main.c から設定） */
 extern char g_request_id[40];
+
+/* Per-request フラグ（main.c から設定） */
+extern int g_accept_gzip;
+extern int g_lang_en;
+
+/* 予約日程変更 */
+void handle_reschedule_booking(struct mg_connection *c, struct mg_http_message *hm,
+                               DbConn *db, const char *id);
+
+/* ギフト券 */
+void handle_validate_giftcard(struct mg_connection *c, struct mg_http_message *hm,
+                              DbConn *db, const char *code);
+
+/* スタッフ */
+void handle_staff_list_bookings(struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+void handle_staff_list_venues  (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+
+/* Google OAuth */
+void handle_auth_google         (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+void handle_auth_google_callback(struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+
+/* Current request message (for ETag / If-None-Match) */
+extern struct mg_http_message *g_hm_current;

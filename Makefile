@@ -60,9 +60,9 @@ endif
 
 # 共通リンクフラグ（プラットフォーム別）
 ifeq ($(UNAME), Darwin)
-    LDFLAGS += -lsqlite3 -lcurl -lpthread -framework Security -framework CoreFoundation
+    LDFLAGS += -lsqlite3 -lcurl -lpthread -lz -framework Security -framework CoreFoundation
 else
-    LDFLAGS += -lsqlite3 -lcurl -lpthread -lssl -lcrypto
+    LDFLAGS += -lsqlite3 -lcurl -lpthread -lz -lssl -lcrypto
 endif
 
 SRCS    = deps/mongoose.c deps/cJSON.c \

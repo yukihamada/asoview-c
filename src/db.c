@@ -161,6 +161,38 @@ DbConn *db_open(const char *path) {
     APPLY_MIGRATION(25,
         "CREATE INDEX IF NOT EXISTS idx_venues_tenant_id ON venues(tenant_id);"
         "CREATE INDEX IF NOT EXISTS idx_tenants_slug     ON tenants(slug)");
+
+    /* ─── スタッフロール / ギフト券 / OAuth / リマインダー ───────────────── */
+    APPLY_MIGRATION(26,
+        "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'");
+    APPLY_MIGRATION(27,
+        "CREATE TABLE IF NOT EXISTS staff_venues("
+        "user_id  INTEGER NOT NULL REFERENCES users(id)  ON DELETE CASCADE,"
+        "venue_id INTEGER NOT NULL REFERENCES venues(id) ON DELETE CASCADE,"
+        "PRIMARY KEY (user_id, venue_id))");
+    APPLY_MIGRATION(28,
+        "ALTER TABLE bookings ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0");
+    APPLY_MIGRATION(29,
+        "CREATE TABLE IF NOT EXISTS gift_cards("
+        "id                INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "code              TEXT UNIQUE NOT NULL,"
+        "initial_amount    INTEGER NOT NULL,"
+        "remaining_balance INTEGER NOT NULL,"
+        "issued_to_email   TEXT,"
+        "expires_at        TEXT,"
+        "is_active         INTEGER NOT NULL DEFAULT 1,"
+        "created_at        TEXT NOT NULL DEFAULT (datetime('now')))");
+    APPLY_MIGRATION(30,
+        "ALTER TABLE bookings ADD COLUMN gift_card_id INTEGER REFERENCES gift_cards(id)");
+    APPLY_MIGRATION(31,
+        "ALTER TABLE bookings ADD COLUMN gift_discount INTEGER NOT NULL DEFAULT 0");
+    APPLY_MIGRATION(32,
+        "ALTER TABLE users ADD COLUMN google_id TEXT");
+    APPLY_MIGRATION(33,
+        "CREATE INDEX IF NOT EXISTS idx_gift_cards_code  ON gift_cards(code);"
+        "CREATE INDEX IF NOT EXISTS idx_users_role       ON users(role);"
+        "CREATE INDEX IF NOT EXISTS idx_users_google_id  ON users(google_id);"
+        "CREATE INDEX IF NOT EXISTS idx_staff_venues_uid ON staff_venues(user_id)");
 #undef APPLY_MIGRATION
     /* FTS5 インデックスを既存データで再構築（INSERT トリガーで新規データは自動追加） */
     sqlite3_exec(db,

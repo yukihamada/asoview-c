@@ -3,6 +3,7 @@
 #include <string.h>
 #include <signal.h>
 #include <time.h>
+#include <pthread.h>
 #include "mongoose.h"
 #include "db_driver.h"
 #include "db.h"
@@ -15,11 +16,78 @@
 #include "waitlist.h"
 #include "setup.h"
 #include "webhooks.h"
+#include "mailer.h"
 
 #define MAX_BODY_BYTES (64 * 1024)  /* 64 KB リクエストボディ上限 */
 
 static volatile int g_quit = 0;
 static void handle_signal(int sig) { (void)sig; g_quit = 1; }
+
+/* ─── 予約リマインダースレッド ──────────────────────────────────────────── */
+static void *reminder_thread(void *arg) {
+    const char *db_path = (const char *)arg;
+    while (!g_quit) {
+        /* 毎時 00 分に近いタイミングで起動 */
+        time_t now = time(NULL);
+        /* 次の 00:00 秒まで待つ（最大3600秒） */
+        int sleep_secs = 3600 - (int)(now % 3600);
+        for (int i = 0; i < sleep_secs && !g_quit; i++) {
+            struct timespec ts = {1, 0};
+            nanosleep(&ts, NULL);
+        }
+        if (g_quit) break;
+
+        DbConn *rdb = db_open(db_path);
+        if (!rdb) continue;
+
+        /* 明日の confirmed 予約で reminder_sent=0 のもの */
+        DbStmt *st = NULL;
+        st = db_prepare(rdb,
+            "SELECT b.id, u.email, p.title, s.date, s.start_time, v.name "
+            "FROM bookings b "
+            "JOIN users u     ON u.id=b.user_id "
+            "JOIN schedules s ON s.id=b.schedule_id "
+            "JOIN plans p     ON p.id=s.plan_id "
+            "JOIN venues v    ON v.id=p.venue_id "
+            "WHERE b.status='confirmed' "
+            "  AND b.reminder_sent=0 "
+            "  AND s.date = date('now', '+1 day')");
+        if (!st) { db_close(rdb); continue; }
+
+        /* 複数の結果を収集してから送信（DB ロック時間を短く） */
+        typedef struct {
+            char id[64], email[256], title[256], date[16], stime[8], venue[256];
+        } REntry;
+        REntry entries[64]; int n = 0;
+        while (db_step(st) == 1 && n < 64) {
+            REntry *e = &entries[n++];
+            const char *v;
+            v = db_col_text(st, 0); strncpy(e->id,    v?v:"", sizeof(e->id)-1);
+            v = db_col_text(st, 1); strncpy(e->email, v?v:"", sizeof(e->email)-1);
+            v = db_col_text(st, 2); strncpy(e->title, v?v:"", sizeof(e->title)-1);
+            v = db_col_text(st, 3); strncpy(e->date,  v?v:"", sizeof(e->date)-1);
+            v = db_col_text(st, 4); strncpy(e->stime, v?v:"", sizeof(e->stime)-1);
+            v = db_col_text(st, 5); strncpy(e->venue, v?v:"", sizeof(e->venue)-1);
+        }
+        db_finalize(st);
+
+        for (int i = 0; i < n; i++) {
+            REntry *e = &entries[i];
+            if (e->email[0]) {
+                send_booking_reminder_email(e->email, e->id, e->title, e->date, e->stime, e->venue);
+            }
+            /* reminder_sent フラグを立てる */
+            DbStmt *upd = db_prepare(rdb,
+                "UPDATE bookings SET reminder_sent=1 WHERE id=?");
+            db_bind_text(upd, 1, e->id);
+            db_step(upd); db_finalize(upd);
+            fprintf(stdout, "[reminder] sent for booking %s\n", e->id);
+        }
+
+        db_close(rdb);
+    }
+    return NULL;
+}
 
 /* シンプル UUID 生成（ログ用） */
 static void gen_uuid(char *out, size_t sz) {
@@ -202,6 +270,25 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     /* X-Request-ID 生成 */
     gen_uuid(g_request_id, sizeof(g_request_id));
+
+    /* Per-request フラグを設定 */
+    g_hm_current  = hm;
+    g_accept_gzip = 0;
+    g_lang_en     = 0;
+    {
+        struct mg_str *ae = mg_http_get_header(hm, "Accept-Encoding");
+        if (ae) {
+            char ae_buf[256] = {0};
+            snprintf(ae_buf, sizeof(ae_buf), "%.*s", (int)ae->len, ae->buf);
+            if (strstr(ae_buf, "gzip")) g_accept_gzip = 1;
+        }
+        struct mg_str *al = mg_http_get_header(hm, "Accept-Language");
+        if (al) {
+            char al_buf[64] = {0};
+            snprintf(al_buf, sizeof(al_buf), "%.*s", (int)al->len, al->buf);
+            if (strstr(al_buf, "en")) g_lang_en = 1;
+        }
+    }
 
     /* IP ベースレート制限 */
     char client_ip[48] = {0};
@@ -437,6 +524,8 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
             if (IS_PATCH) handle_cancel_booking(c, hm, db, booking_id);
         } else if (strcmp(uri + pfx, "/ical") == 0) {
             if (IS_GET)   handle_ical_booking(c, hm, db, booking_id);
+        } else if (strcmp(uri + pfx, "/reschedule") == 0) {
+            if (IS_PATCH) handle_reschedule_booking(c, hm, db, booking_id);
         } else if (uri[pfx] == '\0') {
             if (IS_GET) handle_get_booking(c, hm, db, booking_id);
         } else {
@@ -636,6 +725,42 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (strcmp(uri, "/api/v1/admin/2fa/setup") == 0) {
         if (IS_GET) handle_admin_2fa_setup(c, hm, db);
 
+    /* ── ギフト券（公開）────────────────────────────────────────────────── */
+    } else if (sscanf(uri, "/api/v1/gift-cards/%63s", booking_id) == 1) {
+        if (IS_GET) handle_validate_giftcard(c, hm, db, booking_id);
+
+    /* ── ギフト券（管理）────────────────────────────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/admin/gift-cards") == 0) {
+        if (IS_GET)  handle_admin_list_giftcards(c, hm, db);
+        else if (IS_POST) handle_admin_create_giftcard(c, hm, db);
+
+    } else if (sscanf(uri, "/api/v1/admin/gift-cards/%ld", &id) == 1) {
+        if (IS_DELETE) handle_admin_delete_giftcard(c, hm, db, id);
+
+    /* ── スタッフ ────────────────────────────────────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/staff/bookings") == 0) {
+        if (IS_GET) handle_staff_list_bookings(c, hm, db);
+
+    } else if (strcmp(uri, "/api/v1/staff/venues") == 0) {
+        if (IS_GET) handle_staff_list_venues(c, hm, db);
+
+    /* ── Admin: スタッフ管理 ─────────────────────────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/admin/staff") == 0) {
+        if (IS_GET)  handle_admin_list_staff(c, hm, db);
+        else if (IS_POST) handle_admin_assign_staff_venue(c, hm, db);
+
+    } else if (strncmp(uri, "/api/v1/admin/staff/", 20) == 0 && strstr(uri, "/venues/")) {
+        long staff_id = 0, venue_id2 = 0;
+        sscanf(uri, "/api/v1/admin/staff/%ld/venues/%ld", &staff_id, &venue_id2);
+        if (IS_DELETE) handle_admin_remove_staff_venue(c, hm, db, staff_id, venue_id2);
+
+    /* ── Google OAuth ────────────────────────────────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/auth/google") == 0) {
+        if (IS_GET) handle_auth_google(c, hm, db);
+
+    } else if (strcmp(uri, "/api/v1/auth/google/callback") == 0) {
+        if (IS_GET) handle_auth_google_callback(c, hm, db);
+
     /* ── テナント管理 ──────────────────────────────────────────────────────── */
     } else if (strcmp(uri, "/api/v1/admin/tenants") == 0) {
         if (IS_GET)  handle_admin_list_tenants(c, hm, db);
@@ -732,6 +857,13 @@ int main(int argc, char *argv[]) {
     DbConn *db = db_open(db_path);
     if (!db) return 1;
     seed_if_empty(db);
+
+    /* ── リマインダースレッド起動 ──────────────────────────────────────── */
+    pthread_t reminder_tid;
+    static char reminder_db_path[256];
+    strncpy(reminder_db_path, db_path, sizeof(reminder_db_path)-1);
+    pthread_create(&reminder_tid, NULL, reminder_thread, reminder_db_path);
+    pthread_detach(reminder_tid);
 
     struct mg_mgr mgr;
     mg_mgr_init(&mgr);
