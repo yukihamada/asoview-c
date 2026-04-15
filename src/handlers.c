@@ -1603,7 +1603,7 @@ void handle_stripe_webhook(struct mg_connection *c, struct mg_http_message *hm,
         /* 処理済みとして記録 */
         DbStmt *ins = NULL;
         ins = db_prepare(db,
-            "INSERT OR IGNORE INTO webhook_events(event_id) VALUES(?)");
+            "INSERT INTO webhook_events(event_id) VALUES(?) ON CONFLICT DO NOTHING");
         db_bind_text(ins, 1, evt_id);
         db_step(ins); db_finalize(ins);
     }
@@ -1751,7 +1751,7 @@ void handle_create_bookmark(struct mg_connection *c, struct mg_http_message *hm,
 
     DbStmt *ins = NULL;
     ins = db_prepare(db,
-        "INSERT OR IGNORE INTO bookmarks(user_id,plan_id) VALUES(?,?)");
+        "INSERT INTO bookmarks(user_id,plan_id) VALUES(?,?) ON CONFLICT DO NOTHING");
     db_bind_int(ins, 1, auth_uid);
     db_bind_int(ins, 2, plan_id);
     db_step(ins);
@@ -1887,7 +1887,7 @@ void handle_change_password(struct mg_connection *c, struct mg_http_message *hm,
                 sig++;
                 DbStmt *bl = NULL;
                 bl = db_prepare(db,
-                    "INSERT OR IGNORE INTO jwt_blocklist(jti, expires_at) "
+                    "INSERT INTO jwt_blocklist(jti, expires_at)"
                     "VALUES(?, " SQL_NOW_PLUS_DAY(7) ")");
                 db_bind_text(bl, 1, sig);
                 db_step(bl); db_finalize(bl);
@@ -2097,7 +2097,7 @@ void handle_auth_logout(struct mg_connection *c, struct mg_http_message *hm, DbC
         sig++;
         DbStmt *bl = NULL;
         bl = db_prepare(db,
-            "INSERT OR IGNORE INTO jwt_blocklist(jti, expires_at) "
+            "INSERT INTO jwt_blocklist(jti, expires_at)"
             "VALUES(?, " SQL_NOW_PLUS_DAY(7) ")");
         db_bind_text(bl, 1, sig);
         db_step(bl); db_finalize(bl);

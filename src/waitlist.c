@@ -61,7 +61,7 @@ void handle_create_waitlist(struct mg_connection *c, struct mg_http_message *hm,
 
     DbStmt *ins = NULL;
     ins = db_prepare(db,
-        "INSERT OR IGNORE INTO waitlist(user_id, schedule_id) VALUES(?,?)");
+        "INSERT INTO waitlist(user_id, schedule_id) VALUES(?,?) ON CONFLICT DO NOTHING");
     db_bind_int(ins, 1, auth_uid);
     db_bind_int(ins, 2, schedule_id);
     db_step(ins);

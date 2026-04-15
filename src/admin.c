@@ -4,6 +4,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+
+/* JSON の数値フィールドを安全に long に変換（NaN/inf → 0） */
+static long cjson_long(cJSON *item) {
+    if (!item || !cJSON_IsNumber(item)) return 0;
+    double v = cJSON_GetNumberValue(item);
+    if (v != v || v > 2147483647.0 || v < -2147483648.0) return 0; /* NaN or out of int range */
+    return (long)v;
+}
 
 #define CORS_HEADERS "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n"
 
@@ -247,14 +256,14 @@ void handle_admin_create_plan(struct mg_connection *c, struct mg_http_message *h
     cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
     if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
 
-    long venue_id    = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "venue_id"));
-    long category_id = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "category_id"));
+    long venue_id    = cjson_long(cJSON_GetObjectItem(body, "venue_id"));
+    long category_id = cjson_long(cJSON_GetObjectItem(body, "category_id"));
     const char *title= cJSON_GetStringValue(cJSON_GetObjectItem(body, "title"));
     const char *desc = cJSON_GetStringValue(cJSON_GetObjectItem(body, "description"));
-    long dur   = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "duration_minutes"));
-    long minp  = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "min_participants"));
-    long maxp  = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "max_participants"));
-    long minage= (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "min_age"));
+    long dur   = cjson_long(cJSON_GetObjectItem(body, "duration_minutes"));
+    long minp  = cjson_long(cJSON_GetObjectItem(body, "min_participants"));
+    long maxp  = cjson_long(cJSON_GetObjectItem(body, "max_participants"));
+    long minage= cjson_long(cJSON_GetObjectItem(body, "min_age"));
     cJSON *imgs = cJSON_GetObjectItem(body, "images");
     cJSON *tags = cJSON_GetObjectItem(body, "tags");
     char *imgs_str = imgs ? cJSON_PrintUnformatted(imgs) : NULL;

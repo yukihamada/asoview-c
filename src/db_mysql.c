@@ -107,8 +107,9 @@ DbConn *db_open_backend(const char *uri) {
     my_bool reconnect = 1;
     mysql_options(db->mysql, MYSQL_OPT_RECONNECT, &reconnect);
 
+    /* CLIENT_MULTI_STATEMENTS: seed.c が複数文を1回の exec() で実行するため必要 */
     if (!mysql_real_connect(db->mysql, host, user, pass, dbname,
-                            (unsigned int)port, NULL, 0)) {
+                            (unsigned int)port, NULL, CLIENT_MULTI_STATEMENTS)) {
         fprintf(stderr, "[db_mysql] Connect failed: %s\n", mysql_error(db->mysql));
         mysql_close(db->mysql);
         free(db);
@@ -131,10 +132,17 @@ int db_exec(DbConn *db, const char *sql) {
         fprintf(stderr, "[db_mysql] exec error: %s\n", db->errmsg);
         return -1;
     }
-    /* 結果セットを解放 */
-    MYSQL_RES *res = mysql_store_result(db->mysql);
-    if (res) mysql_free_result(res);
-    return 0;
+    /* CLIENT_MULTI_STATEMENTS: 全結果セットを消費する（mysql_next_result）*/
+    int rc = 0;
+    do {
+        MYSQL_RES *res = mysql_store_result(db->mysql);
+        if (res) mysql_free_result(res);
+        else if (mysql_field_count(db->mysql) > 0) {
+            snprintf(db->errmsg, sizeof(db->errmsg), "%s", mysql_error(db->mysql));
+            rc = -1;
+        }
+    } while (mysql_next_result(db->mysql) == 0);
+    return rc;
 }
 
 /* ─── DbStmt 操作 ────────────────────────────────────────────────────────── */

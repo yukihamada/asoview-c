@@ -45,6 +45,10 @@ const char  *db_errmsg(DbConn *db);
 #define SQL_NOW_PLUS_MIN(n)   "CURRENT_TIMESTAMP + INTERVAL '" #n " minutes'"
 #define SQL_NOW_PLUS_HOUR(n)  "CURRENT_TIMESTAMP + INTERVAL '" #n " hours'"
 #define SQL_NOW_PLUS_DAY(n)   "CURRENT_TIMESTAMP + INTERVAL '" #n " days'"
+/* FTS: PostgreSQL は tsvector/tsquery を使用。plans_fts FTS5 は不要 */
+#define SQL_FTS_MATCH(col, param) \
+    "(search_vector @@ plainto_tsquery('simple', " param "))"
+#define SQL_USES_POSTGRES_FTS 1
 
 /* ─── MySQL ─ (db_mysql.c で実装) ────────────────────────────────────────── */
 #elif defined(USE_MYSQL)
@@ -75,6 +79,9 @@ const char  *db_errmsg(DbConn *db);
 #define SQL_NOW_PLUS_MIN(n)   "DATE_ADD(NOW(), INTERVAL " #n " MINUTE)"
 #define SQL_NOW_PLUS_HOUR(n)  "DATE_ADD(NOW(), INTERVAL " #n " HOUR)"
 #define SQL_NOW_PLUS_DAY(n)   "DATE_ADD(NOW(), INTERVAL " #n " DAY)"
+/* FTS: MySQL は FULLTEXT か LIKE フォールバック */
+#define SQL_FTS_MATCH(col, param) \
+    "(p.title LIKE CONCAT('%'," param ",'%') OR p.description LIKE CONCAT('%'," param ",'%') OR v.name LIKE CONCAT('%'," param ",'%'))"
 
 /* ─── SQLite（デフォルト）─ inline ラッパー ──────────────────────────────── */
 #else
@@ -90,6 +97,9 @@ typedef sqlite3_stmt  DbStmt;
 #define SQL_NOW_PLUS_MIN(n)   "datetime('now', '+" #n " minutes')"
 #define SQL_NOW_PLUS_HOUR(n)  "datetime('now', '+" #n " hours')"
 #define SQL_NOW_PLUS_DAY(n)   "datetime('now', '+" #n " days')"
+/* FTS: SQLite は FTS5 の plans_fts を使用 */
+#define SQL_FTS_MATCH(col, param) \
+    "(p.id IN (SELECT rowid FROM plans_fts WHERE plans_fts MATCH " param "))"
 
 /* Inline ラッパー: PgSQL/MySQL 版と同じ名前で使える ─────────────────────── */
 
