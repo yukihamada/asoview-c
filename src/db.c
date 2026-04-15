@@ -115,6 +115,52 @@ DbConn *db_open(const char *path) {
     /* 予約にクーポン適用列 */
     APPLY_MIGRATION(13, "ALTER TABLE bookings ADD COLUMN coupon_id INTEGER REFERENCES coupons(id)");
     APPLY_MIGRATION(14, "ALTER TABLE bookings ADD COLUMN discount_amount INTEGER NOT NULL DEFAULT 0");
+
+    /* ─── パフォーマンスインデックス ─────────────────────────────────────── */
+    APPLY_MIGRATION(15,
+        "CREATE INDEX IF NOT EXISTS idx_bookings_user_id   ON bookings(user_id);"
+        "CREATE INDEX IF NOT EXISTS idx_bookings_plan_id   ON bookings(plan_id);"
+        "CREATE INDEX IF NOT EXISTS idx_bookings_schedule  ON bookings(schedule_id);"
+        "CREATE INDEX IF NOT EXISTS idx_bookings_status    ON bookings(status);"
+        "CREATE INDEX IF NOT EXISTS idx_bookings_created   ON bookings(created_at DESC)");
+    APPLY_MIGRATION(16,
+        "CREATE INDEX IF NOT EXISTS idx_reviews_plan_id    ON reviews(plan_id);"
+        "CREATE INDEX IF NOT EXISTS idx_reviews_user_id    ON reviews(user_id);"
+        "CREATE INDEX IF NOT EXISTS idx_reviews_created    ON reviews(created_at DESC)");
+    APPLY_MIGRATION(17,
+        "CREATE INDEX IF NOT EXISTS idx_bookmarks_user_id  ON bookmarks(user_id);"
+        "CREATE INDEX IF NOT EXISTS idx_bookmarks_plan_id  ON bookmarks(plan_id);"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_bookmarks_uniq ON bookmarks(user_id, plan_id)");
+    APPLY_MIGRATION(18,
+        "CREATE INDEX IF NOT EXISTS idx_schedules_plan_id  ON schedules(plan_id);"
+        "CREATE INDEX IF NOT EXISTS idx_schedules_date     ON schedules(start_date)");
+    APPLY_MIGRATION(19,
+        "CREATE INDEX IF NOT EXISTS idx_plans_venue_id     ON plans(venue_id);"
+        "CREATE INDEX IF NOT EXISTS idx_plans_category_id  ON plans(category_id)");
+    APPLY_MIGRATION(20,
+        "CREATE INDEX IF NOT EXISTS idx_audit_actor        ON audit_logs(actor_id);"
+        "CREATE INDEX IF NOT EXISTS idx_audit_created      ON audit_logs(created_at DESC)");
+    APPLY_MIGRATION(21,
+        "CREATE INDEX IF NOT EXISTS idx_jwt_blocklist_jti  ON jwt_blocklist(jti);"
+        "CREATE INDEX IF NOT EXISTS idx_jwt_blocklist_exp  ON jwt_blocklist(expires_at)");
+    APPLY_MIGRATION(22,
+        "CREATE INDEX IF NOT EXISTS idx_users_email        ON users(email)");
+
+    /* ─── マルチテナント基盤 ──────────────────────────────────────────────── */
+    APPLY_MIGRATION(23,
+        "CREATE TABLE IF NOT EXISTS tenants("
+        "id         INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "slug       TEXT UNIQUE NOT NULL COLLATE NOCASE,"
+        "name       TEXT NOT NULL,"
+        "api_key    TEXT UNIQUE NOT NULL,"
+        "plan_limit INTEGER NOT NULL DEFAULT 100,"
+        "is_active  INTEGER NOT NULL DEFAULT 1,"
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')))");
+    APPLY_MIGRATION(24,
+        "ALTER TABLE venues ADD COLUMN tenant_id INTEGER REFERENCES tenants(id)");
+    APPLY_MIGRATION(25,
+        "CREATE INDEX IF NOT EXISTS idx_venues_tenant_id ON venues(tenant_id);"
+        "CREATE INDEX IF NOT EXISTS idx_tenants_slug     ON tenants(slug)");
 #undef APPLY_MIGRATION
     /* FTS5 インデックスを既存データで再構築（INSERT トリガーで新規データは自動追加） */
     sqlite3_exec(db,

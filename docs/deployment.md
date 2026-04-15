@@ -70,6 +70,8 @@ DATABASE_URL=/data/asoview.db
 
 ## 3. systemd Service
 
+### 通常起動
+
 ```ini
 # /etc/systemd/system/asoview.service
 [Unit]
@@ -99,6 +101,62 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable --now asoview
 sudo systemctl status asoview
+```
+
+### ゼロダウンタイム再起動（Socket Activation）
+
+systemd の Socket Activation を使うと、再起動中もリスニングソケットを保持し続けるため
+接続が切れません（`systemctl restart` 中も TCP 接続を受け付けます）。
+
+```ini
+# /etc/systemd/system/asoview.socket
+[Unit]
+Description=asoview-c HTTP socket
+
+[Socket]
+ListenStream=3001
+Accept=no
+# ソケットをプロセス間で保持（再起動時も接続を失わない）
+
+[Install]
+WantedBy=sockets.target
+```
+
+```ini
+# /etc/systemd/system/asoview.service （Socket Activation 版）
+[Unit]
+Description=asoview-c API server
+Requires=asoview.socket
+After=asoview.socket
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/asoview
+EnvironmentFile=/opt/asoview/.env
+ExecStart=/opt/asoview/asoview-c
+Restart=on-failure
+RestartSec=1
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/data
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+# 初回セットアップ
+sudo systemctl daemon-reload
+sudo systemctl enable --now asoview.socket
+sudo systemctl start asoview
+
+# バイナリ更新時のゼロダウンタイム再起動
+sudo cp /tmp/asoview-c-new /opt/asoview/asoview-c
+sudo systemctl restart asoview   # ソケットは asoview.socket が保持するため切れない
 ```
 
 ## 4. Nginx (TLS Termination)
@@ -139,37 +197,103 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ## 5. SQLite Backup (Litestream)
 
-Litestream streams WAL frames to S3 / GCS in real-time.
+Litestream は WAL フレームをリアルタイムで S3 / Cloudflare R2 / GCS にストリームします。
+RPO ≈ 1 秒、RTO ≈ 数十秒で運用できます。
+
+### インストール
+
+```bash
+curl -fsSL https://github.com/benbjohnson/litestream/releases/latest/download/litestream-linux-amd64.tar.gz \
+  | sudo tar -C /usr/local/bin -xz litestream
+```
+
+### 設定ファイル
+
+Secrets はファイルに直書きせず、systemd の `EnvironmentFile` で渡します。
 
 ```yaml
 # /etc/litestream.yml
 dbs:
   - path: /data/asoview.db
     replicas:
-      - url: s3://your-bucket/asoview
-        access-key-id: AKIAIOSFODNN7EXAMPLE
-        secret-access-key: xxx
-        region: ap-northeast-1
+      # ── AWS S3 ──────────────────────────────────────────────────
+      - url: s3://${LITESTREAM_S3_BUCKET}/asoview
+        access-key-id: ${AWS_ACCESS_KEY_ID}
+        secret-access-key: ${AWS_SECRET_ACCESS_KEY}
+        region: ${AWS_REGION:-ap-northeast-1}
+        # 保持期間: 直近 24 時間はすべてのフレーム、それ以前は 1 時間ごとのスナップショット
+        retention: 24h
+        snapshot-interval: 1h
+
+      # ── Cloudflare R2（S3 互換）────────────────────────────────
+      # - url: s3://${R2_BUCKET}/asoview
+      #   endpoint: https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+      #   access-key-id: ${R2_ACCESS_KEY_ID}
+      #   secret-access-key: ${R2_SECRET_ACCESS_KEY}
 ```
+
+### 環境変数ファイル
+
+```bash
+# /opt/asoview/litestream.env  （chmod 600）
+AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+AWS_REGION=ap-northeast-1
+LITESTREAM_S3_BUCKET=your-bucket
+```
+
+### systemd サービス
 
 ```ini
 # /etc/systemd/system/litestream.service
 [Unit]
-Description=Litestream
+Description=Litestream — asoview DB リアルタイムバックアップ
 After=network.target
+# asoview サービスより先に起動し、終了後に停止
+Before=asoview.service
 
 [Service]
+Type=simple
+EnvironmentFile=/opt/asoview/litestream.env
+ExecStartPre=/usr/local/bin/litestream restore -if-db-not-exists -config /etc/litestream.yml /data/asoview.db
 ExecStart=/usr/local/bin/litestream replicate -config /etc/litestream.yml
 Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-### Restore
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now litestream
+sudo systemctl enable asoview  # litestream より後に起動
+```
+
+> **`ExecStartPre` の restore について**  
+> Litestream サービス起動時、DB ファイルが存在しない場合のみ S3 から自動復元します。  
+> 新規サーバーへの移行時も `systemctl start litestream` だけで本番 DB が復元されます。
+
+### ポイントインタイムリストア
 
 ```bash
-litestream restore -config /etc/litestream.yml /data/asoview.db
+# 利用可能なスナップショット一覧
+litestream snapshots -config /etc/litestream.yml /data/asoview.db
+
+# 特定時刻に巻き戻す（ISO 8601）
+litestream restore -config /etc/litestream.yml \
+  -timestamp 2026-04-15T12:00:00Z \
+  /data/asoview.db
+```
+
+### ヘルスチェック
+
+```bash
+# レプリケーション遅延を確認（WAL フレームの未送信数）
+litestream databases -config /etc/litestream.yml
+
+# S3 バケット内のオブジェクト確認
+aws s3 ls s3://${LITESTREAM_S3_BUCKET}/asoview/ --recursive | tail -5
 ```
 
 ## 6. Docker

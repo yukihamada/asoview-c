@@ -261,7 +261,7 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
         snprintf(cors_hdrs, sizeof(cors_hdrs),
             "Access-Control-Allow-Origin: %s\r\n"
             "Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type, Authorization, X-Admin-Key\r\n"
+            "Access-Control-Allow-Headers: Content-Type, Authorization, X-Admin-Key, X-Tenant-ID\r\n"
             "Access-Control-Max-Age: 86400\r\n",
             cors_origin);
         mg_http_reply(c, 204, cors_hdrs, "");
@@ -365,6 +365,10 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (sscanf(uri, "/api/v1/venues/%ld", &id) == 1
                && strstr(uri, "/plans") == NULL) {
         if (IS_GET) handle_get_venue(c, hm, db, id);
+
+    } else if (sscanf(uri, "/api/v1/plans/%ld/availability", &id) == 1
+               && strstr(uri, "/availability") != NULL) {
+        if (IS_GET) handle_plan_availability(c, hm, db, id);
 
     } else if (sscanf(uri, "/api/v1/plans/%ld/schedules", &id) == 1
                && strstr(uri, "/schedules") != NULL) {
@@ -628,6 +632,20 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (sscanf(uri, "/api/v1/admin/plan-images/%ld", &id) == 1) {
         if (IS_DELETE) handle_admin_delete_plan_image(c, hm, db, id);
 
+    /* ── Admin 2FA セットアップ ─────────────────────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/admin/2fa/setup") == 0) {
+        if (IS_GET) handle_admin_2fa_setup(c, hm, db);
+
+    /* ── テナント管理 ──────────────────────────────────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/admin/tenants") == 0) {
+        if (IS_GET)  handle_admin_list_tenants(c, hm, db);
+        if (IS_POST) handle_admin_create_tenant(c, hm, db);
+
+    } else if (sscanf(uri, "/api/v1/admin/tenants/%ld", &id) == 1) {
+        if (IS_GET)    handle_admin_get_tenant(c, hm, db, id);
+        if (IS_PATCH)  handle_admin_update_tenant(c, hm, db, id);
+        if (IS_DELETE) handle_admin_delete_tenant(c, hm, db, id);
+
     /* ── OpenAPI スペック ────────────────────────────────────────────────── */
     } else if (strcmp(uri, "/api/v1/openapi.json") == 0 ||
                strcmp(uri, "/openapi.json") == 0) {
@@ -718,13 +736,28 @@ int main(int argc, char *argv[]) {
     struct mg_mgr mgr;
     mg_mgr_init(&mgr);
 
+    /* ── systemd socket activation (LISTEN_FDS) ──────────────────────────
+     * systemd が fd 3 以降に listen ソケットを渡してくれている場合はそれを使う。
+     * これにより systemd --no-block restart でゼロダウンタイム再起動が可能。 */
+    const char *listen_fds_env = getenv("LISTEN_FDS");
+    int listen_fds = listen_fds_env ? atoi(listen_fds_env) : 0;
     char listen_addr[64];
     snprintf(listen_addr, sizeof(listen_addr), "0.0.0.0:%s", port);
-    if (!mg_http_listen(&mgr, listen_addr, event_handler, db)) {
-        fprintf(stderr, "Failed to listen on %s\n", listen_addr);
-        return 1;
+
+    if (listen_fds > 0) {
+        /* systemd socket activation: fd 3 = 最初の listen ソケット */
+        if (!mg_http_listen_fd(&mgr, 3, event_handler, db)) {
+            fprintf(stderr, "Failed to wrap systemd socket fd 3\n");
+            return 1;
+        }
+        printf("[asoview-c] Listening on systemd socket (fd=3)\n");
+    } else {
+        if (!mg_http_listen(&mgr, listen_addr, event_handler, db)) {
+            fprintf(stderr, "Failed to listen on %s\n", listen_addr);
+            return 1;
+        }
+        printf("[asoview-c] Listening on http://%s\n", listen_addr);
     }
-    printf("[asoview-c] Listening on http://%s\n", listen_addr);
 
     printf("[asoview-c] Press Ctrl-C to stop\n");
     while (!g_quit) mg_mgr_poll(&mgr, 100);

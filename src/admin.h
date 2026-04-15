@@ -50,3 +50,11 @@ void handle_admin_delete_coupon  (struct mg_connection *c, struct mg_http_messag
 void handle_admin_list_plan_images  (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long plan_id);
 void handle_admin_create_plan_image (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long plan_id);
 void handle_admin_delete_plan_image (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long img_id);
+/* Admin 2FA */
+void handle_admin_2fa_setup         (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+/* Tenants */
+void handle_admin_list_tenants      (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+void handle_admin_create_tenant     (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+void handle_admin_get_tenant        (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id);
+void handle_admin_update_tenant     (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id);
+void handle_admin_delete_tenant     (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id);

@@ -3356,6 +3356,17 @@ struct mg_connection *mg_http_listen(struct mg_mgr *mgr, const char *url,
   return c;
 }
 
+/* systemd socket activation: wrap an already-open listener fd as HTTP */
+struct mg_connection *mg_http_listen_fd(struct mg_mgr *mgr, int fd,
+                                        mg_event_handler_t fn, void *fn_data) {
+  struct mg_connection *c = mg_wrapfd(mgr, fd, fn, fn_data);
+  if (c != NULL) {
+    c->is_listening = 1;
+    c->pfn = http_cb;
+  }
+  return c;
+}
+
 #ifdef MG_ENABLE_LINES
 #line 1 "src/iobuf.c"
 #endif

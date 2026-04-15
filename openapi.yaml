@@ -411,7 +411,8 @@ paths:
                 properties:
                   user_id: { type: integer }
                   name: { type: string }
-                  token: { type: string }
+                  token: { type: string, description: "アクセストークン（有効期限 1h）" }
+                  refresh_token: { type: string, description: "リフレッシュトークン（有効期限 14d）" }
                   message: { type: string }
         "400":
           description: 認証失敗
@@ -1108,19 +1109,35 @@ paths:
   /api/v1/auth/refresh:
     post:
       tags: [auth]
-      summary: JWT リフレッシュ（有効期限の延長）
-      security: [{ bearerAuth: [] }]
+      summary: JWT リフレッシュ（アクセストークン + リフレッシュトークン再発行）
+      description: |
+        リフレッシュトークンをリクエストボディで渡す。
+        発行済みの refresh_token は即座に無効化（ローテーション）される。
+        Authorization ヘッダーは不要。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+                  description: "ログイン時に発行された refresh_token"
       responses:
         "200":
-          description: 新しいトークンを発行
+          description: 新しいアクセストークンとリフレッシュトークンを発行
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  token: { type: string }
+                  token: { type: string, description: "新しいアクセストークン（1h）" }
+                  refresh_token: { type: string, description: "新しいリフレッシュトークン（14d）" }
                   message: { type: string }
-        "401": { description: 未認証 }
+        "400": { description: "refresh_token が未指定" }
+        "401": { description: "無効・期限切れ・または使用済みのリフレッシュトークン" }
 
   /api/v1/auth/logout:
     post:
@@ -1301,6 +1318,677 @@ paths:
               schema:
                 type: string
 
+  # ── iCal エクスポート ──────────────────────────────────────────────────────
+
+  /api/v1/bookings/{id}/ical:
+    get:
+      tags: [bookings]
+      summary: 予約を iCal (.ics) としてエクスポート（RFC 5545）
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: iCal ファイル
+          content:
+            text/calendar:
+              schema: { type: string }
+        "400": { description: キャンセル済みの予約 }
+        "401": { description: 未認証 }
+        "403": { description: 他人の予約 }
+        "404": { description: 予約が見つからない }
+
+  # ── クーポン ───────────────────────────────────────────────────────────────
+
+  /api/v1/coupons/{code}:
+    get:
+      tags: [bookings]
+      summary: クーポンコード検証
+      description: クーポンの有効性・割引内容を返す。認証不要。
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema: { type: string, example: "SUMMER10" }
+      responses:
+        "200":
+          description: クーポン情報
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  code: { type: string }
+                  description: { type: string, nullable: true }
+                  discount_type: { type: string, enum: [percent, fixed] }
+                  discount_value: { type: number }
+                  expires_at: { type: string, format: date-time, nullable: true }
+        "404": { description: 無効・期限切れ・使用上限超過 }
+
+  # ── プラン空き状況 ─────────────────────────────────────────────────────────
+
+  /api/v1/plans/{id}/availability:
+    get:
+      tags: [plans]
+      summary: プランの空き日程一覧（カレンダー表示用）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+          description: "検索開始日（デフォルト: 今日）"
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+          description: "検索終了日（デフォルト: 今日 +30 日）"
+        - name: adults
+          in: query
+          schema: { type: integer, default: 1 }
+          description: 最低必要空き数
+      responses:
+        "200":
+          description: 空きスケジュール一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plan_id: { type: integer }
+                  from: { type: string, format: date }
+                  to: { type: string, format: date }
+                  adults: { type: integer }
+                  schedules:
+                    type: array
+                    items: { $ref: "#/components/schemas/Schedule" }
+        "404": { description: プランが見つからない }
+
+  # ── 2FA TOTP (ユーザー) ────────────────────────────────────────────────────
+
+  /api/v1/auth/2fa/setup:
+    post:
+      tags: [auth]
+      summary: 2FA セットアップ — シークレット生成
+      description: TOTP シークレットと otpauth:// URI を返す。まだ有効化はしない。
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: シークレットと QR URI
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret: { type: string, description: Base32 エンコードシークレット }
+                  qr_uri: { type: string, description: "otpauth://totp/... URI" }
+        "401": { description: 未認証 }
+
+  /api/v1/auth/2fa/enable:
+    post:
+      tags: [auth]
+      summary: 2FA 有効化 — TOTP コード確認
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string, example: "123456", description: 6 桁 TOTP コード }
+      responses:
+        "200": { description: 2FA 有効化成功 }
+        "400": { description: コードが不正または未セットアップ }
+        "401": { description: 未認証 }
+
+  /api/v1/auth/2fa/verify:
+    post:
+      tags: [auth]
+      summary: 2FA 認証 — temp_token と TOTP コードで JWT を取得
+      description: |
+        2FA 有効ユーザーのログイン後、`/auth/login` が返す `temp_token` と
+        TOTP コードを送信して正式な JWT を取得する。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [temp_token, code]
+              properties:
+                temp_token: { type: string, description: login で返された一時トークン }
+                code: { type: string, example: "123456" }
+      responses:
+        "200":
+          description: 認証成功 — JWT 返却
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  user_id: { type: integer }
+        "401": { description: temp_token が無効またはコード不正 }
+
+  # ── 管理者 2FA ─────────────────────────────────────────────────────────────
+
+  /api/v1/admin/2fa/setup:
+    get:
+      tags: [admin]
+      summary: 管理者 TOTP セットアップ（初回のみ）
+      description: |
+        `ADMIN_TOTP_SECRET` が未設定の場合は新しいシークレットを生成して返す。
+        設定済みの場合は `{"status":"already_configured"}` を返す。
+        取得したシークレットを `.env` の `ADMIN_TOTP_SECRET` に設定して再起動すること。
+      security: [{ adminKey: [] }]
+      responses:
+        "200":
+          description: セットアップ情報または設定済み通知
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      totp_secret: { type: string }
+                      qr_uri: { type: string }
+                      instructions: { type: string }
+                  - type: object
+                    properties:
+                      status: { type: string, enum: [already_configured] }
+                      message: { type: string }
+        "403": { description: 管理者キーエラー }
+
+  # ── 管理者: 予約返金 ───────────────────────────────────────────────────────
+
+  /api/v1/admin/bookings/{id}/refund:
+    post:
+      tags: [admin, bookings]
+      summary: 予約を返金（Stripe）
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200": { description: 返金成功 }
+        "400": { description: 既にキャンセル済みまたは返金不可 }
+        "403": { description: 管理者キーエラー }
+        "404": { description: 予約が見つからない }
+        "502": { description: Stripe API エラー }
+
+  # ── 管理者: DB バックアップ ────────────────────────────────────────────────
+
+  /api/v1/admin/backup:
+    get:
+      tags: [admin]
+      summary: SQLite DB バックアップダウンロード
+      description: SQLite の `.backup` API でスナップショットを取得してバイナリ返却。
+      security: [{ adminKey: [] }]
+      responses:
+        "200":
+          description: SQLite DB バイナリ
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "403": { description: 管理者キーエラー }
+        "500": { description: バックアップ失敗 }
+
+  # ── 管理者: クーポン CRUD ──────────────────────────────────────────────────
+
+  /api/v1/admin/coupons:
+    get:
+      tags: [admin]
+      summary: クーポン一覧
+      security: [{ adminKey: [] }]
+      responses:
+        "200":
+          description: クーポン一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  coupons:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        code: { type: string }
+                        description: { type: string, nullable: true }
+                        discount_type: { type: string, enum: [percent, fixed] }
+                        discount_value: { type: number }
+                        max_uses: { type: integer, nullable: true }
+                        used_count: { type: integer }
+                        expires_at: { type: string, format: date-time, nullable: true }
+                        is_active: { type: boolean }
+        "403": { description: 管理者キーエラー }
+    post:
+      tags: [admin]
+      summary: クーポン作成
+      security: [{ adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, discount_type, discount_value]
+              properties:
+                code: { type: string, example: "SUMMER10" }
+                description: { type: string }
+                discount_type: { type: string, enum: [percent, fixed] }
+                discount_value: { type: number, example: 10 }
+                max_uses: { type: integer, nullable: true }
+                expires_at: { type: string, format: date-time, nullable: true }
+      responses:
+        "201": { description: 作成成功 }
+        "400": { description: パラメータ不足または重複コード }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/coupons/{id}:
+    delete:
+      tags: [admin]
+      summary: クーポン削除
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { description: 削除成功 }
+        "403": { description: 管理者キーエラー }
+        "404": { description: クーポンが見つからない }
+
+  # ── 管理者: Webhook エンドポイント CRUD ───────────────────────────────────
+
+  /api/v1/admin/webhooks:
+    get:
+      tags: [admin]
+      summary: Webhook エンドポイント一覧
+      security: [{ adminKey: [] }]
+      responses:
+        "200":
+          description: Webhook 一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  webhooks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        url: { type: string, format: uri }
+                        events: { type: string, description: カンマ区切りイベント名 }
+                        is_active: { type: boolean }
+        "403": { description: 管理者キーエラー }
+    post:
+      tags: [admin]
+      summary: Webhook エンドポイント登録
+      security: [{ adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, format: uri }
+                events: { type: string, example: "booking.created,booking.cancelled" }
+                secret: { type: string, description: HMAC 署名用シークレット }
+      responses:
+        "201": { description: 登録成功 }
+        "400": { description: パラメータ不足 }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/webhooks/{id}:
+    delete:
+      tags: [admin]
+      summary: Webhook エンドポイント削除
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { description: 削除成功 }
+        "403": { description: 管理者キーエラー }
+        "404": { description: 見つからない }
+
+  # ── 管理者: プラン画像 CRUD ────────────────────────────────────────────────
+
+  /api/v1/admin/plans/{id}/images:
+    get:
+      tags: [admin, plans]
+      summary: プラン画像一覧
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: 画像一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  images:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        url: { type: string, format: uri }
+                        sort_order: { type: integer }
+        "403": { description: 管理者キーエラー }
+        "404": { description: プランが見つからない }
+    post:
+      tags: [admin, plans]
+      summary: プラン画像追加
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, format: uri }
+                sort_order: { type: integer, default: 0 }
+      responses:
+        "201": { description: 追加成功 }
+        "400": { description: URL が必要 }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/plan-images/{id}:
+    delete:
+      tags: [admin, plans]
+      summary: プラン画像削除
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { description: 削除成功 }
+        "403": { description: 管理者キーエラー }
+        "404": { description: 見つからない }
+
+  # ── 管理者: 一括スケジュール生成 ──────────────────────────────────────────
+
+  /api/v1/admin/plans/{id}/schedules/bulk:
+    post:
+      tags: [admin, schedules]
+      summary: スケジュール一括生成
+      description: |
+        日付範囲と曜日マスクを指定して複数スケジュールを一括作成。
+        例: 毎週土日 9:00〜12:00 を 3 ヶ月分まとめて生成。
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, to, weekdays, start_time, end_time, capacity]
+              properties:
+                from: { type: string, format: date }
+                to: { type: string, format: date }
+                weekdays:
+                  type: array
+                  items: { type: integer, minimum: 0, maximum: 6 }
+                  description: "0=日, 1=月, ..., 6=土"
+                start_time: { type: string, example: "09:00" }
+                end_time: { type: string, example: "12:00" }
+                capacity: { type: integer }
+      responses:
+        "200":
+          description: 生成結果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  created: { type: integer, description: 生成件数 }
+                  skipped: { type: integer, description: 重複スキップ件数 }
+        "400": { description: パラメータ不足 }
+        "403": { description: 管理者キーエラー }
+
+  # ── 管理者: 売上レポート ───────────────────────────────────────────────────
+
+  /api/v1/admin/reports/sales:
+    get:
+      tags: [admin]
+      summary: 売上レポート CSV ダウンロード
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+          description: "開始日（デフォルト: 30 日前）"
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+          description: "終了日（デフォルト: 今日）"
+      responses:
+        "200":
+          description: CSV ファイル
+          content:
+            text/csv:
+              schema: { type: string }
+        "403": { description: 管理者キーエラー }
+
+  # ── 管理者: 監査ログ ───────────────────────────────────────────────────────
+
+  /api/v1/admin/audit-logs:
+    get:
+      tags: [admin]
+      summary: 監査ログ一覧
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: actor
+          in: query
+          schema: { type: string }
+          description: 操作者フィルター（IP または user_id）
+        - name: action
+          in: query
+          schema: { type: string }
+          description: 操作種別フィルター
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+      responses:
+        "200":
+          description: 監査ログ一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  logs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        actor: { type: string }
+                        action: { type: string }
+                        target: { type: string, nullable: true }
+                        detail: { type: string, nullable: true }
+                        created_at: { type: string, format: date-time }
+        "403": { description: 管理者キーエラー }
+
+  # ── 管理者: ダッシュボード ─────────────────────────────────────────────────
+
+  /api/v1/admin/dashboard:
+    get:
+      tags: [admin]
+      summary: 管理ダッシュボード統計
+      security: [{ adminKey: [] }]
+      responses:
+        "200":
+          description: ダッシュボード統計
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  venues: { type: integer }
+                  plans: { type: integer }
+                  users: { type: integer }
+                  bookings_total: { type: integer }
+                  bookings_confirmed: { type: integer }
+                  revenue_total: { type: integer }
+                  reviews_total: { type: integer }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/tenants:
+    get:
+      tags: [admin]
+      summary: テナント一覧
+      security: [{ adminKey: [] }]
+      responses:
+        "200":
+          description: テナント一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenants:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Tenant'
+        "403": { description: 管理者キーエラー }
+    post:
+      tags: [admin]
+      summary: テナント作成
+      security: [{ adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [slug, name]
+              properties:
+                slug:
+                  type: string
+                  description: "URL 用の識別子（英数字・ハイフン）"
+                name:
+                  type: string
+                  description: "テナント表示名"
+                plan_limit:
+                  type: integer
+                  default: 100
+                  description: "プラン登録上限数"
+      responses:
+        "201":
+          description: 作成成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  slug: { type: string }
+                  name: { type: string }
+                  api_key: { type: string, description: "自動生成された API キー（X-Tenant-ID ヘッダーで使用）" }
+                  plan_limit: { type: integer }
+                  is_active: { type: integer }
+                  created_at: { type: string, format: date-time }
+        "400": { description: "必須フィールド不足" }
+        "409": { description: "slug が既に使用済み" }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/tenants/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: integer }
+    get:
+      tags: [admin]
+      summary: テナント詳細取得
+      security: [{ adminKey: [] }]
+      responses:
+        "200":
+          description: テナント詳細
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        "404": { description: テナントが存在しない }
+        "403": { description: 管理者キーエラー }
+    patch:
+      tags: [admin]
+      summary: テナント更新
+      security: [{ adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                plan_limit: { type: integer }
+                is_active: { type: integer, enum: [0, 1] }
+      responses:
+        "200":
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        "404": { description: テナントが存在しない }
+        "403": { description: 管理者キーエラー }
+    delete:
+      tags: [admin]
+      summary: テナント削除
+      security: [{ adminKey: [] }]
+      responses:
+        "200":
+          description: 削除成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+        "404": { description: テナントが存在しない }
+        "403": { description: 管理者キーエラー }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1455,3 +2143,14 @@ components:
       type: object
       properties:
         error: { type: string }
+
+    Tenant:
+      type: object
+      properties:
+        id: { type: integer }
+        slug: { type: string, description: "URL 用の識別子（X-Tenant-ID ヘッダー値）" }
+        name: { type: string }
+        api_key: { type: string, description: "テナント API キー（作成時のみ返却）" }
+        plan_limit: { type: integer }
+        is_active: { type: integer, enum: [0, 1] }
+        created_at: { type: string, format: date-time }

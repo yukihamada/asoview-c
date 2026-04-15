@@ -24,9 +24,14 @@ static void test_webhook_endpoints(void);
 static void test_plan_images(void);
 static void test_sales_report(void);
 static void test_2fa_flow(void);
-static void test_ical_booking(void);static const char *BASE_URL;
-static char g_token[512]  = {0}; /* taro@example.com のJWT */
-static char g_token2[512] = {0}; /* hanako@example.com のJWT */
+static void test_ical_booking(void);
+static void test_admin_2fa_setup(void);
+static void test_plan_availability(void);
+static void test_admin_tenants(void);
+static const char *BASE_URL;
+static char g_token[512]         = {0}; /* taro@example.com のアクセストークン */
+static char g_refresh_token[512] = {0}; /* taro@example.com のリフレッシュトークン */
+static char g_token2[512]        = {0}; /* hanako@example.com のアクセストークン */
 
 #define ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -173,6 +178,26 @@ static Resp http_put_admin(const char *url, const char *json_body) {
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_perform(curl);
+    Resp r = { buf.data, 0 };
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    return r;
+}
+
+/* 管理者キー付き PATCH */
+static Resp http_patch_admin(const char *url, const char *json_body) {
+    CURL *curl = curl_easy_init();
+    Buf buf = { malloc(1), 0 };
+    struct curl_slist *hdrs = curl_slist_append(NULL, "Content-Type: application/json");
+    hdrs = curl_slist_append(hdrs, "X-Admin-Key: asoview-admin-dev");
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
@@ -586,6 +611,9 @@ static void test_login(void) {
     const char *tok = cJSON_GetStringValue(cJSON_GetObjectItem(j, "token"));
     ASSERT(tok && strlen(tok) > 10, "token present");
     strncpy(g_token, tok, sizeof(g_token)-1);
+    const char *rtok = cJSON_GetStringValue(cJSON_GetObjectItem(j, "refresh_token"));
+    ASSERT(rtok && strlen(rtok) > 10, "refresh_token present");
+    strncpy(g_refresh_token, rtok, sizeof(g_refresh_token)-1);
     cJSON_Delete(j); resp_free(&r);
     PASS();
 }
@@ -1520,23 +1548,34 @@ static void test_create_user_invalid_email(void) {
     PASS();
 }
 
-/* POST /auth/refresh — 有効なトークンで新しいトークンを発行 */
+/* POST /auth/refresh — refresh token でアクセストークンを更新 */
 static void test_auth_refresh(void) {
     char url[256];
     snprintf(url, sizeof(url), "%s/api/v1/auth/refresh", BASE_URL);
 
-    /* 有効なトークン → 200 + 新しいトークン */
-    Resp r = http_post_auth(url, "", g_token);
+    /* 有効な refresh token → 200 + 新しいトークンペア */
+    char body[600];
+    snprintf(body, sizeof(body), "{\"refresh_token\":\"%s\"}", g_refresh_token);
+    Resp r = http_post(url, body);
     ASSERT(r.status == 200, "refresh with valid token → 200");
     cJSON *j = cJSON_Parse(r.body);
     const char *new_tok = cJSON_GetStringValue(cJSON_GetObjectItem(j, "token"));
     ASSERT(new_tok && strlen(new_tok) > 10, "has new token");
+    const char *new_rt = cJSON_GetStringValue(cJSON_GetObjectItem(j, "refresh_token"));
+    ASSERT(new_rt && strlen(new_rt) > 10, "has new refresh_token");
     cJSON_Delete(j); resp_free(&r);
 
-    /* 未認証 → 401 */
-    Resp r2 = http_post(url, "");
-    ASSERT(r2.status == 401, "no auth → 401");
+    /* access token を refresh として使用 → 401 */
+    char body2[600];
+    snprintf(body2, sizeof(body2), "{\"refresh_token\":\"%s\"}", g_token);
+    Resp r2 = http_post(url, body2);
+    ASSERT(r2.status == 401, "access token as refresh → 401");
     resp_free(&r2);
+
+    /* body なし → 400 */
+    Resp r3 = http_post(url, "");
+    ASSERT(r3.status == 400, "no body → 400");
+    resp_free(&r3);
 
     PASS();
 }
@@ -2303,13 +2342,16 @@ int main(void) {
     test_security_headers();
     test_setup_page();
 
-    /* ── Batch 7: クーポン・Webhook・画像・売上・2FA・iCal ── */
+    /* ── Batch 7: クーポン・Webhook・画像・売上・2FA・iCal・Admin2FA・availability ── */
     test_coupons();
     test_webhook_endpoints();
     test_plan_images();
     test_sales_report();
     test_2fa_flow();
     test_ical_booking();
+    test_admin_2fa_setup();
+    test_plan_availability();
+    test_admin_tenants();
 
     kill(pid, 15);
 
@@ -2478,48 +2520,183 @@ static void test_2fa_flow(void) {
 }
 
 static void test_ical_booking(void) {
-    /* g_booking_id は test_create_and_get_booking で設定されているが、
-       そのブッキングはキャンセル済みの可能性がある。新規予約を作成。 */
     char url[256];
 
-    /* スケジュール ID 10 を試す（seed データに存在） */
-    snprintf(url, sizeof(url), "%s/api/v1/bookings", BASE_URL);
-    Resp rb = http_post_auth(url,
-        "{\"plan_id\":2,\"schedule_id\":10,"
+    /* 専用スケジュールを管理者作成（将来日付・空き確実） */
+    snprintf(url, sizeof(url), "%s/api/v1/admin/plans/1/schedules", BASE_URL);
+    Resp rs = http_post_admin(url,
+        "{\"date\":\"2099-12-31\",\"start_time\":\"10:00\","
+        "\"end_time\":\"12:00\",\"capacity\":10}");
+    ASSERT(rs.status == 201, "ical: create schedule 201");
+    cJSON *js = cJSON_Parse(rs.body);
+    long ical_sched_id = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(js, "id"));
+    cJSON_Delete(js); resp_free(&rs);
+    ASSERT(ical_sched_id > 0, "ical: schedule id > 0");
+
+    /* 価格を設定（plan_id=1には既にあるが念のため PUT）*/
+    snprintf(url, sizeof(url), "%s/api/v1/admin/plans/1/prices", BASE_URL);
+    Resp rp = http_put_admin(url,
+        "[{\"participant_type\":\"adult\",\"label\":\"大人\",\"price\":1000}]");
+    resp_free(&rp);
+
+    /* 予約作成 */
+    char body[128];
+    snprintf(body, sizeof(body),
+        "{\"plan_id\":1,\"schedule_id\":%ld,"
         "\"participants\":[{\"participant_type\":\"adult\",\"count\":1}]}",
-        g_token);
-    if (rb.status != 200 && rb.status != 201) {
-        resp_free(&rb);
-        /* スケジュールが満席または存在しない場合はスキップ */
-        printf("  SKIP test_ical_booking (no available schedule)\n");
-        passed++;
-        return;
-    }
+        ical_sched_id);
+    snprintf(url, sizeof(url), "%s/api/v1/bookings", BASE_URL);
+    Resp rb = http_post_auth(url, body, g_token);
+    ASSERT(rb.status == 200 || rb.status == 201, "ical: booking created");
     cJSON *jb = cJSON_Parse(rb.body);
     const char *bid = cJSON_GetStringValue(cJSON_GetObjectItem(jb, "id"));
-    char booking_id_copy[64] = {0};
-    if (bid) strncpy(booking_id_copy, bid, sizeof(booking_id_copy)-1);
+    char booking_id[64] = {0};
+    if (bid) strncpy(booking_id, bid, sizeof(booking_id)-1);
     cJSON_Delete(jb); resp_free(&rb);
+    ASSERT(booking_id[0], "ical: booking id present");
 
-    if (!booking_id_copy[0]) {
-        printf("  SKIP test_ical_booking (could not parse booking id)\n");
-        passed++; return;
-    }
-
-    snprintf(url, sizeof(url), "%s/api/v1/bookings/%s/ical", BASE_URL, booking_id_copy);
+    /* iCal エクスポート（本人） */
+    snprintf(url, sizeof(url), "%s/api/v1/bookings/%s/ical", BASE_URL, booking_id);
     Resp r = http_get_auth(url, g_token);
     ASSERT(r.status == 200, "ical export → 200");
-    ASSERT(r.body != NULL && strstr(r.body, "BEGIN:VCALENDAR") != NULL,
-           "response contains VCALENDAR");
-    ASSERT(strstr(r.body, "BEGIN:VEVENT") != NULL, "response contains VEVENT");
-    ASSERT(strstr(r.body, "DTSTART") != NULL, "response contains DTSTART");
+    ASSERT(r.body && strstr(r.body, "BEGIN:VCALENDAR") != NULL, "has VCALENDAR");
+    ASSERT(strstr(r.body, "BEGIN:VEVENT") != NULL, "has VEVENT");
+    ASSERT(strstr(r.body, "DTSTART") != NULL, "has DTSTART");
+    ASSERT(strstr(r.body, "2099") != NULL, "date 2099 in ical");
     resp_free(&r);
 
-    /* 他人の予約では 403 */
-    snprintf(url, sizeof(url), "%s/api/v1/bookings/%s/ical", BASE_URL, booking_id_copy);
+    /* 他人は 403 */
+    snprintf(url, sizeof(url), "%s/api/v1/bookings/%s/ical", BASE_URL, booking_id);
     Resp r2 = http_get_auth(url, g_token2);
-    ASSERT(r2.status == 403, "ical export by non-owner → 403");
+    ASSERT(r2.status == 403, "ical non-owner → 403");
     resp_free(&r2);
+
+    PASS();
+}
+
+static void test_admin_2fa_setup(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/v1/admin/2fa/setup", BASE_URL);
+
+    /* X-Admin-Key なしは 403 */
+    Resp r0 = http_get(url);
+    ASSERT(r0.status == 403, "admin 2fa setup: no key → 403");
+    resp_free(&r0);
+
+    /* 正しいキーで setup → 200 + totp_secret or already_configured */
+    Resp r = http_get_admin(url);
+    ASSERT(r.status == 200, "admin 2fa setup → 200");
+    cJSON *j = cJSON_Parse(r.body);
+    ASSERT(j != NULL, "admin 2fa setup: valid JSON");
+    /* ADMIN_TOTP_SECRET 未設定ならシークレット返却、設定済みなら already_configured */
+    int has_secret = cJSON_GetObjectItem(j, "totp_secret") != NULL;
+    int already    = cJSON_GetObjectItem(j, "status") != NULL;
+    ASSERT(has_secret || already, "admin 2fa: secret or already_configured present");
+    cJSON_Delete(j); resp_free(&r);
+
+    PASS();
+}
+
+static void test_plan_availability(void) {
+    char url[256];
+
+    /* 正常: plan_id=1 のデフォルト範囲（今日〜30日後） */
+    snprintf(url, sizeof(url), "%s/api/v1/plans/1/availability", BASE_URL);
+    Resp r = http_get(url);
+    ASSERT(r.status == 200, "availability → 200");
+    cJSON *j = cJSON_Parse(r.body);
+    ASSERT(j != NULL, "availability: valid JSON");
+    ASSERT(cJSON_GetObjectItem(j, "plan_id") != NULL, "availability: plan_id present");
+    ASSERT(cJSON_GetObjectItem(j, "schedules") != NULL, "availability: schedules present");
+    ASSERT(cJSON_IsArray(cJSON_GetObjectItem(j, "schedules")), "availability: schedules is array");
+    cJSON_Delete(j); resp_free(&r);
+
+    /* from/to 指定 */
+    snprintf(url, sizeof(url), "%s/api/v1/plans/1/availability?from=2099-12-30&to=2099-12-31&adults=1", BASE_URL);
+    Resp r2 = http_get(url);
+    ASSERT(r2.status == 200, "availability with from/to → 200");
+    cJSON *j2 = cJSON_Parse(r2.body);
+    /* 2099-12-31 には test_ical_booking で作成したスケジュールがある */
+    cJSON *scheds = cJSON_GetObjectItem(j2, "schedules");
+    ASSERT(cJSON_GetArraySize(scheds) >= 1, "availability: 2099-12-31 schedule found");
+    cJSON_Delete(j2); resp_free(&r2);
+
+    /* 存在しないプラン → 404 */
+    snprintf(url, sizeof(url), "%s/api/v1/plans/99999/availability", BASE_URL);
+    Resp r3 = http_get(url);
+    ASSERT(r3.status == 404, "availability: invalid plan → 404");
+    resp_free(&r3);
+
+    PASS();
+}
+
+/* ─── テナント CRUD ──────────────────────────────────────────────────────── */
+static void test_admin_tenants(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/v1/admin/tenants", BASE_URL);
+
+    /* 空一覧 → 200 */
+    Resp r0 = http_get_admin(url);
+    ASSERT(r0.status == 200, "list tenants (empty) → 200");
+    resp_free(&r0);
+
+    /* 作成 → 201 */
+    const char *tbody = "{\"slug\":\"acme\",\"name\":\"Acme Corp\"}";
+    Resp r1 = http_post_admin(url, tbody);
+    ASSERT(r1.status == 201, "create tenant → 201");
+    cJSON *j1 = cJSON_Parse(r1.body);
+    long tenant_id = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(j1, "id"));
+    ASSERT(tenant_id > 0, "tenant id > 0");
+    const char *tapi_key = cJSON_GetStringValue(cJSON_GetObjectItem(j1, "api_key"));
+    ASSERT(tapi_key && strlen(tapi_key) >= 32, "api_key auto-generated");
+    cJSON_Delete(j1); resp_free(&r1);
+
+    /* 重複 slug → 409 */
+    Resp r2 = http_post_admin(url, tbody);
+    ASSERT(r2.status == 409, "duplicate slug → 409");
+    resp_free(&r2);
+
+    /* 取得 */
+    char get_url[256];
+    snprintf(get_url, sizeof(get_url), "%s/api/v1/admin/tenants/%ld", BASE_URL, tenant_id);
+    Resp r3 = http_get_admin(get_url);
+    ASSERT(r3.status == 200, "get tenant → 200");
+    resp_free(&r3);
+
+    /* 更新 */
+    Resp r4 = http_patch_admin(get_url, "{\"name\":\"Acme Updated\",\"is_active\":false}");
+    ASSERT(r4.status == 200, "update tenant → 200");
+    cJSON *j4 = cJSON_Parse(r4.body);
+    ASSERT(cJSON_IsFalse(cJSON_GetObjectItem(j4, "is_active")), "is_active updated to false");
+    cJSON_Delete(j4); resp_free(&r4);
+
+    /* X-Tenant-ID で未知テナント → 404 */
+    {
+        char venues_url[256];
+        snprintf(venues_url, sizeof(venues_url), "%s/api/v1/venues", BASE_URL);
+        CURL *tcurl = curl_easy_init();
+        Buf tbuf = { malloc(1), 0 };
+        struct curl_slist *thdrs = NULL;
+        thdrs = curl_slist_append(thdrs, "X-Tenant-ID: nonexistent-tenant-xyz");
+        curl_easy_setopt(tcurl, CURLOPT_URL, venues_url);
+        curl_easy_setopt(tcurl, CURLOPT_HTTPHEADER, thdrs);
+        curl_easy_setopt(tcurl, CURLOPT_WRITEFUNCTION, write_cb);
+        curl_easy_setopt(tcurl, CURLOPT_WRITEDATA, &tbuf);
+        curl_easy_perform(tcurl);
+        long tstatus = 0; curl_easy_getinfo(tcurl, CURLINFO_RESPONSE_CODE, &tstatus);
+        curl_slist_free_all(thdrs); curl_easy_cleanup(tcurl); free(tbuf.data);
+        ASSERT(tstatus == 404, "unknown X-Tenant-ID → 404");
+    }
+
+    /* 削除 */
+    Resp r5 = http_delete_admin(get_url);
+    ASSERT(r5.status == 200, "delete tenant → 200");
+    resp_free(&r5);
+
+    /* 削除後は 404 */
+    Resp r6 = http_get_admin(get_url);
+    ASSERT(r6.status == 404, "deleted tenant → 404");
+    resp_free(&r6);
 
     PASS();
 }

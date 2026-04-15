@@ -7,6 +7,10 @@
 #define GENERAL_LIMIT 500
 #define AUTH_LIMIT     60
 
+/* ユーザー単位レート制限 */
+#define UID_BUCKET_COUNT  2048
+#define UID_WRITE_LIMIT    30   /* 認証ユーザー: 書き込み操作 30 回/min */
+
 typedef struct {
     char  ip[48];        /* IPv4/IPv6 文字列 */
     long  window_start;
@@ -14,7 +18,14 @@ typedef struct {
     int   auth_count;
 } RateBucket;
 
+typedef struct {
+    long uid;
+    long window_start;
+    int  count;
+} UidBucket;
+
 static RateBucket buckets[BUCKET_COUNT];
+static UidBucket  uid_buckets[UID_BUCKET_COUNT];
 
 static unsigned int hash_ip(const char *ip) {
     unsigned int h = 5381;
@@ -46,4 +57,24 @@ int rate_check(const char *ip, int is_auth) {
     if (b->count      > GENERAL_LIMIT) return 1;
     if (is_auth && b->auth_count > AUTH_LIMIT) return 1;
     return 0;
+}
+
+/* ユーザー単位の書き込み操作レート制限
+ * 返り値: 0 = OK, 1 = レート超過 */
+int rate_check_uid(long uid) {
+    if (uid <= 0) return 0;
+
+    unsigned int idx = (unsigned int)(uid % UID_BUCKET_COUNT);
+    UidBucket   *b   = &uid_buckets[idx];
+    long         now = (long)time(NULL);
+
+    /* スロット未使用・別ユーザー・ウィンドウ期限切れ → リセット */
+    if (b->uid == 0 || b->uid != uid || now - b->window_start >= WINDOW_SECS) {
+        b->uid          = uid;
+        b->window_start = now;
+        b->count        = 0;
+    }
+
+    b->count++;
+    return b->count > UID_WRITE_LIMIT ? 1 : 0;
 }

@@ -14,10 +14,16 @@ char *str_lower(char *s);               /* in-place lowercase */
 int   str_starts_with(const char *s, const char *prefix);
 
 /* JWT (HS256) ― platform.h 経由で HMAC-SHA256 を使用
-   jwt_create: malloc で確保したトークン文字列を返す。呼び出し元が free() すること。
-   jwt_verify: user_id を返す。無効/期限切れなら -1 */
+   jwt_create:         access token (1h, type="access")
+   jwt_create_refresh: refresh token (14d, type="refresh")
+   戻り値は malloc 確保済み文字列。呼び出し元が free() すること。
+   jwt_verify:       user_id を返す。無効/期限切れなら -1 (後方互換)
+   jwt_verify_typed: type_out に token の type を書き込む。NULL 可 */
 char *jwt_create(long user_id, const char *secret);
+char *jwt_create_refresh(long user_id, const char *secret);
 long  jwt_verify(const char *token, const char *secret);
+long  jwt_verify_typed(const char *token, const char *secret,
+                       char *type_out, size_t type_sz);
 
 /* LIKE パターンの % _ ! をエスケープ（'!' エスケープ文字方式、全バックエンド共通）
    LIKE ... ESCAPE '!' と組み合わせて使う */

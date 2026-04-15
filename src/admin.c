@@ -1,12 +1,14 @@
 #include "admin.h"
-#include "handlers.h"   /* send_json_str, send_error_json */
+#include "handlers.h"   /* send_json_str, send_error_json, totp_verify */
 #include "audit.h"
+#include "platform.h"
 #include "cJSON.h"
 #include "stripe.h"
 #include "mailer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <math.h>
 #include <time.h>
 
@@ -44,6 +46,20 @@ static int require_admin(struct mg_connection *c, struct mg_http_message *hm) {
     /* 定数時間比較でタイミング攻撃を防ぐ */
     if (!const_time_strcmp(hdr->buf, hdr->len, expected, strlen(expected))) {
         send_error_json(c, 403, "管理者キーが不正です"); return 0;
+    }
+    /* ADMIN_TOTP_SECRET が設定されている場合は X-Admin-TOTP ヘッダも検証 */
+    const char *totp_secret = getenv("ADMIN_TOTP_SECRET");
+    if (totp_secret && *totp_secret) {
+        struct mg_str *totp_hdr = mg_http_get_header(hm, "X-Admin-TOTP");
+        if (!totp_hdr) {
+            send_error_json(c, 403, "管理者 TOTP コードが必要です (X-Admin-TOTP)"); return 0;
+        }
+        char code_buf[8] = {0};
+        size_t n = totp_hdr->len < 7 ? totp_hdr->len : 7;
+        memcpy(code_buf, totp_hdr->buf, n);
+        if (!totp_verify(totp_secret, code_buf)) {
+            send_error_json(c, 403, "TOTP コードが不正です"); return 0;
+        }
     }
     return 1;
 }
@@ -1199,6 +1215,11 @@ void handle_admin_ui(struct mg_connection *c, struct mg_http_message *hm, DbConn
 "    <a href='#' onclick='showTab(\"schedules\")' id='nav-schedules'>Schedules</a>\n"
 "    <a href='#' onclick='showTab(\"bookings\")' id='nav-bookings'>Bookings</a>\n"
 "    <a href='#' onclick='showTab(\"users\")' id='nav-users'>Users</a>\n"
+"    <a href='#' onclick='showTab(\"reviews\")' id='nav-reviews'>Reviews</a>\n"
+"    <a href='#' onclick='showTab(\"coupons\")' id='nav-coupons'>Coupons</a>\n"
+"    <a href='#' onclick='showTab(\"webhooks\")' id='nav-webhooks'>Webhooks</a>\n"
+"    <a href='#' onclick='showTab(\"audit\")' id='nav-audit'>Audit Log</a>\n"
+"    <a href='#' onclick='showTab(\"tenants\")' id='nav-tenants'>Tenants</a>\n"
 "  </nav>\n"
 "</div>\n"
 "<div id='main'>\n"
@@ -1228,6 +1249,14 @@ void handle_admin_ui(struct mg_connection *c, struct mg_http_message *hm, DbConn
 "      <button class='btn btn-primary' onclick='openPlanModal()'>+ 追加</button>\n"
 "    </div>\n"
 "    <table id='plans-table'><thead><tr><th>ID</th><th>Title</th><th>Venue</th><th>Active</th><th>Actions</th></tr></thead><tbody></tbody></table>\n"
+"    <div id='prices-section' style='display:none;margin-top:20px;'>\n"
+"      <h3 id='prices-title' style='font-size:15px;margin-bottom:8px;'>料金設定</h3>\n"
+"      <div id='prices-msg'></div>\n"
+"      <div id='prices-list' style='margin-bottom:10px;'></div>\n"
+"      <button class='btn btn-secondary' onclick='addPriceRow()'>+ 料金を追加</button>\n"
+"      <button class='btn btn-primary' style='margin-left:8px;' onclick='savePrices()'>保存</button>\n"
+"      <button class='btn btn-secondary' style='margin-left:8px;' onclick='closePrices()'>閉じる</button>\n"
+"    </div>\n"
 "  </div>\n"
 "\n"
 "  <!-- SCHEDULES TAB -->\n"
@@ -1260,6 +1289,46 @@ void handle_admin_ui(struct mg_connection *c, struct mg_http_message *hm, DbConn
 "      <input type='text' id='users-search' placeholder='検索...' oninput='loadUsers()'>\n"
 "    </div>\n"
 "    <table id='users-table'><thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Bookings</th><th>Created</th></tr></thead><tbody></tbody></table>\n"
+"  </div>\n"
+"\n"
+"  <!-- REVIEWS TAB -->\n"
+"  <div class='tab' id='tab-reviews'>\n"
+"    <div id='reviews-msg'></div>\n"
+"    <div class='toolbar'><h2>Reviews</h2></div>\n"
+"    <table id='reviews-table'><thead><tr><th>ID</th><th>Plan</th><th>User</th><th>Rating</th><th>Comment</th><th>Created</th><th>Actions</th></tr></thead><tbody></tbody></table>\n"
+"  </div>\n"
+"\n"
+"  <!-- COUPONS TAB -->\n"
+"  <div class='tab' id='tab-coupons'>\n"
+"    <div id='coupons-msg'></div>\n"
+"    <div class='toolbar'><h2>Coupons</h2><button class='btn btn-primary' onclick='openCouponModal()'>+ 追加</button></div>\n"
+"    <table id='coupons-table'><thead><tr><th>ID</th><th>Code</th><th>Type</th><th>Value</th><th>Used/Max</th><th>Expires</th><th>Active</th><th>Actions</th></tr></thead><tbody></tbody></table>\n"
+"  </div>\n"
+"\n"
+"  <!-- WEBHOOKS TAB -->\n"
+"  <div class='tab' id='tab-webhooks'>\n"
+"    <div id='webhooks-msg'></div>\n"
+"    <div class='toolbar'><h2>Webhooks</h2><button class='btn btn-primary' onclick='openWebhookModal()'>+ 追加</button></div>\n"
+"    <table id='webhooks-table'><thead><tr><th>ID</th><th>URL</th><th>Events</th><th>Active</th><th>Actions</th></tr></thead><tbody></tbody></table>\n"
+"  </div>\n"
+"\n"
+"  <!-- AUDIT LOG TAB -->\n"
+"  <div class='tab' id='tab-audit'>\n"
+"    <div class='toolbar'>\n"
+"      <h2>Audit Log</h2>\n"
+"      <div style='display:flex;gap:8px;align-items:center;'>\n"
+"        <span style='font-size:12px;color:var(--muted)'>直近200件</span>\n"
+"        <button class='btn btn-secondary' onclick='loadAudit()'>&#8635; 更新</button>\n"
+"      </div>\n"
+"    </div>\n"
+"    <table id='audit-table'><thead><tr><th>時刻</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th><th>IP</th></tr></thead><tbody></tbody></table>\n"
+"  </div>\n"
+"\n"
+"  <!-- TENANTS TAB -->\n"
+"  <div class='tab' id='tab-tenants'>\n"
+"    <div id='tenants-msg'></div>\n"
+"    <div class='toolbar'><h2>Tenants</h2><button class='btn btn-primary' onclick='openTenantModal()'>+ 追加</button></div>\n"
+"    <table id='tenants-table'><thead><tr><th>ID</th><th>Slug</th><th>Name</th><th>API Key</th><th>Plan Limit</th><th>Active</th><th>Actions</th></tr></thead><tbody></tbody></table>\n"
 "  </div>\n"
 "\n"
 "  </div><!-- /content -->\n"
@@ -1364,6 +1433,68 @@ void handle_admin_ui(struct mg_connection *c, struct mg_http_message *hm, DbConn
 "  </div>\n"
 "</div>\n"
 "\n"
+"<!-- COUPON MODAL -->\n"
+"<div class='overlay' id='coupon-modal'>\n"
+"  <div class='modal'>\n"
+"    <h3>クーポンを追加</h3>\n"
+"    <div id='coupon-modal-msg'></div>\n"
+"    <div class='form-row'>\n"
+"      <div class='form-group'><label>コード *</label><input id='coupon-code' type='text' placeholder='SUMMER20'></div>\n"
+"      <div class='form-group'><label>種別</label>\n"
+"        <select id='coupon-type'><option value='percent'>割引率(%)</option><option value='amount'>固定額(円)</option></select>\n"
+"      </div>\n"
+"    </div>\n"
+"    <div class='form-row'>\n"
+"      <div class='form-group'><label>割引値 *</label><input id='coupon-value' type='number' min='1'></div>\n"
+"      <div class='form-group'><label>最大利用数</label><input id='coupon-maxuses' type='number' placeholder='無制限'></div>\n"
+"    </div>\n"
+"    <div class='form-group'><label>有効期限</label><input id='coupon-expires' type='date'></div>\n"
+"    <div class='form-group'><label>説明</label><input id='coupon-desc' type='text'></div>\n"
+"    <div class='modal-footer'>\n"
+"      <button class='btn btn-secondary' onclick='closeModal(\"coupon-modal\")'>キャンセル</button>\n"
+"      <button class='btn btn-primary' onclick='saveCoupon()'>保存</button>\n"
+"    </div>\n"
+"  </div>\n"
+"</div>\n"
+"\n"
+"<!-- WEBHOOK MODAL -->\n"
+"<div class='overlay' id='webhook-modal'>\n"
+"  <div class='modal'>\n"
+"    <h3>Webhook エンドポイントを追加</h3>\n"
+"    <div id='webhook-modal-msg'></div>\n"
+"    <div class='form-group'><label>URL *</label><input id='wh-url' type='url' placeholder='https://example.com/webhook'></div>\n"
+"    <div class='form-group'><label>シークレット *</label><input id='wh-secret' type='text' placeholder='署名検証用シークレット'></div>\n"
+"    <div class='form-group'><label>イベント（カンマ区切り）</label><input id='wh-events' type='text' placeholder='booking.created,booking.cancelled'></div>\n"
+"    <div class='modal-footer'>\n"
+"      <button class='btn btn-secondary' onclick='closeModal(\"webhook-modal\")'>キャンセル</button>\n"
+"      <button class='btn btn-primary' onclick='saveWebhook()'>保存</button>\n"
+"    </div>\n"
+"  </div>\n"
+"</div>\n"
+"\n"
+"<!-- TENANT MODAL -->\n"
+"<div class='overlay' id='tenant-modal'>\n"
+"  <div class='modal'>\n"
+"    <h3 id='tenant-modal-title'>テナントを追加</h3>\n"
+"    <div id='tenant-modal-msg'></div>\n"
+"    <input type='hidden' id='tenant-id'>\n"
+"    <div class='form-row'>\n"
+"      <div class='form-group'><label>Slug *</label><input id='tenant-slug' type='text' placeholder='acme'></div>\n"
+"      <div class='form-group'><label>名前 *</label><input id='tenant-name' type='text' placeholder='Acme Corp'></div>\n"
+"    </div>\n"
+"    <div class='form-row'>\n"
+"      <div class='form-group'><label>Plan上限</label><input id='tenant-limit' type='number' value='100'></div>\n"
+"      <div class='form-group'><label>有効</label>\n"
+"        <select id='tenant-active'><option value='true'>有効</option><option value='false'>無効</option></select>\n"
+"      </div>\n"
+"    </div>\n"
+"    <div class='modal-footer'>\n"
+"      <button class='btn btn-secondary' onclick='closeModal(\"tenant-modal\")'>キャンセル</button>\n"
+"      <button class='btn btn-primary' onclick='saveTenant()'>保存</button>\n"
+"    </div>\n"
+"  </div>\n"
+"</div>\n"
+"\n"
 "<script>\n"
 "// ─── Key Management ──────────────────────────────────────────────────────────\n"
 "let adminKey = localStorage.getItem('asoview_admin_key') || '';\n"
@@ -1398,6 +1529,11 @@ void handle_admin_ui(struct mg_connection *c, struct mg_http_message *hm, DbConn
 "  if (tab === 'schedules') { loadPlanSelect(); }\n"
 "  if (tab === 'bookings')  loadBookings();\n"
 "  if (tab === 'users')     loadUsers();\n"
+"  if (tab === 'reviews')   loadReviews();\n"
+"  if (tab === 'coupons')   loadCoupons();\n"
+"  if (tab === 'webhooks')  loadWebhooks();\n"
+"  if (tab === 'audit')     loadAudit();\n"
+"  if (tab === 'tenants')   loadTenants();\n"
 "}\n"
 "\n"
 "// ─── Modal helpers ────────────────────────────────────────────────────────────\n"
@@ -1476,6 +1612,7 @@ void handle_admin_ui(struct mg_connection *c, struct mg_http_message *hm, DbConn
 "     <td>${p.is_active?`<span class='badge badge-green'>Yes</span>`:`<span class='badge badge-grey'>No</span>`}</td>\n"
 "     <td class='actions'>\n"
 "       <button class='btn btn-secondary' onclick='editPlan(${p.id},${JSON.stringify(p).replace(/\"/g,\"&quot;\")})'>編集</button>\n"
+"       <button class='btn btn-secondary' onclick='openPrices(${p.id},${JSON.stringify(p.title||'').replace(/\"/g,\"&quot;\")})'>料金</button>\n"
 "       <button class='btn btn-danger' onclick='deletePlan(${p.id})'>削除</button>\n"
 "     </td></tr>`\n"
 "  ).join('');\n"
@@ -1633,6 +1770,222 @@ void handle_admin_ui(struct mg_connection *c, struct mg_http_message *hm, DbConn
 "     <td>${u.booking_count}</td>\n"
 "     <td style='font-size:11px;'>${(u.created_at||'').slice(0,10)}</td></tr>`\n"
 "  ).join('');\n"
+"}\n"
+"\n"
+"// ─── PLAN PRICES ────────────────────────────────────────────────────────────────\n"
+"let currentPricesPlanId = null;\n"
+"async function openPrices(pid, title) {\n"
+"  currentPricesPlanId = pid;\n"
+"  document.getElementById('prices-title').textContent = `料金設定 — Plan ${pid}: ${title}`;\n"
+"  document.getElementById('prices-section').style.display = 'block';\n"
+"  document.getElementById('prices-section').scrollIntoView({behavior:'smooth'});\n"
+"  // 既存料金を取得して表示\n"
+"  const r = await api('GET', `/api/v1/plans/${pid}`);\n"
+"  const prices = r.ok ? (r.data.prices || []) : [];\n"
+"  document.getElementById('prices-list').innerHTML = '';\n"
+"  if (prices.length === 0) { addPriceRow(); } else { prices.forEach(p => addPriceRow(p)); }\n"
+"}\n"
+"function closePrices() {\n"
+"  document.getElementById('prices-section').style.display = 'none';\n"
+"  currentPricesPlanId = null;\n"
+"}\n"
+"function addPriceRow(p={}) {\n"
+"  const list = document.getElementById('prices-list');\n"
+"  const row = document.createElement('div');\n"
+"  row.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:8px;';\n"
+"  row.innerHTML = `\n"
+"    <input type='text' placeholder='participant_type (adult)' value='${p.participant_type||'adult'}' style='width:140px;background:var(--input);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:4px;font-size:12px;'>\n"
+"    <input type='text' placeholder='ラベル (大人)' value='${p.label||'大人'}' style='width:120px;background:var(--input);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:4px;font-size:12px;'>\n"
+"    <input type='number' placeholder='価格(円)' value='${p.price||0}' style='width:100px;background:var(--input);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:4px;font-size:12px;'>\n"
+"    <button style='background:var(--danger);color:#fff;border:none;border-radius:4px;padding:5px 8px;cursor:pointer;font-size:12px;' onclick='this.parentElement.remove()'>✕</button>\n"
+"  `;\n"
+"  list.appendChild(row);\n"
+"}\n"
+"async function savePrices() {\n"
+"  if (!currentPricesPlanId) return;\n"
+"  const rows = document.querySelectorAll('#prices-list > div');\n"
+"  const prices = [...rows].map(row => {\n"
+"    const inputs = row.querySelectorAll('input');\n"
+"    return { participant_type: inputs[0].value, label: inputs[1].value, price: +inputs[2].value };\n"
+"  }).filter(p => p.participant_type && p.price > 0);\n"
+"  const r = await api('PUT', `/api/v1/admin/plans/${currentPricesPlanId}/prices`, {prices});\n"
+"  showMsg('prices-msg', r.ok, r.ok ? '保存しました' : (r.data?.error || 'エラー'));\n"
+"}\n"
+"\n"
+"// ─── REVIEWS ──────────────────────────────────────────────────────────────────\n"
+"async function loadReviews() {\n"
+"  const r = await api('GET', '/api/v1/admin/reviews?limit=100');\n"
+"  if (!r.ok) { showMsg('reviews-msg', false, r.data?.error || 'エラー'); return; }\n"
+"  const tbody = document.querySelector('#reviews-table tbody');\n"
+"  tbody.innerHTML = (r.data.reviews || []).map(v =>\n"
+"    `<tr><td>${v.id}</td><td>${v.plan_id}</td><td>${v.user_id}</td>\n"
+"     <td>${'★'.repeat(v.rating||0)}</td>\n"
+"     <td style='max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>${v.comment||''}</td>\n"
+"     <td style='font-size:11px;'>${(v.created_at||'').slice(0,10)}</td>\n"
+"     <td class='actions'>\n"
+"       <button class='btn btn-danger' onclick='deleteReview(${v.id})'>削除</button>\n"
+"     </td></tr>`\n"
+"  ).join('');\n"
+"}\n"
+"async function deleteReview(id) {\n"
+"  if (!confirm('このレビューを削除しますか？')) return;\n"
+"  const r = await api('DELETE', `/api/v1/admin/reviews/${id}`);\n"
+"  showMsg('reviews-msg', r.ok, r.ok ? '削除しました' : (r.data?.error || 'エラー'));\n"
+"  if (r.ok) loadReviews();\n"
+"}\n"
+"\n"
+"// ─── COUPONS ──────────────────────────────────────────────────────────────────\n"
+"async function loadCoupons() {\n"
+"  const r = await api('GET', '/api/v1/admin/coupons');\n"
+"  if (!r.ok) { showMsg('coupons-msg', false, r.data?.error || 'エラー'); return; }\n"
+"  const tbody = document.querySelector('#coupons-table tbody');\n"
+"  tbody.innerHTML = (r.data.coupons || []).map(cp =>\n"
+"    `<tr><td>${cp.id}</td><td><code>${cp.code}</code></td>\n"
+"     <td>${cp.discount_type}</td>\n"
+"     <td>${cp.discount_type==='percent'?cp.discount_value+'%':'¥'+cp.discount_value}</td>\n"
+"     <td>${cp.used_count}/${cp.max_uses||'∞'}</td>\n"
+"     <td style='font-size:11px;'>${cp.expires_at||'無期限'}</td>\n"
+"     <td>${cp.is_active?\"<span class='badge badge-green'>有効</span>\":\"<span class='badge badge-grey'>無効</span>\"}</td>\n"
+"     <td class='actions'>\n"
+"       <button class='btn btn-danger' onclick='deleteCoupon(${cp.id})'>削除</button>\n"
+"     </td></tr>`\n"
+"  ).join('');\n"
+"}\n"
+"function openCouponModal() {\n"
+"  ['coupon-code','coupon-value','coupon-maxuses','coupon-expires','coupon-desc'].forEach(id => document.getElementById(id).value = '');\n"
+"  document.getElementById('coupon-type').value = 'percent';\n"
+"  openModal('coupon-modal');\n"
+"}\n"
+"async function saveCoupon() {\n"
+"  const mu = document.getElementById('coupon-maxuses').value;\n"
+"  const ex = document.getElementById('coupon-expires').value;\n"
+"  const body = {\n"
+"    code: document.getElementById('coupon-code').value,\n"
+"    discount_type: document.getElementById('coupon-type').value,\n"
+"    discount_value: +document.getElementById('coupon-value').value,\n"
+"    description: document.getElementById('coupon-desc').value || undefined\n"
+"  };\n"
+"  if (mu) body.max_uses = +mu;\n"
+"  if (ex) body.expires_at = ex;\n"
+"  const r = await api('POST', '/api/v1/admin/coupons', body);\n"
+"  showMsg('coupon-modal-msg', r.ok, r.ok ? '作成しました' : (r.data?.error || 'エラー'));\n"
+"  if (r.ok) { closeModal('coupon-modal'); loadCoupons(); }\n"
+"}\n"
+"async function deleteCoupon(id) {\n"
+"  if (!confirm('このクーポンを削除しますか？')) return;\n"
+"  const r = await api('DELETE', `/api/v1/admin/coupons/${id}`);\n"
+"  showMsg('coupons-msg', r.ok, r.ok ? '削除しました' : (r.data?.error || 'エラー'));\n"
+"  if (r.ok) loadCoupons();\n"
+"}\n"
+"\n"
+"// ─── WEBHOOKS ─────────────────────────────────────────────────────────────────\n"
+"async function loadWebhooks() {\n"
+"  const r = await api('GET', '/api/v1/admin/webhooks');\n"
+"  if (!r.ok) { showMsg('webhooks-msg', false, r.data?.error || 'エラー'); return; }\n"
+"  const tbody = document.querySelector('#webhooks-table tbody');\n"
+"  tbody.innerHTML = (r.data.endpoints || []).map(wh =>\n"
+"    `<tr><td>${wh.id}</td>\n"
+"     <td style='max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;'>${wh.url}</td>\n"
+"     <td style='font-size:11px;'>${wh.events||'[]'}</td>\n"
+"     <td>${wh.is_active?\"<span class='badge badge-green'>有効</span>\":\"<span class='badge badge-grey'>無効</span>\"}</td>\n"
+"     <td class='actions'>\n"
+"       <button class='btn btn-danger' onclick='deleteWebhook(${wh.id})'>削除</button>\n"
+"     </td></tr>`\n"
+"  ).join('');\n"
+"}\n"
+"function openWebhookModal() {\n"
+"  ['wh-url','wh-secret','wh-events'].forEach(id => document.getElementById(id).value = '');\n"
+"  openModal('webhook-modal');\n"
+"}\n"
+"async function saveWebhook() {\n"
+"  const evStr = document.getElementById('wh-events').value;\n"
+"  const events = evStr ? evStr.split(',').map(e=>e.trim()).filter(Boolean) : [];\n"
+"  const body = {\n"
+"    url: document.getElementById('wh-url').value,\n"
+"    secret: document.getElementById('wh-secret').value,\n"
+"    events\n"
+"  };\n"
+"  const r = await api('POST', '/api/v1/admin/webhooks', body);\n"
+"  showMsg('webhook-modal-msg', r.ok, r.ok ? '追加しました' : (r.data?.error || 'エラー'));\n"
+"  if (r.ok) { closeModal('webhook-modal'); loadWebhooks(); }\n"
+"}\n"
+"async function deleteWebhook(id) {\n"
+"  if (!confirm('このWebhookを削除しますか？')) return;\n"
+"  const r = await api('DELETE', `/api/v1/admin/webhooks/${id}`);\n"
+"  showMsg('webhooks-msg', r.ok, r.ok ? '削除しました' : (r.data?.error || 'エラー'));\n"
+"  if (r.ok) loadWebhooks();\n"
+"}\n"
+"\n"
+"// ─── AUDIT LOG ────────────────────────────────────────────────────────────────\n"
+"async function loadAudit() {\n"
+"  const r = await api('GET', '/api/v1/admin/audit-logs?limit=200');\n"
+"  if (!r.ok) return;\n"
+"  const tbody = document.querySelector('#audit-table tbody');\n"
+"  tbody.innerHTML = (r.data.logs || []).map(l =>\n"
+"    `<tr>\n"
+"     <td style='font-size:11px;white-space:nowrap;'>${(l.ts||'').slice(0,19)}</td>\n"
+"     <td style='font-size:12px;'>${l.actor||''}</td>\n"
+"     <td><code style='font-size:11px;'>${l.action||''}</code></td>\n"
+"     <td style='font-size:11px;'>${l.target_type||''} ${l.target_id||''}</td>\n"
+"     <td style='font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>${l.detail||''}</td>\n"
+"     <td style='font-size:11px;color:var(--muted);'>${l.ip||''}</td>\n"
+"    </tr>`\n"
+"  ).join('');\n"
+"}\n"
+"\n"
+"// ─── TENANTS ──────────────────────────────────────────────────────────────────\n"
+"async function loadTenants() {\n"
+"  const r = await api('GET', '/api/v1/admin/tenants');\n"
+"  if (!r.ok) { showMsg('tenants-msg', false, r.data?.error || 'エラー'); return; }\n"
+"  const tbody = document.querySelector('#tenants-table tbody');\n"
+"  tbody.innerHTML = (r.data.tenants || []).map(t =>\n"
+"    `<tr><td>${t.id}</td><td><code>${t.slug}</code></td><td>${t.name}</td>\n"
+"     <td style='font-size:10px;font-family:monospace;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='${t.api_key}'>${t.api_key}</td>\n"
+"     <td>${t.plan_limit}</td>\n"
+"     <td>${t.is_active?\"<span class='badge badge-green'>有効</span>\":\"<span class='badge badge-grey'>無効</span>\"}</td>\n"
+"     <td class='actions'>\n"
+"       <button class='btn btn-secondary' onclick='editTenant(${t.id},${JSON.stringify(t).replace(/\"/g,\"&quot;\")})'>編集</button>\n"
+"       <button class='btn btn-danger' onclick='deleteTenant(${t.id})'>削除</button>\n"
+"     </td></tr>`\n"
+"  ).join('');\n"
+"}\n"
+"function openTenantModal() {\n"
+"  document.getElementById('tenant-id').value = '';\n"
+"  document.getElementById('tenant-modal-title').textContent = 'テナントを追加';\n"
+"  document.getElementById('tenant-slug').disabled = false;\n"
+"  ['tenant-slug','tenant-name'].forEach(id => document.getElementById(id).value = '');\n"
+"  document.getElementById('tenant-limit').value = '100';\n"
+"  document.getElementById('tenant-active').value = 'true';\n"
+"  openModal('tenant-modal');\n"
+"}\n"
+"function editTenant(id, t) {\n"
+"  document.getElementById('tenant-id').value = id;\n"
+"  document.getElementById('tenant-modal-title').textContent = 'テナントを編集';\n"
+"  document.getElementById('tenant-slug').value = t.slug;\n"
+"  document.getElementById('tenant-slug').disabled = true;  // slug は変更不可\n"
+"  document.getElementById('tenant-name').value = t.name;\n"
+"  document.getElementById('tenant-limit').value = t.plan_limit;\n"
+"  document.getElementById('tenant-active').value = t.is_active ? 'true' : 'false';\n"
+"  openModal('tenant-modal');\n"
+"}\n"
+"async function saveTenant() {\n"
+"  const id = document.getElementById('tenant-id').value;\n"
+"  const body = {\n"
+"    slug: document.getElementById('tenant-slug').value,\n"
+"    name: document.getElementById('tenant-name').value,\n"
+"    plan_limit: +document.getElementById('tenant-limit').value,\n"
+"    is_active: document.getElementById('tenant-active').value === 'true'\n"
+"  };\n"
+"  const r = id ? await api('PATCH', `/api/v1/admin/tenants/${id}`, body)\n"
+"              : await api('POST', '/api/v1/admin/tenants', body);\n"
+"  showMsg('tenant-modal-msg', r.ok, r.ok ? '保存しました' : (r.data?.error || 'エラー'));\n"
+"  if (r.ok) { closeModal('tenant-modal'); loadTenants(); }\n"
+"}\n"
+"async function deleteTenant(id) {\n"
+"  if (!confirm('このテナントを削除しますか？関連Venueのtenant_idが解除されます。')) return;\n"
+"  const r = await api('DELETE', `/api/v1/admin/tenants/${id}`);\n"
+"  showMsg('tenants-msg', r.ok, r.ok ? '削除しました' : (r.data?.error || 'エラー'));\n"
+"  if (r.ok) loadTenants();\n"
 "}\n"
 "\n"
 "// ─── Init ─────────────────────────────────────────────────────────────────────\n"
@@ -1982,6 +2335,66 @@ void handle_admin_delete_plan_image(struct mg_connection *c, struct mg_http_mess
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"画像を削除しました\"}");
 }
 
+/* ─── 管理者 2FA セットアップ ────────────────────────────────────────────── */
+
+/* GET /api/v1/admin/2fa/setup
+ * 初回のみ ADMIN_KEY 認証（TOTP 未設定状態での取得なのでTOTP検証スキップ）。
+ * ADMIN_TOTP_SECRET を環境変数に設定して再起動後、全APIに X-Admin-TOTP が必須になる。 */
+void handle_admin_2fa_setup(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    (void)db;
+    /* TOTP検証を除いた認証（キーのみ） */
+    struct mg_str *hdr = mg_http_get_header(hm, "X-Admin-Key");
+    if (!hdr) { send_error_json(c, 403, "管理者キーが必要です"); return; }
+    const char *expected = getenv("ADMIN_KEY");
+    if (!expected || !*expected) expected = "asoview-admin-dev";
+    if (!const_time_strcmp(hdr->buf, hdr->len, expected, strlen(expected))) {
+        send_error_json(c, 403, "管理者キーが不正です"); return;
+    }
+
+    const char *existing = getenv("ADMIN_TOTP_SECRET");
+    if (existing && *existing) {
+        /* すでに設定済み — シークレットは返さず、設定済みであることだけ伝える */
+        send_json_str(c, 200, CORS_HEADERS,
+            "{\"status\":\"already_configured\","
+            "\"message\":\"ADMIN_TOTP_SECRET は設定済みです。再設定する場合は環境変数を削除してください\"}");
+        return;
+    }
+
+    /* 新規シークレット生成（20 バイト = 160bit） */
+    unsigned char raw[20];
+    platform_random(raw, sizeof(raw));
+
+    /* Base32 エンコード */
+    static const char B32[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    char b32[40] = {0};
+    size_t j = 0;
+    uint32_t buf = 0; int bits = 0;
+    for (size_t i = 0; i < sizeof(raw) && j + 1 < sizeof(b32); i++) {
+        buf = (buf << 8) | raw[i]; bits += 8;
+        while (bits >= 5 && j + 1 < sizeof(b32)) {
+            bits -= 5; b32[j++] = B32[(buf >> bits) & 0x1f];
+        }
+    }
+    if (bits > 0 && j + 1 < sizeof(b32)) b32[j++] = B32[(buf << (5 - bits)) & 0x1f];
+    while (j % 8 && j + 1 < sizeof(b32)) b32[j++] = '=';
+    b32[j] = '\0';
+
+    char otpauth[256];
+    snprintf(otpauth, sizeof(otpauth),
+        "otpauth://totp/Asoview%%3AAdmin?secret=%s&issuer=Asoview&algorithm=SHA1&digits=6&period=30",
+        b32);
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddStringToObject(res, "totp_secret", b32);
+    cJSON_AddStringToObject(res, "otpauth_uri", otpauth);
+    cJSON_AddStringToObject(res, "next_step",
+        "1) 認証アプリ(Google Authenticator等)でQRを読み取る "
+        "2) .env に ADMIN_TOTP_SECRET=" "... を追加してサーバーを再起動 "
+        "3) 以降の管理APIリクエストに X-Admin-TOTP: <6桁> ヘッダを付与");
+    send_cjson_admin(c, 200, res);
+    cJSON_Delete(res);
+}
+
 void handle_admin_list_plan_images(struct mg_connection *c, struct mg_http_message *hm,
                                     DbConn *db, long plan_id) {
     if (!require_admin(c, hm)) return;
@@ -2003,4 +2416,159 @@ void handle_admin_list_plan_images(struct mg_connection *c, struct mg_http_messa
     cJSON_AddItemToObject(res, "images", arr);
     send_cjson_admin(c, 200, res);
     cJSON_Delete(res);
+}
+
+/* ─── テナント CRUD ──────────────────────────────────────────────────────── */
+
+static cJSON *tenant_row(DbStmt *st) {
+    cJSON *t = cJSON_CreateObject();
+    cJSON_AddNumberToObject(t, "id",          db_col_int(st,  0));
+    cJSON_AddStringToObject(t, "slug",        db_col_text(st, 1) ? db_col_text(st, 1) : "");
+    cJSON_AddStringToObject(t, "name",        db_col_text(st, 2) ? db_col_text(st, 2) : "");
+    cJSON_AddStringToObject(t, "api_key",     db_col_text(st, 3) ? db_col_text(st, 3) : "");
+    cJSON_AddNumberToObject(t, "plan_limit",  db_col_int(st,  4));
+    cJSON_AddBoolToObject(t,   "is_active",   db_col_int(st,  5) != 0);
+    cJSON_AddStringToObject(t, "created_at",  db_col_text(st, 6) ? db_col_text(st, 6) : "");
+    return t;
+}
+
+void handle_admin_list_tenants(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    if (!require_admin(c, hm)) return;
+    DbStmt *st = db_prepare(db,
+        "SELECT id,slug,name,api_key,plan_limit,is_active,created_at FROM tenants ORDER BY id");
+    cJSON *arr = cJSON_CreateArray();
+    while (db_step(st) == 1) cJSON_AddItemToArray(arr, tenant_row(st));
+    db_finalize(st);
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddItemToObject(res, "tenants", arr);
+    cJSON_AddNumberToObject(res, "total", (double)cJSON_GetArraySize(arr));
+    send_cjson_admin(c, 200, res);
+    cJSON_Delete(res);
+}
+
+void handle_admin_create_tenant(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    if (!require_admin(c, hm)) return;
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
+
+    const char *slug = cJSON_GetStringValue(cJSON_GetObjectItem(body, "slug"));
+    const char *name = cJSON_GetStringValue(cJSON_GetObjectItem(body, "name"));
+    if (!slug || !*slug || !name || !*name) {
+        cJSON_Delete(body);
+        send_error_json(c, 400, "slug と name は必須");
+        return;
+    }
+
+    /* slugとnameをコピーしておく（body解放後も使用するため） */
+    char slug_in[64]={0}, name_in[256]={0};
+    strncpy(slug_in, slug, sizeof(slug_in)-1);
+    strncpy(name_in, name, sizeof(name_in)-1);
+
+    /* api_key を自動生成（指定があれば使用） */
+    const char *api_key_in_p = cJSON_GetStringValue(cJSON_GetObjectItem(body, "api_key"));
+    char api_key_in[65] = {0};
+    if (api_key_in_p && *api_key_in_p) {
+        strncpy(api_key_in, api_key_in_p, sizeof(api_key_in)-1);
+    } else {
+        uint8_t rnd[32];
+        platform_random(rnd, sizeof(rnd));
+        for (int i = 0; i < 32; i++) snprintf(api_key_in + i*2, 3, "%02x", rnd[i]);
+    }
+    long plan_limit = 100;
+    cJSON *pl = cJSON_GetObjectItem(body, "plan_limit");
+    if (cJSON_IsNumber(pl)) plan_limit = (long)cJSON_GetNumberValue(pl);
+    cJSON_Delete(body);
+
+    DbStmt *st = db_prepare(db,
+        "INSERT INTO tenants(slug,name,api_key,plan_limit) VALUES(?,?,?,?)");
+    db_bind_text(st, 1, slug_in);
+    db_bind_text(st, 2, name_in);
+    db_bind_text(st, 3, api_key_in);
+    db_bind_int(st,  4, plan_limit);
+    int rc = db_step(st);
+    db_finalize(st);
+
+    if (rc < 0) { send_error_json(c, 409, "slug が既に存在します"); return; }
+
+    /* 作成したテナントを返す */
+    DbStmt *sel = db_prepare(db,
+        "SELECT id,slug,name,api_key,plan_limit,is_active,created_at FROM tenants WHERE slug=?");
+    db_bind_text(sel, 1, slug_in);
+    if (db_step(sel) != 1) { db_finalize(sel); send_error_json(c, 500, "fetch failed"); return; }
+    cJSON *res = tenant_row(sel);
+    db_finalize(sel);
+    send_cjson_admin(c, 201, res);
+    cJSON_Delete(res);
+}
+
+void handle_admin_get_tenant(struct mg_connection *c, struct mg_http_message *hm,
+                              DbConn *db, long id) {
+    if (!require_admin(c, hm)) return;
+    DbStmt *st = db_prepare(db,
+        "SELECT id,slug,name,api_key,plan_limit,is_active,created_at FROM tenants WHERE id=?");
+    db_bind_int(st, 1, id);
+    if (db_step(st) != 1) { db_finalize(st); send_error_json(c, 404, "テナントが見つかりません"); return; }
+    cJSON *res = tenant_row(st);
+    db_finalize(st);
+    send_cjson_admin(c, 200, res);
+    cJSON_Delete(res);
+}
+
+void handle_admin_update_tenant(struct mg_connection *c, struct mg_http_message *hm,
+                                 DbConn *db, long id) {
+    if (!require_admin(c, hm)) return;
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
+
+    /* 既存値を読み込む */
+    DbStmt *cur = db_prepare(db,
+        "SELECT slug,name,plan_limit,is_active FROM tenants WHERE id=?");
+    db_bind_int(cur, 1, id);
+    if (db_step(cur) != 1) { db_finalize(cur); cJSON_Delete(body); send_error_json(c, 404, "テナントが見つかりません"); return; }
+    char slug_buf[64]={0}, name_buf[256]={0};
+    strncpy(slug_buf, db_col_text(cur,0) ? db_col_text(cur,0) : "", sizeof(slug_buf)-1);
+    strncpy(name_buf, db_col_text(cur,1) ? db_col_text(cur,1) : "", sizeof(name_buf)-1);
+    long plan_limit  = db_col_int(cur, 2);
+    long is_active   = db_col_int(cur, 3);
+    db_finalize(cur);
+
+    const char *new_name = cJSON_GetStringValue(cJSON_GetObjectItem(body, "name"));
+    if (new_name && *new_name) strncpy(name_buf, new_name, sizeof(name_buf)-1);
+    cJSON *pl = cJSON_GetObjectItem(body, "plan_limit");
+    if (cJSON_IsNumber(pl)) plan_limit = (long)cJSON_GetNumberValue(pl);
+    cJSON *ia = cJSON_GetObjectItem(body, "is_active");
+    if (cJSON_IsBool(ia)) is_active = cJSON_IsTrue(ia) ? 1 : 0;
+
+    DbStmt *upd = db_prepare(db,
+        "UPDATE tenants SET name=?,plan_limit=?,is_active=? WHERE id=?");
+    db_bind_text(upd, 1, name_buf);
+    db_bind_int(upd,  2, plan_limit);
+    db_bind_int(upd,  3, is_active);
+    db_bind_int(upd,  4, id);
+    db_step(upd); db_finalize(upd);
+    cJSON_Delete(body);
+
+    DbStmt *sel = db_prepare(db,
+        "SELECT id,slug,name,api_key,plan_limit,is_active,created_at FROM tenants WHERE id=?");
+    db_bind_int(sel, 1, id);
+    if (db_step(sel) != 1) { db_finalize(sel); send_error_json(c, 404, "not found"); return; }
+    cJSON *res = tenant_row(sel);
+    db_finalize(sel);
+    send_cjson_admin(c, 200, res);
+    cJSON_Delete(res);
+}
+
+void handle_admin_delete_tenant(struct mg_connection *c, struct mg_http_message *hm,
+                                 DbConn *db, long id) {
+    if (!require_admin(c, hm)) return;
+    /* 関連 venues の tenant_id を NULL に戻す */
+    DbStmt *unlink = db_prepare(db,
+        "UPDATE venues SET tenant_id=NULL WHERE tenant_id=?");
+    db_bind_int(unlink, 1, id);
+    db_step(unlink); db_finalize(unlink);
+
+    DbStmt *del = db_prepare(db, "DELETE FROM tenants WHERE id=?");
+    db_bind_int(del, 1, id);
+    db_step(del); db_finalize(del);
+    send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"テナントを削除しました\"}");
 }

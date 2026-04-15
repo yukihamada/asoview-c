@@ -5,6 +5,8 @@
 #include "mailer.h"
 #include "metrics.h"
 #include "waitlist.h"
+#include "rate_limit.h"
+#include "audit.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,14 +22,20 @@ char g_request_id[40] = "none";
 /* ─── 動的 CORS ヘッダー（CORS_ORIGIN 環境変数 + X-Request-ID 対応） ─────── */
 
 static const char *get_cors_headers(void) {
-    static char buf[600];
+    static char buf[700];
     const char *origin = getenv("CORS_ORIGIN");
     if (!origin || !*origin) origin = "*";
+    /* FORCE_HTTPS=true のとき（Nginx TLS 終端時）HSTS を付与 */
+    const char *force_https = getenv("FORCE_HTTPS");
+    int add_hsts = (force_https && (strcmp(force_https, "true") == 0 ||
+                                    strcmp(force_https, "1") == 0));
     snprintf(buf, sizeof(buf),
              "Content-Type: application/json\r\n"
              "Access-Control-Allow-Origin: %s\r\n"
-             "X-Request-ID: %s\r\n",
-             origin, g_request_id);
+             "X-Request-ID: %s\r\n"
+             "%s",
+             origin, g_request_id,
+             add_hsts ? "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n" : "");
     return buf;
 }
 #define CORS_HEADERS get_cors_headers()
@@ -56,6 +64,11 @@ void send_error_json(struct mg_connection *c, int status, const char *msg) {
     cJSON_Delete(e);
 }
 
+/* ─── IP ヘルパー ────────────────────────────────────────────────────────── */
+static void get_client_ip(struct mg_connection *c, char *buf, size_t sz) {
+    mg_snprintf(buf, sz, "%M", mg_print_ip, &c->rem);
+}
+
 /* ─── Auth helper ────────────────────────────────────────────────────────── */
 
 /* Authorization: Bearer <token> を検証し user_id を返す。失敗時は 401 を送信して -1 */
@@ -75,13 +88,20 @@ static long require_auth(struct mg_connection *c, struct mg_http_message *hm, Db
 
     const char *secret = getenv("JWT_SECRET");
     if (!secret || !*secret) secret = "asoview-jwt-secret-dev";
-    long uid = jwt_verify(tok, secret);
+    char tok_type[16] = {0};
+    long uid = jwt_verify_typed(tok, secret, tok_type, sizeof(tok_type));
     /* JWT ローテーション: 新 secret で失敗した場合は旧 secret を試す */
     if (uid <= 0) {
         const char *prev_secret = getenv("JWT_SECRET_PREV");
-        if (prev_secret && *prev_secret) uid = jwt_verify(tok, prev_secret);
+        if (prev_secret && *prev_secret)
+            uid = jwt_verify_typed(tok, prev_secret, tok_type, sizeof(tok_type));
     }
     if (uid <= 0) { send_error_json(c, 401, "トークンが無効または期限切れです"); return -1; }
+    /* refresh token は API 認証に使用不可 */
+    if (strcmp(tok_type, "refresh") == 0) {
+        send_error_json(c, 401, "refresh token は API 認証に使用できません");
+        return -1;
+    }
 
     /* JWT ブラックリスト確認（署名部分 = jti として使用） */
     if (db) {
@@ -134,6 +154,31 @@ static long query_long(struct mg_http_message *hm, const char *k, long def) {
 static int query_str(struct mg_http_message *hm, const char *k,
                      char *out, size_t len) {
     return mg_http_get_var(&hm->query, k, out, len) > 0;
+}
+
+/* ─── マルチテナント: X-Tenant-ID ヘッダーを tenant.id に解決 ─────────────
+   戻り値:  0  = ヘッダーなし（テナント指定なし）
+            >0 = 解決済み tenant_id
+            -1 = 不明なテナント（404 を送信済み）                         */
+static long resolve_tenant_id(struct mg_connection *c,
+                               struct mg_http_message *hm, DbConn *db) {
+    struct mg_str *hdr = mg_http_get_header(hm, "X-Tenant-ID");
+    if (!hdr || hdr->len == 0) return 0;
+    char slug[64] = {0};
+    size_t slen = hdr->len < sizeof(slug)-1 ? hdr->len : sizeof(slug)-1;
+    memcpy(slug, hdr->buf, slen);
+    slug[slen] = '\0';
+    DbStmt *st = db_prepare(db,
+        "SELECT id FROM tenants WHERE slug=? AND is_active=1");
+    db_bind_text(st, 1, slug);
+    long tid = -1;
+    if (db_step(st) == 1) tid = db_col_int(st, 0);
+    db_finalize(st);
+    if (tid <= 0) {
+        send_error_json(c, 404, "テナントが見つかりません");
+        return -1;
+    }
+    return tid;
 }
 
 /* plan の価格一覧を cJSON array として返す */
@@ -276,12 +321,20 @@ void handle_list_venues(struct mg_connection *c, struct mg_http_message *hm, DbC
     long page   = query_long(hm, "page", 1);  if (page < 1) page = 1;
     long offset = after > 0 ? 0 : (page - 1) * limit;
 
+    /* テナントフィルタ (0 = 全テナント, >0 = 特定テナント) */
+    long tid = resolve_tenant_id(c, hm, db);
+    if (tid < 0) return;  /* 不明テナント (404 送信済み) */
+
     /* total */
     DbStmt *ct = NULL;
     ct = db_prepare(db,
-        "SELECT COUNT(*) FROM venues v WHERE (? = 0 OR v.area_id = ?)");
+        "SELECT COUNT(*) FROM venues v "
+        "WHERE (? = 0 OR v.area_id = ?) "
+        "AND (? = 0 OR v.tenant_id IS NULL OR v.tenant_id = ?)");
     db_bind_int(ct, 1, area_id);
     db_bind_int(ct, 2, area_id);
+    db_bind_int(ct, 3, tid);
+    db_bind_int(ct, 4, tid);
     db_step(ct);
     long total = db_col_int(ct, 0);
     db_finalize(ct);
@@ -293,21 +346,29 @@ void handle_list_venues(struct mg_connection *c, struct mg_http_message *hm, DbC
             "SELECT v.id,v.name,v.description,v.area_id,a.name,"
             "v.address,v.latitude,v.longitude,v.review_count,v.review_avg,v.created_at "
             "FROM venues v LEFT JOIN areas a ON a.id=v.area_id "
-            "WHERE v.id > ? AND (? = 0 OR v.area_id = ?) ORDER BY v.id LIMIT ?");
+            "WHERE v.id > ? AND (? = 0 OR v.area_id = ?) "
+            "AND (? = 0 OR v.tenant_id IS NULL OR v.tenant_id = ?) "
+            "ORDER BY v.id LIMIT ?");
         db_bind_int(st, 1, after);
         db_bind_int(st, 2, area_id);
         db_bind_int(st, 3, area_id);
-        db_bind_int(st, 4, limit);
+        db_bind_int(st, 4, tid);
+        db_bind_int(st, 5, tid);
+        db_bind_int(st, 6, limit);
     } else {
         st = db_prepare(db,
             "SELECT v.id,v.name,v.description,v.area_id,a.name,"
             "v.address,v.latitude,v.longitude,v.review_count,v.review_avg,v.created_at "
             "FROM venues v LEFT JOIN areas a ON a.id=v.area_id "
-            "WHERE (? = 0 OR v.area_id = ?) ORDER BY v.id LIMIT ? OFFSET ?");
+            "WHERE (? = 0 OR v.area_id = ?) "
+            "AND (? = 0 OR v.tenant_id IS NULL OR v.tenant_id = ?) "
+            "ORDER BY v.id LIMIT ? OFFSET ?");
         db_bind_int(st, 1, area_id);
         db_bind_int(st, 2, area_id);
-        db_bind_int(st, 3, limit);
-        db_bind_int(st, 4, offset);
+        db_bind_int(st, 3, tid);
+        db_bind_int(st, 4, tid);
+        db_bind_int(st, 5, limit);
+        db_bind_int(st, 6, offset);
     }
 
     cJSON *venues = cJSON_CreateArray();
@@ -582,13 +643,15 @@ void handle_create_user(struct mg_connection *c, struct mg_http_message *hm, DbC
 
     if (!email || !*email || !name || !*name || !password || strlen(password) < 8) {
         send_error_json(c, 400, "email, name は必須。password は8文字以上");
-        cJSON_Delete(body);
-        return;
+        cJSON_Delete(body); return;
+    }
+    if (strlen(email) > 254 || strlen(name) > 100 || strlen(password) > 128) {
+        send_error_json(c, 400, "email は254字以内、name は100字以内、password は128字以内");
+        cJSON_Delete(body); return;
     }
     if (!is_valid_email(email)) {
         send_error_json(c, 400, "メールアドレスの形式が正しくありません");
-        cJSON_Delete(body);
-        return;
+        cJSON_Delete(body); return;
     }
 
     char email_lower[256];
@@ -731,16 +794,26 @@ void handle_login(struct mg_connection *c, struct mg_http_message *hm, DbConn *d
 
     const char *secret = getenv("JWT_SECRET");
     if (!secret || !*secret) secret = "asoview-jwt-secret-dev";
-    char *tok = jwt_create(uid, secret);
+    char *tok         = jwt_create(uid, secret);
+    char *refresh_tok = jwt_create_refresh(uid, secret);
+
+    /* 監査ログ */
+    {
+        char ip[48] = {0}; get_client_ip(c, ip, sizeof(ip));
+        char uid_str[24]; snprintf(uid_str, sizeof(uid_str), "%ld", uid);
+        audit_log(db, uid_str, "login", "user", uid_str, email_lower, ip);
+    }
 
     cJSON *res = cJSON_CreateObject();
-    cJSON_AddNumberToObject(res, "user_id", uid);
-    cJSON_AddStringToObject(res, "name",    name_buf);
-    cJSON_AddStringToObject(res, "token",   tok ? tok : "");
-    cJSON_AddStringToObject(res, "message", "ログインしました");
+    cJSON_AddNumberToObject(res, "user_id",       uid);
+    cJSON_AddStringToObject(res, "name",          name_buf);
+    cJSON_AddStringToObject(res, "token",         tok         ? tok         : "");
+    cJSON_AddStringToObject(res, "refresh_token", refresh_tok ? refresh_tok : "");
+    cJSON_AddStringToObject(res, "message",       "ログインしました");
     send_cjson(c, 200, res);
     cJSON_Delete(res);
     free(tok);
+    free(refresh_tok);
 }
 
 void handle_list_user_bookings(struct mg_connection *c, struct mg_http_message *hm,
@@ -797,6 +870,12 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
     long auth_uid = require_auth(c, hm, db);
     if (auth_uid < 0) return;
 
+    /* ユーザー単位書き込みレート制限 */
+    if (rate_check_uid(auth_uid)) {
+        send_error_json(c, 429, "リクエスト数が多すぎます。しばらく経ってから再試行してください");
+        return;
+    }
+
     cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
     if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
 
@@ -806,6 +885,10 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
     const char *note   = cJSON_GetStringValue(cJSON_GetObjectItem(body, "note"));
     const char *coupon_code_raw = cJSON_GetStringValue(cJSON_GetObjectItem(body, "coupon_code"));
 
+    if (note && strlen(note) > 500) {
+        send_error_json(c, 400, "note は 500 字以内");
+        cJSON_Delete(body); return;
+    }
     if (plan_id <= 0 || sched_id <= 0 ||
         !parts || !cJSON_IsArray(parts) || cJSON_GetArraySize(parts) == 0) {
         send_error_json(c, 400, "plan_id, schedule_id, participants は必須です");
@@ -1093,8 +1176,16 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
         }
     }
 
-    if (bk) { send_cjson(c, 201, bk); cJSON_Delete(bk); }
-    else      send_error_json(c, 500, "failed to fetch booking");
+    if (bk) {
+        /* 監査ログ */
+        char ip[48] = {0}; get_client_ip(c, ip, sizeof(ip));
+        char uid_str[24]; snprintf(uid_str, sizeof(uid_str), "%ld", auth_uid);
+        const char *new_bid = cJSON_GetStringValue(cJSON_GetObjectItem(bk, "id"));
+        audit_log(db, uid_str, "booking.create", "booking", new_bid, NULL, ip);
+        send_cjson(c, 201, bk); cJSON_Delete(bk);
+    } else {
+        send_error_json(c, 500, "failed to fetch booking");
+    }
 }
 
 void handle_get_booking(struct mg_connection *c, struct mg_http_message *hm,
@@ -1147,6 +1238,12 @@ void handle_create_review(struct mg_connection *c, struct mg_http_message *hm, D
     long auth_uid = require_auth(c, hm, db);
     if (auth_uid < 0) return;
 
+    /* ユーザー単位書き込みレート制限 */
+    if (rate_check_uid(auth_uid)) {
+        send_error_json(c, 429, "リクエスト数が多すぎます。しばらく経ってから再試行してください");
+        return;
+    }
+
     cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
     if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
 
@@ -1162,8 +1259,11 @@ void handle_create_review(struct mg_connection *c, struct mg_http_message *hm, D
     }
     if (rating < 1 || rating > 5) {
         send_error_json(c, 400, "rating は 1〜5 で指定してください");
-        cJSON_Delete(body);
-        return;
+        cJSON_Delete(body); return;
+    }
+    if (comment && strlen(comment) > 2000) {
+        send_error_json(c, 400, "comment は 2000 字以内");
+        cJSON_Delete(body); return;
     }
 
     /* 予約確認: このユーザーがこのプランを予約済みか（confirmed または cancelled） */
@@ -1494,6 +1594,13 @@ void handle_cancel_booking(struct mg_connection *c, struct mg_http_message *hm,
     /* キャンセルメール送信 */
     if (user_email[0]) {
         send_booking_cancellation_email(user_email, id, plan_title, refunded);
+    }
+
+    /* 監査ログ */
+    {
+        char ip[48] = {0}; get_client_ip(c, ip, sizeof(ip));
+        char uid_str[24]; snprintf(uid_str, sizeof(uid_str), "%ld", auth_uid);
+        audit_log(db, uid_str, "booking.cancel", "booking", id, refund_type, ip);
     }
 
     cJSON *res = cJSON_CreateObject();
@@ -1939,6 +2046,12 @@ void handle_create_bookmark(struct mg_connection *c, struct mg_http_message *hm,
     long auth_uid = require_auth(c, hm, db);
     if (auth_uid < 0) return;
 
+    /* ユーザー単位書き込みレート制限 */
+    if (rate_check_uid(auth_uid)) {
+        send_error_json(c, 429, "リクエスト数が多すぎます。しばらく経ってから再試行してください");
+        return;
+    }
+
     cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
     if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
 
@@ -2259,6 +2372,14 @@ void handle_delete_review(struct mg_connection *c, struct mg_http_message *hm,
     db_bind_int(del, 1, id);
     db_step(del); db_finalize(del);
 
+    /* 監査ログ */
+    {
+        char ip[48] = {0}; get_client_ip(c, ip, sizeof(ip));
+        char uid_str[24]; snprintf(uid_str, sizeof(uid_str), "%ld", auth_uid);
+        char id_str[24];  snprintf(id_str,  sizeof(id_str),  "%ld", id);
+        audit_log(db, uid_str, "review.delete", "review", id_str, NULL, ip);
+    }
+
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"レビューを削除しました\"}");
 }
 
@@ -2266,18 +2387,81 @@ void handle_delete_review(struct mg_connection *c, struct mg_http_message *hm,
    有効な JWT を受け取り、有効期限を延長した新しい JWT を返す              */
 
 void handle_auth_refresh(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
-    long uid = require_auth(c, hm, db);
-    if (uid < 0) return;
+    /* Body: {"refresh_token": "..."} */
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
+
+    const char *rt = cJSON_GetStringValue(cJSON_GetObjectItem(body, "refresh_token"));
+    if (!rt || !*rt) {
+        cJSON_Delete(body);
+        send_error_json(c, 400, "refresh_token は必須");
+        return;
+    }
+    /* コピーしてから body を解放 */
+    char rt_buf[512] = {0};
+    if (strlen(rt) >= sizeof(rt_buf)) {
+        cJSON_Delete(body);
+        send_error_json(c, 400, "refresh_token が長すぎます");
+        return;
+    }
+    strncpy(rt_buf, rt, sizeof(rt_buf)-1);
+    cJSON_Delete(body);
 
     const char *secret = getenv("JWT_SECRET");
     if (!secret || !*secret) secret = "asoview-jwt-secret-dev";
 
-    char *new_token = jwt_create(uid, secret);
-    if (!new_token) { send_error_json(c, 500, "token generation failed"); return; }
+    /* type="refresh" のトークンのみ受け付ける */
+    char tok_type[16] = {0};
+    long uid = jwt_verify_typed(rt_buf, secret, tok_type, sizeof(tok_type));
+    if (uid <= 0 || strcmp(tok_type, "refresh") != 0) {
+        send_error_json(c, 401, "有効な refresh token が必要です");
+        return;
+    }
+
+    /* ブラックリスト確認 */
+    if (db) {
+        const char *sig = strrchr(rt_buf, '.');
+        if (sig && sig[1]) {
+            sig++;
+            DbStmt *bl = db_prepare(db,
+                "SELECT 1 FROM jwt_blocklist WHERE jti=?");
+            db_bind_text(bl, 1, sig);
+            int blocked = (db_step(bl) == 1);
+            db_finalize(bl);
+            if (blocked) {
+                send_error_json(c, 401, "このトークンは無効化されています");
+                return;
+            }
+        }
+    }
+
+    /* 古い refresh token をブラックリストに追加（rotation） */
+    {
+        const char *sig = strrchr(rt_buf, '.');
+        if (sig && sig[1]) {
+            sig++;
+            DbStmt *bl = db_prepare(db,
+                "INSERT OR IGNORE INTO jwt_blocklist(jti, expires_at)"
+                "VALUES(?, " SQL_NOW_PLUS_DAY(15) ")");
+            db_bind_text(bl, 1, sig);
+            db_step(bl); db_finalize(bl);
+        }
+    }
+
+    /* 新しい access token + refresh token を発行 */
+    char *new_token   = jwt_create(uid, secret);
+    char *new_refresh = jwt_create_refresh(uid, secret);
+    if (!new_token || !new_refresh) {
+        free(new_token); free(new_refresh);
+        send_error_json(c, 500, "token generation failed");
+        return;
+    }
 
     cJSON *res = cJSON_CreateObject();
-    cJSON_AddStringToObject(res, "token", new_token);
+    cJSON_AddStringToObject(res, "token",         new_token);
+    cJSON_AddStringToObject(res, "refresh_token", new_refresh);
     free(new_token);
+    free(new_refresh);
     send_cjson(c, 200, res);
     cJSON_Delete(res);
 }
@@ -2298,19 +2482,49 @@ void handle_auth_logout(struct mg_connection *c, struct mg_http_message *hm, DbC
 
     const char *secret = getenv("JWT_SECRET");
     if (!secret || !*secret) secret = "asoview-jwt-secret-dev";
-    long uid = jwt_verify(tok, secret);
+    long uid = jwt_verify_typed(tok, secret, NULL, 0);
     if (uid <= 0) { send_error_json(c, 401, "トークンが無効または期限切れです"); return; }
 
-    /* 署名部分（最後のドット以降）をブラックリストキーとして使用 */
+    /* access token をブラックリストに追加（TTL: 2日で十分、access は1h） */
     const char *sig = strrchr(tok, '.');
     if (sig && sig[1]) {
         sig++;
-        DbStmt *bl = NULL;
-        bl = db_prepare(db,
-            "INSERT INTO jwt_blocklist(jti, expires_at)"
-            "VALUES(?, " SQL_NOW_PLUS_DAY(7) ")");
+        DbStmt *bl = db_prepare(db,
+            "INSERT OR IGNORE INTO jwt_blocklist(jti, expires_at)"
+            "VALUES(?, " SQL_NOW_PLUS_DAY(2) ")");
         db_bind_text(bl, 1, sig);
         db_step(bl); db_finalize(bl);
+    }
+
+    /* オプション: body に refresh_token があれば一緒にブラックリスト追加 */
+    if (hm->body.len > 2) {
+        cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+        if (body) {
+            const char *rt = cJSON_GetStringValue(cJSON_GetObjectItem(body, "refresh_token"));
+            if (rt && *rt && strlen(rt) < 512) {
+                char rt_copy[512]; strncpy(rt_copy, rt, sizeof(rt_copy)-1); rt_copy[sizeof(rt_copy)-1]='\0';
+                long rt_uid = jwt_verify_typed(rt_copy, secret, NULL, 0);
+                if (rt_uid == uid) {  /* 自分のトークンのみ無効化 */
+                    const char *rt_sig = strrchr(rt_copy, '.');
+                    if (rt_sig && rt_sig[1]) {
+                        rt_sig++;
+                        DbStmt *bl2 = db_prepare(db,
+                            "INSERT OR IGNORE INTO jwt_blocklist(jti, expires_at)"
+                            "VALUES(?, " SQL_NOW_PLUS_DAY(15) ")");
+                        db_bind_text(bl2, 1, rt_sig);
+                        db_step(bl2); db_finalize(bl2);
+                    }
+                }
+            }
+            cJSON_Delete(body);
+        }
+    }
+
+    /* 監査ログ */
+    {
+        char ip[48] = {0}; get_client_ip(c, ip, sizeof(ip));
+        char uid_str[24]; snprintf(uid_str, sizeof(uid_str), "%ld", uid);
+        audit_log(db, uid_str, "logout", "user", uid_str, NULL, ip);
     }
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"ログアウトしました\"}");
 }
@@ -2544,12 +2758,87 @@ void handle_ical_booking(struct mg_connection *c, struct mg_http_message *hm,
         id, dtstamp, dtstart, dtend,
         title, desc, venue, price, addr);
 
-    char disp_hdr[128];
+    char disp_hdr[256];
     snprintf(disp_hdr, sizeof(disp_hdr),
         "Content-Type: text/calendar; charset=UTF-8\r\n"
         "Content-Disposition: attachment; filename=\"booking_%s.ics\"\r\n",
         id);
     mg_http_reply(c, 200, disp_hdr, "%s", ical);
+}
+
+/* ─── GET /api/v1/plans/:id/availability ────────────────────────────────── */
+
+void handle_plan_availability(struct mg_connection *c, struct mg_http_message *hm,
+                               DbConn *db, long plan_id) {
+    /* ?from=YYYY-MM-DD  デフォルト: 今日 */
+    /* ?to=YYYY-MM-DD    デフォルト: 30 日後 */
+    /* ?adults=N         デフォルト: 1 */
+    char from_buf[16] = {0}, to_buf[16] = {0};
+    long adults = query_long(hm, "adults", 1);
+    if (adults < 1) adults = 1;
+
+    /* デフォルト: 今日〜30日後 */
+    time_t now = time(NULL);
+    if (!query_str(hm, "from", from_buf, sizeof(from_buf)) || !from_buf[0]) {
+        struct tm *tm_now = gmtime(&now);
+        strftime(from_buf, sizeof(from_buf), "%Y-%m-%d", tm_now);
+    }
+    if (!query_str(hm, "to", to_buf, sizeof(to_buf)) || !to_buf[0]) {
+        time_t t30 = now + 30 * 86400;
+        struct tm *tm30 = gmtime(&t30);
+        strftime(to_buf, sizeof(to_buf), "%Y-%m-%d", tm30);
+    }
+
+    /* プランの存在確認 */
+    DbStmt *chk = db_prepare(db, "SELECT id FROM plans WHERE id=? AND is_active=1");
+    db_bind_int(chk, 1, plan_id);
+    if (db_step(chk) != 1) {
+        db_finalize(chk);
+        send_error_json(c, 404, "プランが見つかりません");
+        return;
+    }
+    db_finalize(chk);
+
+    /* 空きスケジュール一覧 */
+    DbStmt *st = db_prepare(db,
+        "SELECT id, date, start_time, end_time, capacity, booked_count, "
+        "       (capacity - booked_count) AS available "
+        "FROM schedules "
+        "WHERE plan_id=? AND date>=? AND date<=? "
+        "  AND (capacity - booked_count) >= ? "
+        "ORDER BY date, start_time");
+    db_bind_int(st, 1, plan_id);
+    db_bind_text(st, 2, from_buf);
+    db_bind_text(st, 3, to_buf);
+    db_bind_int(st, 4, adults);
+
+    cJSON *arr = cJSON_CreateArray();
+    while (db_step(st) == 1) {
+        cJSON *s = cJSON_CreateObject();
+        cJSON_AddNumberToObject(s, "id",           db_col_int(st, 0));
+        const char *d = db_col_text(st, 1);
+        cJSON_AddStringToObject(s, "date",         d ? d : "");
+        const char *st_ = db_col_text(st, 2);
+        cJSON_AddStringToObject(s, "start_time",   st_ ? st_ : "");
+        const char *et = db_col_text(st, 3);
+        if (et) cJSON_AddStringToObject(s, "end_time", et);
+        else    cJSON_AddNullToObject  (s, "end_time");
+        cJSON_AddNumberToObject(s, "capacity",     db_col_int(st, 4));
+        cJSON_AddNumberToObject(s, "booked_count", db_col_int(st, 5));
+        cJSON_AddNumberToObject(s, "available",    db_col_int(st, 6));
+        cJSON_AddItemToArray(arr, s);
+    }
+    db_finalize(st);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "plan_id",  plan_id);
+    cJSON_AddStringToObject(root, "from",     from_buf);
+    cJSON_AddStringToObject(root, "to",       to_buf);
+    cJSON_AddNumberToObject(root, "adults",   adults);
+    cJSON_AddItemToObject  (root, "schedules", arr);
+
+    send_cjson_etag(c, hm, root);
+    cJSON_Delete(root);
 }
 
 /* ─── GET /api/v1/coupons/:code ─────────────────────────────────────────── */
@@ -2631,7 +2920,7 @@ static void base32_encode(const uint8_t *in, size_t in_len, char *out, size_t ou
 }
 
 /* HOTP(secret, counter) → 6 桁コード */
-static uint32_t hotp(const uint8_t *secret, size_t sec_len, uint64_t counter) {
+uint32_t hotp(const uint8_t *secret, size_t sec_len, uint64_t counter) {
     uint8_t msg[8];
     for (int i = 7; i >= 0; i--) { msg[i] = counter & 0xff; counter >>= 8; }
     uint8_t mac[20];
@@ -2645,7 +2934,7 @@ static uint32_t hotp(const uint8_t *secret, size_t sec_len, uint64_t counter) {
 }
 
 /* TOTP 検証（±1 ステップ = ±30 秒の誤差を許容） */
-static int totp_verify(const char *b32_secret, const char *code_str) {
+int totp_verify(const char *b32_secret, const char *code_str) {
     /* base32 デコード */
     uint8_t sec[32]; size_t sec_len = 0;
     const char *p = b32_secret;

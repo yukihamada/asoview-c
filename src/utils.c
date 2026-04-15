@@ -152,34 +152,38 @@ static int b64url_decode(const char *src, size_t src_len, uint8_t *out, size_t o
 
 /* ─── JWT HS256 ──────────────────────────────────────────────────────────── */
 
-char *jwt_create(long user_id, const char *secret) {
-    /* header */
+/* ─── JWT 内部実装 ────────────────────────────────────────────────────────── */
+
+static char *jwt_create_internal(long user_id, const char *secret,
+                                  const char *type, long ttl_secs) {
     const char *hdr = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
     char hdr_b64[64];
     b64url_encode((const uint8_t*)hdr, strlen(hdr), hdr_b64);
 
-    /* payload — jti は乱数で一意性を保証（同秒内の複数発行でも衝突しない） */
     time_t now = time(NULL);
-    time_t exp = now + 7*24*3600;
+    time_t exp = now + ttl_secs;
     unsigned jti = (unsigned)rand() ^ (unsigned)(now & 0xFFFF);
-    char pay[160];
-    snprintf(pay, sizeof(pay),
-             "{\"sub\":\"%ld\",\"iat\":%ld,\"exp\":%ld,\"jti\":%u}",
-             user_id, (long)now, (long)exp, jti);
+    char pay[192];
+    if (type && *type) {
+        snprintf(pay, sizeof(pay),
+                 "{\"sub\":\"%ld\",\"iat\":%ld,\"exp\":%ld,\"jti\":%u,\"type\":\"%s\"}",
+                 user_id, (long)now, (long)exp, jti, type);
+    } else {
+        snprintf(pay, sizeof(pay),
+                 "{\"sub\":\"%ld\",\"iat\":%ld,\"exp\":%ld,\"jti\":%u}",
+                 user_id, (long)now, (long)exp, jti);
+    }
     char pay_b64[256];
     b64url_encode((const uint8_t*)pay, strlen(pay), pay_b64);
 
-    /* signing input */
     char si[512];
     snprintf(si, sizeof(si), "%s.%s", hdr_b64, pay_b64);
 
-    /* HMAC-SHA256 */
     uint8_t mac[32];
     platform_hmac_sha256(secret, strlen(secret), si, strlen(si), mac);
     char sig[64];
     b64url_encode(mac, 32, sig);
 
-    /* assemble */
     size_t tlen = strlen(si) + 1 + strlen(sig) + 1;
     char *tok = malloc(tlen);
     if (!tok) return NULL;
@@ -187,13 +191,24 @@ char *jwt_create(long user_id, const char *secret) {
     return tok;
 }
 
-long jwt_verify(const char *token, const char *secret) {
+/* access token: 1 時間 */
+char *jwt_create(long user_id, const char *secret) {
+    return jwt_create_internal(user_id, secret, "access", 3600);
+}
+
+/* refresh token: 14 日 */
+char *jwt_create_refresh(long user_id, const char *secret) {
+    return jwt_create_internal(user_id, secret, "refresh", 14*24*3600);
+}
+
+/* 検証して uid を返す。type_out に token の type を書く（NULLなら無視）。
+   失敗時 -1 */
+long jwt_verify_typed(const char *token, const char *secret, char *type_out, size_t type_sz) {
     const char *p1 = strchr(token, '.');
     if (!p1) return -1;
     const char *p2 = strchr(p1+1, '.');
     if (!p2) return -1;
 
-    /* verify signature */
     size_t si_len = (size_t)(p2 - token);
     uint8_t mac[32];
     platform_hmac_sha256(secret, strlen(secret), token, si_len, mac);
@@ -201,7 +216,6 @@ long jwt_verify(const char *token, const char *secret) {
     b64url_encode(mac, 32, expected);
     if (strcmp(expected, p2+1) != 0) return -1;
 
-    /* decode payload */
     const char *pay_b64 = p1+1;
     size_t pay_b64_len = (size_t)(p2 - pay_b64);
     uint8_t pay_json[256];
@@ -213,12 +227,31 @@ long jwt_verify(const char *token, const char *secret) {
     const char *ep = strstr((char*)pay_json, "\"exp\":");
     if (!ep) return -1;
     long exp = strtol(ep+6, NULL, 10);
-    if (time(NULL) > exp) return -1;  /* expired */
+    if (time(NULL) > exp) return -1;
 
     /* parse sub */
     const char *sp = strstr((char*)pay_json, "\"sub\":\"");
     if (!sp) return -1;
     long uid = strtol(sp+7, NULL, 10);
     if (uid <= 0) return -1;
+
+    /* parse type（省略可 — 古いトークンは type なしで "access" 扱い） */
+    if (type_out && type_sz > 0) {
+        const char *tp = strstr((char*)pay_json, "\"type\":\"");
+        if (tp) {
+            tp += 8;
+            size_t i = 0;
+            while (*tp && *tp != '"' && i < type_sz-1) type_out[i++] = *tp++;
+            type_out[i] = '\0';
+        } else {
+            strncpy(type_out, "access", type_sz-1);
+            type_out[type_sz-1] = '\0';
+        }
+    }
     return uid;
+}
+
+/* 後方互換: type を無視して uid のみ返す */
+long jwt_verify(const char *token, const char *secret) {
+    return jwt_verify_typed(token, secret, NULL, 0);
 }
