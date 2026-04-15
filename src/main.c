@@ -84,7 +84,7 @@ static const char OGP_IMAGE_SVG[] =
     "<rect x='764' y='430' width='210' height='108' rx='12'"
     " fill='rgba(255,255,255,0.06)' stroke='rgba(255,255,255,0.10)' stroke-width='1'/>"
     "<text x='869' y='486' font-size='46' font-weight='700'"
-    " font-family='system-ui,-apple-system,sans-serif' fill='#4ade80' text-anchor='middle'>68/68</text>"
+    " font-family='system-ui,-apple-system,sans-serif' fill='#4ade80' text-anchor='middle'>69/69</text>"
     "<text x='869' y='522' font-size='17' font-family='system-ui,-apple-system,sans-serif'"
     " fill='rgba(255,255,255,0.40)' text-anchor='middle'>Tests Passing</text>"
     "</svg>";
@@ -120,7 +120,7 @@ static const char ADMIN_HTML_TEMPLATE[] =
     /* Twitter Card */
     "<meta name='twitter:card' content='summary_large_image'>\n"
     "<meta name='twitter:title' content='Asoview Admin'>\n"
-    "<meta name='twitter:description' content='C11 + SQLite3, 285KB single binary. 44+ API endpoints, 68/68 tests passing.'>\n"
+    "<meta name='twitter:description' content='C11 + SQLite3, 285KB single binary. 44+ API endpoints, 69/69 tests passing.'>\n"
     "<meta name='twitter:image' content='%s'>\n"
     /* Styles */
     "<style>\n"
