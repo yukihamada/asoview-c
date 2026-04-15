@@ -1091,12 +1091,12 @@ void handle_search(struct mg_connection *c, struct mg_http_message *hm, DbConn *
     char kw[520] = {0};
     if (kw_flag && q_esc[0]) snprintf(kw, sizeof(kw), "%%%s%%", q_esc);
 
-    /* FTS5 サブクエリ方式（JOIN より信頼性が高い） */
+    /* FTS サブクエリ方式（バックエンド別マクロで自動切替） */
     const char *cnt_fts_sql =
         "SELECT COUNT(DISTINCT p.id) FROM plans p "
         "JOIN venues v ON v.id=p.venue_id "
         "WHERE p.is_active=1 "
-        "AND p.id IN (SELECT rowid FROM plans_fts WHERE plans_fts MATCH ?) "
+        "AND " SQL_FTS_MATCH(p.id, "?") " "
         "AND (? = 0 OR p.category_id=?) "
         "AND (? = 0 OR v.area_id=?) "
         "AND (? = 0 OR EXISTS (SELECT 1 FROM schedules s "
@@ -1115,7 +1115,7 @@ void handle_search(struct mg_connection *c, struct mg_http_message *hm, DbConn *
     char qsql_fts[1200], qsql_like[1200];
     snprintf(qsql_fts, sizeof(qsql_fts),
         "%s WHERE p.is_active=1 "
-        "AND p.id IN (SELECT rowid FROM plans_fts WHERE plans_fts MATCH ?) "
+        "AND " SQL_FTS_MATCH(p.id, "?") " "
         "AND (? = 0 OR p.category_id=?) "
         "AND (? = 0 OR v.area_id=?) "
         "AND (? = 0 OR EXISTS (SELECT 1 FROM schedules s "

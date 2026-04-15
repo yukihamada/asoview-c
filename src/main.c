@@ -13,6 +13,7 @@
 #include "rate_limit.h"
 #include "metrics.h"
 #include "waitlist.h"
+#include "setup.h"
 
 #define MAX_BODY_BYTES (64 * 1024)  /* 64 KB リクエストボディ上限 */
 
@@ -90,9 +91,10 @@ static const char OGP_IMAGE_SVG[] =
     "</svg>";
 
 /* ─── 管理者ダッシュボード HTML テンプレート ─────────────────────────────
- *   %%s[0] = og:image の絶対 URL
- *   %%s[1] = og:url の絶対 URL
- *   %%s[2] = twitter:image の絶対 URL (= og:image と同値)
+ *   %s[0] = og:image の絶対 URL
+ *   %s[1] = og:url の絶対 URL
+ *   %s[2] = twitter:image の絶対 URL (= og:image と同値)
+ *   %s[3] = セットアップ警告バナー HTML（空文字列 or バナー）
  * ─────────────────────────────────────────────────────────────────────── */
 static const char ADMIN_HTML_TEMPLATE[] =
     "<!DOCTYPE html>\n"
@@ -144,6 +146,12 @@ static const char ADMIN_HTML_TEMPLATE[] =
     ".link-btn:hover{background:#e8eaf0;border-color:#dde}\n"
     ".note{color:#aaa;font-size:12px;margin-top:20px;text-align:center}\n"
     ".note code{background:#f0f0f0;padding:1px 6px;border-radius:4px;font-size:11px}\n"
+    ".setup-banner{background:#fff3cd;border:1px solid #ffc107;border-radius:8px;"
+    "padding:12px 16px;margin-bottom:20px;font-size:13px;color:#856404;"
+    "display:flex;align-items:center;justify-content:space-between;gap:12px}\n"
+    ".setup-banner a{background:#e94560;color:#fff;padding:6px 16px;border-radius:6px;"
+    "text-decoration:none;font-weight:600;font-size:12px;white-space:nowrap}\n"
+    ".setup-banner a:hover{background:#c73552}\n"
     "</style>\n"
     "</head>\n"
     "<body>\n"
@@ -156,11 +164,12 @@ static const char ADMIN_HTML_TEMPLATE[] =
     "<span class='badge'>\xe7\xae\xa1\xe7\x90\x86\xe7\x94\xbb\xe9\x9d\xa2</span>"
     "</div>\n"
     "<div class='container'>\n"
+    "%s"  /* [3] setup warning banner (empty or HTML) */
     "<div class='grid'>\n"
     "<div class='card'><h2>API</h2><div class='val'>44+</div><div class='sub'>\xe3\x82\xa8\xe3\x83\xb3\xe3\x83\x89\xe3\x83\x9d\xe3\x82\xa4\xe3\x83\xb3\xe3\x83\x88</div></div>\n"
     "<div class='card'><h2>Binary</h2><div class='val'>~285</div><div class='sub'>KB</div></div>\n"
     "<div class='card'><h2>Stack</h2><div class='val'>C11</div><div class='sub'>+ SQLite3</div></div>\n"
-    "<div class='card'><h2>Tests</h2><div class='val' style='color:#16a34a'>68/68</div><div class='sub'>all passing</div></div>\n"
+    "<div class='card'><h2>Tests</h2><div class='val' style='color:#16a34a'>69/69</div><div class='sub'>all passing</div></div>\n"
     "</div>\n"
     "<div class='links'>\n"
     "<h2>\xe7\xae\xa1\xe7\x90\x86\xe3\x82\xa8\xe3\x83\xb3\xe3\x83\x89\xe3\x83\x9d\xe3\x82\xa4\xe3\x83\xb3\xe3\x83\x88</h2>\n"
@@ -174,6 +183,8 @@ static const char ADMIN_HTML_TEMPLATE[] =
     "<a class='link-btn' href='/api/v1/metrics'>\xf0\x9f\x93\x8a Prometheus</a>\n"
     "<a class='link-btn' href='/api/v1/venues'>\xf0\x9f\x8f\xa0 \xe4\xbc\x9a\xe5\xa0\xb4 (Public)</a>\n"
     "<a class='link-btn' href='/api/v1/plans'>\xf0\x9f\x97\x92\xef\xb8\x8f \xe3\x83\x97\xe3\x83\xa9\xe3\x83\xb3 (Public)</a>\n"
+    "<a class='link-btn' href='/setup' style='border-color:#e94560;color:#e94560'>"
+    "&#9881; \xe3\x82\xbb\xe3\x83\x83\xe3\x83\x88\xe3\x82\xa2\xe3\x83\x83\xe3\x83\x97</a>\n"
     "</div>\n"
     "</div>\n"
     "<p class='note'>\xe7\xae\xa1\xe7\x90\x86\xe8\x80\x85\xe3\x82\xa8\xe3\x83\xb3\xe3\x83\x89\xe3\x83\x9d\xe3\x82\xa4\xe3\x83\xb3\xe3\x83\x88\xe3\x81\xab\xe3\x81\xaf <code>X-Admin-Key</code> \xe3\x83\x98\xe3\x83\x83\xe3\x83\x80\xe3\x83\xbc\xe3\x81\x8c\xe5\xbf\x85\xe8\xa6\x81\xe3\x81\xa7\xe3\x81\x99</p>\n"
@@ -300,10 +311,18 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
             char og_image[300], og_url[300];
             snprintf(og_image, sizeof(og_image), "%s/og-image.svg", base);
             snprintf(og_url,   sizeof(og_url),   "%s/admin",        base);
+            const char *setup_banner =
+                setup_is_unconfigured()
+                ? "<div class='setup-banner'>"
+                  "&#9888; <strong>初期設定が必要です</strong> "
+                  "&mdash; JWT_SECRET / ADMIN_KEY / Stripe / Resend キーを設定してください"
+                  "<a href='/setup'>&#9881; セットアップ</a>"
+                  "</div>\n"
+                : "";
             mg_http_reply(c, 200,
                 "Content-Type: text/html; charset=UTF-8\r\n"
                 "Cache-Control: no-cache\r\n",
-                ADMIN_HTML_TEMPLATE, og_image, og_url, og_image);
+                ADMIN_HTML_TEMPLATE, og_image, og_url, og_image, setup_banner);
         }
 
     /* ── Prometheus メトリクス ────────────────────────────────────────────── */
@@ -528,6 +547,13 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     } else if (strcmp(uri, "/api/v1/admin/upload-url") == 0) {
         if (IS_POST) handle_admin_get_upload_url(c, hm, db);
+
+    /* ── セットアップウィザード ───────────────────────────────────────────── */
+    } else if (strcmp(uri, "/setup") == 0 || strcmp(uri, "/setup/") == 0) {
+        if (IS_GET) handle_setup_page(c, hm, db);
+
+    } else if (strcmp(uri, "/api/v1/setup") == 0) {
+        if (IS_POST) handle_setup_save(c, hm, db);
 
     } else {
         mg_http_reply(c, 404, "Content-Type: application/json\r\n",

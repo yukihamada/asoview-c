@@ -68,7 +68,7 @@ endif
 SRCS    = deps/mongoose.c deps/cJSON.c \
           src/utils.c src/db.c src/seed.c src/handlers.c src/admin.c \
           src/stripe.c src/mailer.c src/rate_limit.c src/platform.c src/uploader.c \
-          src/metrics.c src/waitlist.c $(DB_SRCS)
+          src/metrics.c src/waitlist.c src/setup.c $(DB_SRCS)
 
 BIN     = asoview-c
 TEST    = tests/run_tests
