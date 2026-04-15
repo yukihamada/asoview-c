@@ -10,6 +10,11 @@ DB ?= sqlite
 # プラットフォーム別リンクフラグ
 UNAME := $(shell uname)
 
+# Linux (glibc) では POSIX + BSD 拡張を有効化 (strncasecmp, CLOCK_REALTIME 等)
+ifneq ($(UNAME), Darwin)
+    DEFS += -D_DEFAULT_SOURCE
+endif
+
 ifeq ($(DB), postgres)
     DEFS    += -DUSE_POSTGRES
     DB_SRCS  = src/db_postgres.c
