@@ -1,0 +1,140 @@
+groups:
+  # ─── Asoview API アラートルール ──────────────────────────────────────────
+  - name: asoview_api
+    interval: 30s
+    rules:
+
+      # ── 可用性 ────────────────────────────────────────────────────────────
+      - alert: AsoviewDown
+        expr: up{job="asoview"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "Asoview サーバーがダウンしています"
+          description: "インスタンス {{ $labels.instance }} が 1 分以上応答していません。"
+          runbook: "1. コンテナ/プロセスの状態を確認 2. ログ確認 3. 再起動"
+
+      # ── エラー率 ──────────────────────────────────────────────────────────
+      - alert: HighErrorRate
+        expr: |
+          (
+            rate(http_requests_total{status=~"5.."}[5m])
+            /
+            rate(http_requests_total[5m])
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "HTTP 5xx エラー率が 5% を超えています"
+          description: "過去 5 分間の 5xx エラー率: {{ $value | humanizePercentage }}"
+
+      - alert: CriticalErrorRate
+        expr: |
+          (
+            rate(http_requests_total{status=~"5.."}[5m])
+            /
+            rate(http_requests_total[5m])
+          ) > 0.20
+        for: 2m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "HTTP 5xx エラー率が 20% を超えています（緊急）"
+          description: "過去 5 分間の 5xx エラー率: {{ $value | humanizePercentage }}"
+
+      # ── レイテンシ ─────────────────────────────────────────────────────────
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            rate(http_request_duration_ms_bucket[5m])
+          ) > 1000
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "API レスポンス p95 が 1000ms を超えています"
+          description: "p95 レイテンシ: {{ $value }}ms"
+
+      - alert: HighLatencyP99
+        expr: |
+          histogram_quantile(0.99,
+            rate(http_request_duration_ms_bucket[5m])
+          ) > 3000
+        for: 5m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "API レスポンス p99 が 3000ms を超えています（緊急）"
+          description: "p99 レイテンシ: {{ $value }}ms"
+
+      # ── スループット急落 ────────────────────────────────────────────────────
+      - alert: TrafficDrop
+        expr: |
+          rate(http_requests_total[5m])
+          < 0.1 * avg_over_time(rate(http_requests_total[5m])[1h:5m])
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "リクエスト数が過去 1 時間平均の 10% 未満に低下"
+          description: "現在の RPS: {{ $value | humanize }}。デプロイ失敗や障害の可能性。"
+
+  # ─── データベース アラートルール ─────────────────────────────────────────
+  - name: asoview_db
+    rules:
+
+      # ── SQLite WAL サイズ（カスタムメトリクス: sqlite_wal_pages） ─────────
+      - alert: SQLiteWALGrowth
+        expr: sqlite_wal_pages > 10000
+        for: 15m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "SQLite WAL ファイルが大きくなっています"
+          description: "WAL ページ数: {{ $value }}。チェックポイントが滞っている可能性。"
+
+      # ── 予約作成レート急増（予約スパム検知） ─────────────────────────────
+      - alert: BookingSpike
+        expr: rate(bookings_created_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "予約作成レートが異常に高くなっています（スパム疑い）"
+          description: "過去 5 分間の予約作成 RPS: {{ $value }}"
+
+  # ─── セキュリティ アラートルール ────────────────────────────────────────
+  - name: asoview_security
+    rules:
+
+      # ── レート制限ヒット急増（ブルートフォース疑い） ───────────────────────
+      - alert: RateLimitSpike
+        expr: rate(http_requests_total{status="429"}[5m]) > 5
+        for: 3m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "レート制限 (429) が急増しています"
+          description: "過去 5 分間の 429 RPS: {{ $value }}。ブルートフォース攻撃の可能性。"
+
+      # ── 管理エンドポイントへの不正アクセス急増 ────────────────────────────
+      - alert: AdminUnauthorizedAccess
+        expr: rate(http_requests_total{status="401",path=~"/api/v1/admin.*"}[5m]) > 2
+        for: 5m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "管理エンドポイントへの認証失敗が急増"
+          description: "過去 5 分間の管理 401 RPS: {{ $value }}"

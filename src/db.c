@@ -38,16 +38,39 @@ DbConn *db_open(const char *path) {
         sqlite3_close(db);
         return NULL;
     }
-    /* 既存 DB への後方互換マイグレーション（失敗は無視） */
+    /* マイグレーションバージョン管理テーブル */
     sqlite3_exec(db,
-        "ALTER TABLE bookings ADD COLUMN stripe_payment_intent_id TEXT",
+        "CREATE TABLE IF NOT EXISTS schema_migrations("
+        "version INTEGER PRIMARY KEY,"
+        "applied_at TEXT NOT NULL DEFAULT (datetime('now')))",
         NULL, NULL, NULL);
-    sqlite3_exec(db,
-        "ALTER TABLE users ADD COLUMN failed_logins INTEGER NOT NULL DEFAULT 0",
-        NULL, NULL, NULL);
-    sqlite3_exec(db,
-        "ALTER TABLE users ADD COLUMN locked_until TEXT",
-        NULL, NULL, NULL);
+
+    /* ヘルパー: バージョンが未適用なら SQL を実行して記録 */
+    /* NOTE: defined as a static nested helper using a block-scope lambda pattern */
+#define APPLY_MIGRATION(ver, sql) do { \
+    sqlite3_stmt *_chk = NULL; \
+    sqlite3_prepare_v2(db, "SELECT 1 FROM schema_migrations WHERE version=?", -1, &_chk, NULL); \
+    sqlite3_bind_int(_chk, 1, (ver)); \
+    int _found = (sqlite3_step(_chk) == SQLITE_ROW); \
+    sqlite3_finalize(_chk); \
+    if (!_found) { \
+        sqlite3_exec(db, (sql), NULL, NULL, NULL); \
+        sqlite3_stmt *_ins = NULL; \
+        sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", -1, &_ins, NULL); \
+        sqlite3_bind_int(_ins, 1, (ver)); \
+        sqlite3_step(_ins); \
+        sqlite3_finalize(_ins); \
+    } \
+} while (0)
+
+    /* 既存 DB への後方互換マイグレーション（バージョン管理付き） */
+    APPLY_MIGRATION(1, "ALTER TABLE bookings ADD COLUMN stripe_payment_intent_id TEXT");
+    APPLY_MIGRATION(2, "ALTER TABLE users ADD COLUMN failed_logins INTEGER NOT NULL DEFAULT 0");
+    APPLY_MIGRATION(3, "ALTER TABLE users ADD COLUMN locked_until TEXT");
+    APPLY_MIGRATION(4, "ALTER TABLE plans ADD COLUMN cancel_days_full INTEGER NOT NULL DEFAULT 7");
+    APPLY_MIGRATION(5, "ALTER TABLE plans ADD COLUMN cancel_days_partial INTEGER NOT NULL DEFAULT 3");
+    APPLY_MIGRATION(6, "ALTER TABLE plans ADD COLUMN cancel_pct_partial INTEGER NOT NULL DEFAULT 50");
+#undef APPLY_MIGRATION
     /* FTS5 インデックスを既存データで再構築（INSERT トリガーで新規データは自動追加） */
     sqlite3_exec(db,
         "INSERT INTO plans_fts(plans_fts) VALUES('rebuild')",
@@ -58,6 +81,13 @@ DbConn *db_open(const char *path) {
 void db_close(DbConn *db) {
     if (db) sqlite3_close(db);
 }
+
+void db_begin(DbConn *db) {
+    /* BEGIN IMMEDIATE: SQLite では書き込みロックを即座に取得し競合を防ぐ */
+    sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+}
+void db_commit(DbConn *db)   { sqlite3_exec(db, "COMMIT",   NULL, NULL, NULL); }
+void db_rollback(DbConn *db) { sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL); }
 
 /* ─── PostgreSQL / MySQL バックエンド ─────────────────────────────────────── */
 #else
@@ -92,5 +122,9 @@ DbConn *db_open(const char *path) {
 void db_close(DbConn *db) {
     db_close_backend(db);
 }
+
+void db_begin(DbConn *db)    { db_exec(db, "BEGIN"); }
+void db_commit(DbConn *db)   { db_exec(db, "COMMIT"); }
+void db_rollback(DbConn *db) { db_exec(db, "ROLLBACK"); }
 
 #endif /* USE_POSTGRES || USE_MYSQL */

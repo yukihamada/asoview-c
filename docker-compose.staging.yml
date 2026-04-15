@@ -1,0 +1,146 @@
+version: "3.9"
+
+# ─── Asoview Staging 環境 ────────────────────────────────────────────────────
+#
+# 起動:
+#   docker compose -f docker-compose.staging.yml up
+#
+# PostgreSQL バックエンド:
+#   docker compose -f docker-compose.staging.yml --profile postgres up
+#
+# 環境変数:
+#   .env.staging ファイルを作成してシークレットを設定してください（.env.staging.example 参照）
+#
+# アクセス:
+#   - API:      http://localhost:3010/api/v1/
+#   - Admin:    http://localhost:3010/admin
+#   - Setup:    http://localhost:3010/setup
+#   - Metrics:  http://localhost:3010/api/v1/metrics
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+  # ─── Asoview (SQLite バックエンド) ─────────────────────────────────────────
+  asoview-staging:
+    build:
+      context: .
+      args:
+        DB: sqlite
+    image: asoview-c:staging
+    container_name: asoview-staging
+    restart: unless-stopped
+    ports:
+      - "3010:3001"
+    volumes:
+      - asoview_staging_data:/data
+    env_file:
+      - path: .env.staging
+        required: false
+    environment:
+      PORT:         "3001"
+      DATABASE_URL: "/data/asoview-staging.db"
+      # ステージング固有: 本番とは別のシークレットを使用すること
+      # JWT_SECRET: はenv_fileで設定
+      # ADMIN_KEY:  はenv_fileで設定
+      FRONTEND_URL: "http://localhost:3010"
+      CORS_ORIGIN:  "http://localhost:3010"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:3001/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "env=staging"
+
+  # ─── Asoview-PG (PostgreSQL バックエンド) ───────────────────────────────────
+  asoview-staging-pg:
+    build:
+      context: .
+      args:
+        DB: postgres
+    image: asoview-c:staging-pg
+    container_name: asoview-staging-pg
+    restart: unless-stopped
+    ports:
+      - "3011:3001"
+    env_file:
+      - path: .env.staging
+        required: false
+    environment:
+      PORT:         "3001"
+      DATABASE_URL: "postgres://asoview:asoview_staging@postgres-staging:5432/asoview_staging"
+      FRONTEND_URL: "http://localhost:3011"
+      CORS_ORIGIN:  "http://localhost:3011"
+    depends_on:
+      postgres-staging:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:3001/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    labels:
+      - "env=staging"
+    profiles:
+      - postgres
+
+  postgres-staging:
+    image: postgres:16-alpine
+    container_name: asoview-postgres-staging
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       asoview_staging
+      POSTGRES_USER:     asoview
+      POSTGRES_PASSWORD: asoview_staging
+    volumes:
+      - postgres_staging_data:/var/lib/postgresql/data
+      - ./migrations/schema_postgres.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U asoview -d asoview_staging"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      - "env=staging"
+    profiles:
+      - postgres
+
+  # ─── Prometheus (メトリクス収集) ────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: asoview-prometheus-staging
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.staging.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.rules.yml:/etc/prometheus/alerts.rules.yml:ro
+      - prometheus_staging_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'
+    labels:
+      - "env=staging"
+
+  # ─── Grafana (可視化) ───────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: asoview-grafana-staging
+    restart: unless-stopped
+    ports:
+      - "3012:3000"
+    volumes:
+      - grafana_staging_data:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "staging_admin"
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+    labels:
+      - "env=staging"
+
+volumes:
+  asoview_staging_data:
+  postgres_staging_data:
+  prometheus_staging_data:
+  grafana_staging_data:

@@ -1,5 +1,6 @@
 #include "admin.h"
 #include "handlers.h"   /* send_json_str, send_error_json */
+#include "audit.h"
 #include "cJSON.h"
 #include "stripe.h"
 #include "mailer.h"
@@ -158,6 +159,10 @@ void handle_admin_create_venue(struct mg_connection *c, struct mg_http_message *
     long vid = db_last_id(db);
     db_finalize(st);
     if (imgs_str) cJSON_free(imgs_str);
+
+    char vid_str[32]; snprintf(vid_str, sizeof(vid_str), "%ld", vid);
+    audit_log(db, "admin", "create_venue", "venue", vid_str, name, NULL);
+
     cJSON_Delete(body);
 
     cJSON *res = cJSON_CreateObject();
@@ -249,6 +254,8 @@ void handle_admin_delete_venue(struct mg_connection *c, struct mg_http_message *
     if (rc == -1 || db_changes(db) == 0) {
         send_error_json(c, 404, "venue not found"); return;
     }
+    char vid_str2[32]; snprintf(vid_str2, sizeof(vid_str2), "%ld", id);
+    audit_log(db, "admin", "delete_venue", "venue", vid_str2, "", NULL);
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"施設を削除しました\"}");
 }
 
@@ -271,6 +278,13 @@ void handle_admin_create_plan(struct mg_connection *c, struct mg_http_message *h
     cJSON *tags = cJSON_GetObjectItem(body, "tags");
     char *imgs_str = imgs ? cJSON_PrintUnformatted(imgs) : NULL;
     char *tags_str = tags ? cJSON_PrintUnformatted(tags) : NULL;
+    /* キャンセルポリシー（未指定時はデフォルト値） */
+    cJSON *cdft = cJSON_GetObjectItem(body, "cancel_days_full");
+    cJSON *cdpt = cJSON_GetObjectItem(body, "cancel_days_partial");
+    cJSON *cppt = cJSON_GetObjectItem(body, "cancel_pct_partial");
+    long cancel_days_full    = cdft ? (long)cJSON_GetNumberValue(cdft) : 7;
+    long cancel_days_partial = cdpt ? (long)cJSON_GetNumberValue(cdpt) : 3;
+    long cancel_pct_partial  = cppt ? (long)cJSON_GetNumberValue(cppt) : 50;
 
     if (!title || !*title || venue_id<=0 || category_id<=0) {
         cJSON_Delete(body);
@@ -283,8 +297,9 @@ void handle_admin_create_plan(struct mg_connection *c, struct mg_http_message *h
     DbStmt *st = NULL;
     st = db_prepare(db,
         "INSERT INTO plans(venue_id,category_id,title,description,duration_minutes,"
-        "min_participants,max_participants,min_age,images,tags)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?)");
+        "min_participants,max_participants,min_age,images,tags,"
+        "cancel_days_full,cancel_days_partial,cancel_pct_partial)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)");
     db_bind_int(st, 1, venue_id);
     db_bind_int(st, 2, category_id);
     db_bind_text(st, 3, title);
@@ -295,6 +310,9 @@ void handle_admin_create_plan(struct mg_connection *c, struct mg_http_message *h
     db_bind_int(st, 8, minage);
     db_bind_text(st, 9, imgs_str ? imgs_str : "[]");
     db_bind_text(st, 10, tags_str ? tags_str : "[]");
+    db_bind_int(st, 11, cancel_days_full);
+    db_bind_int(st, 12, cancel_days_partial);
+    db_bind_int(st, 13, cancel_pct_partial);
     db_step(st);
     long pid = db_last_id(db);
     db_finalize(st);
@@ -321,6 +339,9 @@ void handle_admin_create_plan(struct mg_connection *c, struct mg_http_message *h
             db_step(pi); db_finalize(pi);
         }
     }
+    char pid_str[32]; snprintf(pid_str, sizeof(pid_str), "%ld", pid);
+    audit_log(db, "admin", "create_plan", "plan", pid_str, title, NULL);
+
     cJSON_Delete(body);
 
     cJSON *res = cJSON_CreateObject();
@@ -363,6 +384,24 @@ void handle_admin_update_plan(struct mg_connection *c, struct mg_http_message *h
         db_bind_int(u, 1, cJSON_IsTrue(it) ? 1 : 0);
         db_bind_int(u, 2, id); db_step(u); db_finalize(u);
     }
+    it = cJSON_GetObjectItem(body, "cancel_days_full");
+    if (it && cJSON_IsNumber(it)) {
+        DbStmt *u = NULL; u = db_prepare(db, "UPDATE plans SET cancel_days_full=? WHERE id=?");
+        db_bind_int(u, 1, (long)cJSON_GetNumberValue(it));
+        db_bind_int(u, 2, id); db_step(u); db_finalize(u);
+    }
+    it = cJSON_GetObjectItem(body, "cancel_days_partial");
+    if (it && cJSON_IsNumber(it)) {
+        DbStmt *u = NULL; u = db_prepare(db, "UPDATE plans SET cancel_days_partial=? WHERE id=?");
+        db_bind_int(u, 1, (long)cJSON_GetNumberValue(it));
+        db_bind_int(u, 2, id); db_step(u); db_finalize(u);
+    }
+    it = cJSON_GetObjectItem(body, "cancel_pct_partial");
+    if (it && cJSON_IsNumber(it)) {
+        DbStmt *u = NULL; u = db_prepare(db, "UPDATE plans SET cancel_pct_partial=? WHERE id=?");
+        db_bind_int(u, 1, (long)cJSON_GetNumberValue(it));
+        db_bind_int(u, 2, id); db_step(u); db_finalize(u);
+    }
     cJSON_Delete(body);
 
     cJSON *res = cJSON_CreateObject();
@@ -381,6 +420,8 @@ void handle_admin_delete_plan(struct mg_connection *c, struct mg_http_message *h
     if (db_changes(db) == 0) {
         send_error_json(c, 404, "plan not found"); return;
     }
+    char dpid_str[32]; snprintf(dpid_str, sizeof(dpid_str), "%ld", id);
+    audit_log(db, "admin", "delete_plan", "plan", dpid_str, "", NULL);
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"プランを非公開にしました\"}");
 }
 
@@ -447,6 +488,8 @@ void handle_admin_delete_schedule(struct mg_connection *c, struct mg_http_messag
     if (db_changes(db) == 0) {
         send_error_json(c, 404, "schedule not found"); return;
     }
+    char dsid_str[32]; snprintf(dsid_str, sizeof(dsid_str), "%ld", id);
+    audit_log(db, "admin", "delete_schedule", "schedule", dsid_str, "", NULL);
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"スケジュールを削除しました\"}");
 }
 
@@ -990,6 +1033,8 @@ void handle_admin_refund_booking(struct mg_connection *c, struct mg_http_message
     upd = db_prepare(db, "UPDATE bookings SET status='refunded' WHERE id=?");
     db_bind_text(upd, 1, id);
     db_step(upd); db_finalize(upd);
+
+    audit_log(db, "admin", "refund", "booking", id, "", NULL);
 
     cJSON *res = cJSON_CreateObject();
     cJSON_AddBoolToObject(res, "refunded", 1);
@@ -1596,4 +1641,58 @@ void handle_admin_ui(struct mg_connection *c, struct mg_http_message *hm, DbConn
 "</body></html>\n";
 
     mg_http_reply(c, 200, "Content-Type: text/html; charset=utf-8\r\n", "%s", HTML);
+}
+
+/* ─── GET /api/v1/admin/audit-logs ─────────────────────────────────────────── */
+
+void handle_admin_audit_logs(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    if (!require_admin(c, hm)) return;
+
+    long page  = 1, limit = 50;
+    char pv[16] = {0}, lv[16] = {0};
+    mg_http_get_var(&hm->query, "page",  pv, sizeof(pv));
+    mg_http_get_var(&hm->query, "limit", lv, sizeof(lv));
+    if (pv[0])  page  = atol(pv);
+    if (lv[0])  limit = atol(lv);
+    if (page  < 1)   page  = 1;
+    if (limit < 1)   limit = 1;
+    if (limit > 200) limit = 200;
+    long offset = (page - 1) * limit;
+
+    /* 総件数 */
+    DbStmt *ct = NULL;
+    ct = db_prepare(db, "SELECT COUNT(*) FROM audit_logs");
+    db_step(ct);
+    long total = db_col_int(ct, 0);
+    db_finalize(ct);
+
+    DbStmt *st = NULL;
+    st = db_prepare(db,
+        "SELECT id,ts,actor,action,target_type,target_id,detail,ip "
+        "FROM audit_logs ORDER BY id DESC LIMIT ? OFFSET ?");
+    db_bind_int(st, 1, limit);
+    db_bind_int(st, 2, offset);
+
+    cJSON *arr = cJSON_CreateArray();
+    while (db_step(st) == 1) {
+        cJSON *row = cJSON_CreateObject();
+        cJSON_AddNumberToObject(row, "id",          db_col_int(st, 0));
+        cJSON_AddStringToObject(row, "ts",          db_col_text(st, 1) ? db_col_text(st, 1) : "");
+        cJSON_AddStringToObject(row, "actor",       db_col_text(st, 2) ? db_col_text(st, 2) : "");
+        cJSON_AddStringToObject(row, "action",      db_col_text(st, 3) ? db_col_text(st, 3) : "");
+        cJSON_AddStringToObject(row, "target_type", db_col_text(st, 4) ? db_col_text(st, 4) : "");
+        cJSON_AddStringToObject(row, "target_id",   db_col_text(st, 5) ? db_col_text(st, 5) : "");
+        cJSON_AddStringToObject(row, "detail",      db_col_text(st, 6) ? db_col_text(st, 6) : "");
+        cJSON_AddStringToObject(row, "ip",          db_col_text(st, 7) ? db_col_text(st, 7) : "");
+        cJSON_AddItemToArray(arr, row);
+    }
+    db_finalize(st);
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddItemToObject(res, "logs",  arr);
+    cJSON_AddNumberToObject(res, "total", total);
+    cJSON_AddNumberToObject(res, "page",  page);
+    cJSON_AddNumberToObject(res, "limit", limit);
+    send_cjson_admin(c, 200, res);
+    cJSON_Delete(res);
 }

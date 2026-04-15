@@ -41,19 +41,22 @@ CREATE TABLE IF NOT EXISTS venues (
 
 -- プラン（施設が提供する体験）
 CREATE TABLE IF NOT EXISTS plans (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    venue_id         INTEGER NOT NULL REFERENCES venues(id),
-    category_id      INTEGER NOT NULL REFERENCES categories(id),
-    title            TEXT NOT NULL,
-    description      TEXT,
-    duration_minutes INTEGER,
-    min_participants INTEGER NOT NULL DEFAULT 1,
-    max_participants INTEGER,
-    min_age          INTEGER,
-    images           TEXT NOT NULL DEFAULT '[]',  -- JSON array
-    tags             TEXT NOT NULL DEFAULT '[]',  -- JSON array
-    is_active        INTEGER NOT NULL DEFAULT 1,
-    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    venue_id            INTEGER NOT NULL REFERENCES venues(id),
+    category_id         INTEGER NOT NULL REFERENCES categories(id),
+    title               TEXT NOT NULL,
+    description         TEXT,
+    duration_minutes    INTEGER,
+    min_participants    INTEGER NOT NULL DEFAULT 1,
+    max_participants    INTEGER,
+    min_age             INTEGER,
+    images              TEXT NOT NULL DEFAULT '[]',  -- JSON array
+    tags                TEXT NOT NULL DEFAULT '[]',  -- JSON array
+    is_active           INTEGER NOT NULL DEFAULT 1,
+    cancel_days_full    INTEGER NOT NULL DEFAULT 7,   -- N日前まで全額返金
+    cancel_days_partial INTEGER NOT NULL DEFAULT 3,   -- N日前まで部分返金
+    cancel_pct_partial  INTEGER NOT NULL DEFAULT 50,  -- 部分返金率(%)
+    created_at          TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- 価格（大人・子供・シニア等）
@@ -197,6 +200,18 @@ CREATE TABLE IF NOT EXISTS jwt_blocklist (
 -- FTS5 全文検索（plans の title / description を索引化）
 CREATE VIRTUAL TABLE IF NOT EXISTS plans_fts
     USING fts5(title, description, content='plans', content_rowid='id');
+
+-- 管理者操作監査ログ
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL DEFAULT (datetime('now')),
+    actor       TEXT NOT NULL DEFAULT 'admin',
+    action      TEXT NOT NULL,
+    target_type TEXT,
+    target_id   TEXT,
+    detail      TEXT,
+    ip          TEXT
+);
 
 -- FTS5 同期トリガー
 CREATE TRIGGER IF NOT EXISTS plans_ai AFTER INSERT ON plans BEGIN

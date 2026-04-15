@@ -384,6 +384,12 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (strcmp(uri, "/api/v1/users") == 0) {
         if (IS_POST) handle_create_user(c, hm, db);
 
+    } else if (strcmp(uri, "/api/v1/users/me/export") == 0) {
+        if (IS_GET) handle_export_user_data(c, hm, db);
+
+    } else if (strcmp(uri, "/api/v1/users/me") == 0) {
+        if (IS_DELETE) handle_delete_user_account(c, hm, db);
+
     } else if (sscanf(uri, "/api/v1/users/%ld/bookings", &id) == 1
                && strstr(uri, "/bookings") != NULL) {
         if (IS_GET) handle_list_user_bookings(c, hm, db, id);
@@ -566,6 +572,9 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
                && strstr(uri, "/refund") != NULL) {
         if (IS_POST) handle_admin_refund_booking(c, hm, db, booking_id);
 
+    } else if (strcmp(uri, "/api/v1/admin/audit-logs") == 0) {
+        if (IS_GET) handle_admin_audit_logs(c, hm, db);
+
     } else if (strcmp(uri, "/api/v1/admin/backup") == 0) {
         if (IS_GET) handle_admin_backup_db(c, hm, db);
 
@@ -646,7 +655,15 @@ int main(int argc, char *argv[]) {
 
     printf("[asoview-c] Press Ctrl-C to stop\n");
     while (!g_quit) mg_mgr_poll(&mgr, 100);
-    printf("[asoview-c] Shutting down...\n");
+    printf("[asoview-c] Shutting down — draining in-flight requests...\n");
+
+    /* グレースフルシャットダウン: 最大 5 秒間ポーリングを続けて
+     * 既存接続が正常にクローズされるのを待つ */
+    time_t drain_start = time(NULL);
+    while (time(NULL) - drain_start < 5) {
+        mg_mgr_poll(&mgr, 100);
+    }
+    printf("[asoview-c] Shutdown complete.\n");
 
     mg_mgr_free(&mgr);
     db_close(db);

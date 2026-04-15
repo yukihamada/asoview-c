@@ -142,6 +142,12 @@ void send_booking_confirmation_email(const char *to,
     const char *frontend = getenv("FRONTEND_URL");
     if (!frontend || !*frontend) frontend = "http://localhost:3000";
 
+    char cancel_link[512], detail_link[512];
+    snprintf(detail_link, sizeof(detail_link), "%s/bookings/%s",
+             frontend, booking_id ? booking_id : "");
+    snprintf(cancel_link, sizeof(cancel_link), "%s/bookings/%s/cancel",
+             frontend, booking_id ? booking_id : "");
+
     char html[2048];
     snprintf(html, sizeof(html),
         "<h2>ご予約確定のお知らせ</h2>"
@@ -154,16 +160,26 @@ void send_booking_confirmation_email(const char *to,
         "<tr><th style=\"text-align:left;padding:8px 16px\">日程</th>"
         "<td style=\"padding:8px 16px\">%s %s</td></tr>"
         "<tr><th style=\"text-align:left;padding:8px 16px\">合計金額</th>"
-        "<td style=\"padding:8px 16px\">¥%ld</td></tr>"
+        "<td style=\"padding:8px 16px\">&yen;%ld</td></tr>"
         "</table>"
-        "<p><a href=\"%s/bookings/%s\">予約詳細を確認する</a></p>",
+        "<p style=\"margin-top:20px\">"
+        "<a href=\"%s\" style=\"background:#0066cc;color:#fff;"
+        "padding:12px 24px;border-radius:4px;text-decoration:none;margin-right:12px\">"
+        "予約詳細を確認する</a>"
+        "<a href=\"%s\" style=\"background:#f5f5f5;color:#666;"
+        "padding:12px 24px;border-radius:4px;text-decoration:none;border:1px solid #ddd\">"
+        "予約をキャンセルする</a>"
+        "</p>"
+        "<p style=\"color:#888;font-size:12px;margin-top:16px\">"
+        "キャンセルポリシーによっては手数料が発生する場合があります。"
+        "詳細は予約詳細ページでご確認ください。</p>",
         booking_id ? booking_id : "",
         plan_title  ? plan_title  : "",
         date        ? date        : "",
         start_time  ? start_time  : "",
         total_price,
-        frontend,
-        booking_id ? booking_id : "");
+        detail_link,
+        cancel_link);
 
     send_email(to, "【asoview】ご予約確定のお知らせ", html);
 }

@@ -34,3 +34,5 @@ void handle_admin_refund_booking (struct mg_connection *c, struct mg_http_messag
 void handle_admin_backup_db      (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
 /* Admin WebUI */
 void handle_admin_ui             (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+/* Audit Logs */
+void handle_admin_audit_logs     (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);

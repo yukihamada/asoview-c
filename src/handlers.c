@@ -1,4 +1,5 @@
 #include "handlers.h"
+#include "db.h"
 #include "utils.h"
 #include "stripe.h"
 #include "mailer.h"
@@ -9,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #define MAX_BUF 256
 
@@ -74,6 +76,11 @@ static long require_auth(struct mg_connection *c, struct mg_http_message *hm, Db
     const char *secret = getenv("JWT_SECRET");
     if (!secret || !*secret) secret = "asoview-jwt-secret-dev";
     long uid = jwt_verify(tok, secret);
+    /* JWT ローテーション: 新 secret で失敗した場合は旧 secret を試す */
+    if (uid <= 0) {
+        const char *prev_secret = getenv("JWT_SECRET_PREV");
+        if (prev_secret && *prev_secret) uid = jwt_verify(tok, prev_secret);
+    }
     if (uid <= 0) { send_error_json(c, 401, "トークンが無効または期限切れです"); return -1; }
 
     /* JWT ブラックリスト確認（署名部分 = jti として使用） */
@@ -812,21 +819,7 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
         return;
     }
 
-    /* 空き枠チェック */
-    DbStmt *cap_st = NULL;
-    cap_st = db_prepare(db,
-        "SELECT capacity,booked_count FROM schedules WHERE id=? AND plan_id=?");
-    db_bind_int(cap_st, 1, sched_id);
-    db_bind_int(cap_st, 2, plan_id);
-    if (db_step(cap_st) != 1) {
-        db_finalize(cap_st); cJSON_Delete(body);
-        send_error_json(c, 404, "schedule not found"); return;
-    }
-    long cap    = db_col_int(cap_st, 0);
-    long booked = db_col_int(cap_st, 1);
-    db_finalize(cap_st);
-
-    /* サーバー側で価格を確定 */
+    /* サーバー側で価格を確定（トランザクション前に価格を取得） */
     int n = cJSON_GetArraySize(parts);
     if (n > MAX_PART_TYPES) n = MAX_PART_TYPES;
     PartEntry entries[MAX_PART_TYPES];
@@ -863,9 +856,34 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
         total_price  += cnt * entries[i].unit_price;
     }
 
+    /* ── 書き込みロックを取得してから空き枠を再確認（競合防止） ── */
+    db_begin(db);
+
+    /* 空き枠チェック（ロック内で再チェック） */
+    DbStmt *cap_st = NULL;
+#if defined(USE_POSTGRES) || defined(USE_MYSQL)
+    cap_st = db_prepare(db,
+        "SELECT capacity,booked_count FROM schedules WHERE id=? AND plan_id=? FOR UPDATE");
+#else
+    cap_st = db_prepare(db,
+        "SELECT capacity,booked_count FROM schedules WHERE id=? AND plan_id=?");
+#endif
+    db_bind_int(cap_st, 1, sched_id);
+    db_bind_int(cap_st, 2, plan_id);
+    if (db_step(cap_st) != 1) {
+        db_finalize(cap_st);
+        db_rollback(db);
+        cJSON_Delete(body);
+        send_error_json(c, 404, "schedule not found"); return;
+    }
+    long cap    = db_col_int(cap_st, 0);
+    long booked = db_col_int(cap_st, 1);
+    db_finalize(cap_st);
+
     if (cap - booked < total_people) {
         char msg[64];
         snprintf(msg, sizeof(msg), "空き枠が不足しています（残 %ld 席）", cap - booked);
+        db_rollback(db);
         send_error_json(c, 409, msg);
         cJSON_Delete(body); return;
     }
@@ -892,6 +910,7 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
     db_finalize(ins);
 
     if (rc == -1) {
+        db_rollback(db);
         cJSON_Delete(body);
         send_error_json(c, 500, "failed to create booking"); return;
     }
@@ -910,6 +929,8 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
         db_step(pi);
         db_finalize(pi);
     }
+
+    db_commit(db);
     cJSON_Delete(body);
 
     /* Stripe PaymentIntent 作成 */
@@ -1285,18 +1306,39 @@ void handle_search(struct mg_connection *c, struct mg_http_message *hm, DbConn *
 
 /* ─── Cancel Booking ──────────────────────────────────────────────────────── */
 
+/* YYYY-MM-DD の日付文字列から今日までの日数差を返す（負の場合は 0） */
+static long calculate_days_until(const char *date_str) {
+    int yy = 0, mm = 0, dd = 0;
+    if (sscanf(date_str, "%d-%d-%d", &yy, &mm, &dd) != 3) return 0;
+    time_t now = time(NULL);
+    struct tm today = *gmtime(&now);
+    struct tm target;
+    memset(&target, 0, sizeof(target));
+    target.tm_year = yy - 1900;
+    target.tm_mon  = mm - 1;
+    target.tm_mday = dd;
+    time_t t_target = mktime(&target);
+    time_t t_today  = mktime(&today);
+    double diff = difftime(t_target, t_today);
+    return diff > 0 ? (long)(diff / 86400.0) : 0;
+}
+
 void handle_cancel_booking(struct mg_connection *c, struct mg_http_message *hm,
                             DbConn *db, const char *id) {
     long auth_uid = require_auth(c, hm, db);
     if (auth_uid < 0) return;
 
     DbStmt *st = NULL;
+    /* col: 0=user_id, 1=status, 2=schedule_id, 3=stripe_pi_id, 4=email, 5=plan_title,
+     *      6=schedule_date, 7=total_price, 8=cancel_days_full, 9=cancel_days_partial, 10=cancel_pct_partial */
     st = db_prepare(db,
         "SELECT b.user_id, b.status, b.schedule_id, b.stripe_payment_intent_id, "
-        "u.email, p.title "
+        "u.email, p.title, s.date, b.total_price, "
+        "p.cancel_days_full, p.cancel_days_partial, p.cancel_pct_partial "
         "FROM bookings b "
         "JOIN users u ON u.id = b.user_id "
         "JOIN plans p ON p.id = b.plan_id "
+        "JOIN schedules s ON s.id = b.schedule_id "
         "WHERE b.id=?");
     db_bind_text(st, 1, id);
     if (db_step(st) != 1) {
@@ -1317,6 +1359,13 @@ void handle_cancel_booking(struct mg_connection *c, struct mg_http_message *hm,
     char plan_title[256] = {0};
     const char *ptv = db_col_text(st, 5);
     if (ptv) strncpy(plan_title, ptv, sizeof(plan_title)-1);
+    char sched_date[32] = {0};
+    const char *sdv = db_col_text(st, 6);
+    if (sdv) strncpy(sched_date, sdv, sizeof(sched_date)-1);
+    long total_price_orig   = db_col_int(st, 7);
+    long cancel_days_full   = db_col_int(st, 8);
+    long cancel_days_partial= db_col_int(st, 9);
+    long cancel_pct_partial = db_col_int(st, 10);
     db_finalize(st);
 
     if (owner_id != auth_uid) {
@@ -1324,6 +1373,18 @@ void handle_cancel_booking(struct mg_connection *c, struct mg_http_message *hm,
     }
     if (strcmp(status_buf, "cancelled") == 0) {
         send_error_json(c, 400, "既にキャンセル済みです"); return;
+    }
+
+    /* キャンセルポリシー計算 */
+    long days_until    = calculate_days_until(sched_date);
+    long refund_amount = 0;
+    const char *refund_type = "none";
+    if (days_until >= cancel_days_full) {
+        refund_amount = total_price_orig;
+        refund_type   = "full";
+    } else if (days_until >= cancel_days_partial) {
+        refund_amount = total_price_orig * cancel_pct_partial / 100;
+        refund_type   = "partial";
     }
 
     /* 参加者合計 → booked_count を戻す */
@@ -1348,12 +1409,13 @@ void handle_cancel_booking(struct mg_connection *c, struct mg_http_message *hm,
     db_bind_int(dec, 3, sched_id);
     db_step(dec); db_finalize(dec);
 
-    /* Stripe 返金（payment_intent_id がある場合） */
+    /* Stripe 返金（payment_intent_id がある場合）*/
     int refunded = 0;
-    if (pi_id[0]) {
+    if (pi_id[0] && refund_amount > 0) {
         refunded = (stripe_create_refund(pi_id) == 0) ? 1 : 0;
         if (refunded)
-            fprintf(stdout, "[stripe] refund issued for booking %s (pi=%s)\n", id, pi_id);
+            fprintf(stdout, "[stripe] refund issued for booking %s (pi=%s, amount=%ld, type=%s)\n",
+                    id, pi_id, refund_amount, refund_type);
     }
 
     /* キャンセルメール送信 */
@@ -1363,6 +1425,8 @@ void handle_cancel_booking(struct mg_connection *c, struct mg_http_message *hm,
 
     cJSON *res = cJSON_CreateObject();
     cJSON_AddStringToObject(res, "message", "予約をキャンセルしました");
+    cJSON_AddNumberToObject(res, "refund_amount", refund_amount);
+    cJSON_AddStringToObject(res, "refund_type",   refund_type);
     if (refunded) cJSON_AddBoolToObject(res, "refunded", 1);
     send_cjson(c, 200, res);
     cJSON_Delete(res);
@@ -2176,4 +2240,149 @@ void handle_auth_logout(struct mg_connection *c, struct mg_http_message *hm, DbC
         db_step(bl); db_finalize(bl);
     }
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"ログアウトしました\"}");
+}
+
+/* ─── DELETE /api/v1/users/me (PIPA 退会・データ匿名化) ─────────────────────── */
+
+void handle_delete_user_account(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    long auth_uid = require_auth(c, hm, db);
+    if (auth_uid < 0) return;
+
+    /* アクティブな予約をキャンセル */
+    DbStmt *cst = NULL;
+    cst = db_prepare(db,
+        "UPDATE bookings SET status='cancelled' WHERE user_id=? AND status NOT IN ('cancelled','refunded')");
+    db_bind_int(cst, 1, auth_uid);
+    db_step(cst); db_finalize(cst);
+
+    /* ブックマーク削除 */
+    DbStmt *bst = NULL;
+    bst = db_prepare(db, "DELETE FROM bookmarks WHERE user_id=?");
+    db_bind_int(bst, 1, auth_uid);
+    db_step(bst); db_finalize(bst);
+
+    /* レビュー削除 */
+    DbStmt *rst = NULL;
+    rst = db_prepare(db, "DELETE FROM reviews WHERE user_id=?");
+    db_bind_int(rst, 1, auth_uid);
+    db_step(rst); db_finalize(rst);
+
+    /* ウェイトリスト削除 */
+    DbStmt *wst = NULL;
+    wst = db_prepare(db, "DELETE FROM waitlist WHERE user_id=?");
+    db_bind_int(wst, 1, auth_uid);
+    db_step(wst); db_finalize(wst);
+
+    /* ユーザー匿名化（財務監査のため予約レコードは残す） */
+    char anon_email[64];
+    snprintf(anon_email, sizeof(anon_email), "deleted_%ld@deleted.invalid", auth_uid);
+    DbStmt *ust = NULL;
+    ust = db_prepare(db,
+        "UPDATE users SET email=?, name='退会済みユーザー', phone=NULL, password_hash='deleted'"
+        " WHERE id=?");
+    db_bind_text(ust, 1, anon_email);
+    db_bind_int(ust, 2, auth_uid);
+    db_step(ust); db_finalize(ust);
+
+    send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"アカウントを削除しました\"}");
+}
+
+/* ─── GET /api/v1/users/me/export (PIPA データエクスポート CSV) ─────────────── */
+
+void handle_export_user_data(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    long auth_uid = require_auth(c, hm, db);
+    if (auth_uid < 0) return;
+
+    /* バッファに CSV を組み立てる */
+    char *buf  = NULL;
+    size_t len = 0;
+    size_t cap = 65536;
+    buf = (char *)malloc(cap);
+    if (!buf) { send_error_json(c, 500, "memory error"); return; }
+    buf[0] = '\0';
+
+#define CSV_APPEND(fmt, ...) do { \
+    int _n = snprintf(buf + len, cap - len, fmt, ##__VA_ARGS__); \
+    if (_n > 0) len += (size_t)_n; \
+    if (len + 4096 > cap) { \
+        cap *= 2; \
+        char *_nb = (char *)realloc(buf, cap); \
+        if (!_nb) { free(buf); send_error_json(c, 500, "memory error"); return; } \
+        buf = _nb; \
+    } \
+} while (0)
+
+    /* ── ユーザー情報 ── */
+    CSV_APPEND("# ユーザー情報\r\n");
+    CSV_APPEND("id,name,email,created_at\r\n");
+    DbStmt *ust = NULL;
+    ust = db_prepare(db, "SELECT id,name,email,created_at FROM users WHERE id=?");
+    db_bind_int(ust, 1, auth_uid);
+    if (db_step(ust) == 1) {
+        CSV_APPEND("%lld,\"%s\",\"%s\",\"%s\"\r\n",
+            (long long)db_col_int(ust, 0),
+            db_col_text(ust, 1) ? db_col_text(ust, 1) : "",
+            db_col_text(ust, 2) ? db_col_text(ust, 2) : "",
+            db_col_text(ust, 3) ? db_col_text(ust, 3) : "");
+    }
+    db_finalize(ust);
+
+    /* ── 予約履歴 ── */
+    CSV_APPEND("\r\n# 予約履歴\r\n");
+    CSV_APPEND("id,plan_title,date,status,total_price,created_at\r\n");
+    DbStmt *bst = NULL;
+    bst = db_prepare(db,
+        "SELECT b.id, p.title, s.date, b.status, b.total_price, b.created_at "
+        "FROM bookings b "
+        "JOIN plans p ON p.id = b.plan_id "
+        "JOIN schedules s ON s.id = b.schedule_id "
+        "WHERE b.user_id=? ORDER BY b.created_at DESC");
+    db_bind_int(bst, 1, auth_uid);
+    while (db_step(bst) == 1) {
+        CSV_APPEND("\"%s\",\"%s\",\"%s\",\"%s\",%lld,\"%s\"\r\n",
+            db_col_text(bst, 0) ? db_col_text(bst, 0) : "",
+            db_col_text(bst, 1) ? db_col_text(bst, 1) : "",
+            db_col_text(bst, 2) ? db_col_text(bst, 2) : "",
+            db_col_text(bst, 3) ? db_col_text(bst, 3) : "",
+            (long long)db_col_int(bst, 4),
+            db_col_text(bst, 5) ? db_col_text(bst, 5) : "");
+    }
+    db_finalize(bst);
+
+    /* ── レビュー ── */
+    CSV_APPEND("\r\n# レビュー\r\n");
+    CSV_APPEND("plan_title,rating,comment,created_at\r\n");
+    DbStmt *rst = NULL;
+    rst = db_prepare(db,
+        "SELECT p.title, r.rating, r.comment, r.created_at "
+        "FROM reviews r JOIN plans p ON p.id = r.plan_id "
+        "WHERE r.user_id=? ORDER BY r.created_at DESC");
+    db_bind_int(rst, 1, auth_uid);
+    while (db_step(rst) == 1) {
+        CSV_APPEND("\"%s\",%lld,\"%s\",\"%s\"\r\n",
+            db_col_text(rst, 0) ? db_col_text(rst, 0) : "",
+            (long long)db_col_int(rst, 1),
+            db_col_text(rst, 2) ? db_col_text(rst, 2) : "",
+            db_col_text(rst, 3) ? db_col_text(rst, 3) : "");
+    }
+    db_finalize(rst);
+
+#undef CSV_APPEND
+
+    /* 今日の日付をファイル名に付ける */
+    time_t now = time(NULL);
+    char date_str[16];
+    strftime(date_str, sizeof(date_str), "%Y-%m-%d", gmtime(&now));
+    char disp[64];
+    snprintf(disp, sizeof(disp), "attachment; filename=\"my_data_%s.csv\"", date_str);
+
+    char hdrs[256];
+    snprintf(hdrs, sizeof(hdrs),
+        "Content-Type: text/csv; charset=UTF-8\r\n"
+        "Content-Disposition: %s\r\n"
+        "Access-Control-Allow-Origin: *\r\n",
+        disp);
+
+    mg_http_reply(c, 200, hdrs, "%.*s", (int)len, buf);
+    free(buf);
 }
