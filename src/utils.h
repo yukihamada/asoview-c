@@ -19,8 +19,8 @@ int   str_starts_with(const char *s, const char *prefix);
 char *jwt_create(long user_id, const char *secret);
 long  jwt_verify(const char *token, const char *secret);
 
-/* LIKE パターンの % _ \ をエスケープ（バックスラッシュ方式）
-   SQLite LIKE ... ESCAPE '\\' と組み合わせて使う */
+/* LIKE パターンの % _ ! をエスケープ（'!' エスケープ文字方式、全バックエンド共通）
+   LIKE ... ESCAPE '!' と組み合わせて使う */
 void escape_like(const char *src, char *dst, size_t dst_len);
 
 /* メールアドレスの簡易バリデーション */

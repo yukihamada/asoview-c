@@ -1603,7 +1603,7 @@ void handle_stripe_webhook(struct mg_connection *c, struct mg_http_message *hm,
         /* 処理済みとして記録 */
         DbStmt *ins = NULL;
         ins = db_prepare(db,
-            "INSERT INTO webhook_events(event_id) VALUES(?) ON CONFLICT DO NOTHING");
+            SQL_INSERT_OR_IGNORE " INTO webhook_events(event_id) VALUES(?)" SQL_ON_CONFLICT_IGNORE);
         db_bind_text(ins, 1, evt_id);
         db_step(ins); db_finalize(ins);
     }
@@ -1751,7 +1751,7 @@ void handle_create_bookmark(struct mg_connection *c, struct mg_http_message *hm,
 
     DbStmt *ins = NULL;
     ins = db_prepare(db,
-        "INSERT INTO bookmarks(user_id,plan_id) VALUES(?,?) ON CONFLICT DO NOTHING");
+        SQL_INSERT_OR_IGNORE " INTO bookmarks(user_id,plan_id) VALUES(?,?)" SQL_ON_CONFLICT_IGNORE);
     db_bind_int(ins, 1, auth_uid);
     db_bind_int(ins, 2, plan_id);
     db_step(ins);

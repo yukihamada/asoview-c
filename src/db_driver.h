@@ -49,6 +49,9 @@ const char  *db_errmsg(DbConn *db);
 #define SQL_FTS_MATCH(col, param) \
     "(search_vector @@ plainto_tsquery('simple', " param "))"
 #define SQL_USES_POSTGRES_FTS 1
+/* INSERT 重複無視: PostgreSQL は ON CONFLICT DO NOTHING */
+#define SQL_INSERT_OR_IGNORE  "INSERT"
+#define SQL_ON_CONFLICT_IGNORE " ON CONFLICT DO NOTHING"
 
 /* ─── MySQL ─ (db_mysql.c で実装) ────────────────────────────────────────── */
 #elif defined(USE_MYSQL)
@@ -82,6 +85,9 @@ const char  *db_errmsg(DbConn *db);
 /* FTS: MySQL は FULLTEXT か LIKE フォールバック */
 #define SQL_FTS_MATCH(col, param) \
     "(p.title LIKE CONCAT('%'," param ",'%') OR p.description LIKE CONCAT('%'," param ",'%') OR v.name LIKE CONCAT('%'," param ",'%'))"
+/* INSERT 重複無視: MySQL は INSERT IGNORE INTO ... (末尾何も付けない) */
+#define SQL_INSERT_OR_IGNORE  "INSERT IGNORE"
+#define SQL_ON_CONFLICT_IGNORE ""
 
 /* ─── SQLite（デフォルト）─ inline ラッパー ──────────────────────────────── */
 #else
@@ -100,6 +106,9 @@ typedef sqlite3_stmt  DbStmt;
 /* FTS: SQLite は FTS5 の plans_fts を使用 */
 #define SQL_FTS_MATCH(col, param) \
     "(p.id IN (SELECT rowid FROM plans_fts WHERE plans_fts MATCH " param "))"
+/* INSERT 重複無視: SQLite は INSERT OR IGNORE INTO ... */
+#define SQL_INSERT_OR_IGNORE  "INSERT OR IGNORE"
+#define SQL_ON_CONFLICT_IGNORE ""
 
 /* Inline ラッパー: PgSQL/MySQL 版と同じ名前で使える ─────────────────────── */
 

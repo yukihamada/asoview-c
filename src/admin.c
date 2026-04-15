@@ -808,7 +808,7 @@ void handle_admin_list_users(struct mg_connection *c, struct mg_http_message *hm
 
     DbStmt *ct = NULL;
     ct = db_prepare(db,
-        "SELECT COUNT(*) FROM users WHERE (? = 0 OR email LIKE ? ESCAPE '\\')");
+        "SELECT COUNT(*) FROM users WHERE (? = 0 OR email LIKE ? ESCAPE '!')");
     db_bind_int(ct, 1, has_q); db_bind_text(ct, 2, kw);
     db_step(ct);
     long total = db_col_int(ct, 0);
@@ -819,7 +819,7 @@ void handle_admin_list_users(struct mg_connection *c, struct mg_http_message *hm
         "SELECT u.id, u.name, u.email, u.created_at, "
         "(SELECT COUNT(*) FROM bookings b WHERE b.user_id=u.id AND b.status='confirmed') AS booking_count "
         "FROM users u "
-        "WHERE (? = 0 OR u.email LIKE ? ESCAPE '\\') "
+        "WHERE (? = 0 OR u.email LIKE ? ESCAPE '!') "
         "ORDER BY u.id LIMIT ? OFFSET ?");
     db_bind_int(st, 1, has_q); db_bind_text(st, 2, kw);
     db_bind_int(st, 3, limit); db_bind_int(st, 4, offset);
