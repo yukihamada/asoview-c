@@ -17,6 +17,7 @@
 #include "setup.h"
 #include "webhooks.h"
 #include "mailer.h"
+#include "portal.h"
 
 #define MAX_BODY_BYTES (64 * 1024)  /* 64 KB リクエストボディ上限 */
 
@@ -772,30 +773,62 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
         if (IS_DELETE) handle_admin_delete_tenant(c, hm, db, id);
 
     /* ── OpenAPI スペック ────────────────────────────────────────────────── */
-    } else if (strcmp(uri, "/api/v1/openapi.json") == 0 ||
+    } else if (strcmp(uri, "/openapi.yaml") == 0 ||
+               strcmp(uri, "/api/v1/openapi.json") == 0 ||
                strcmp(uri, "/openapi.json") == 0) {
-        /* openapi.yml を読み込んで返す（開発用ルート — 本番では静的配信推奨） */
         if (IS_GET) {
-            FILE *f = fopen("openapi.yml", "r");
-            if (!f) f = fopen("/app/openapi.yml", "r");
+            FILE *f = fopen("openapi.yaml", "r");
+            if (!f) f = fopen("/app/openapi.yaml", "r");
+            if (!f) f = fopen("openapi.yml",  "r");
+            if (!f) f = fopen("/app/openapi.yml",  "r");
             if (f) {
                 fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
                 char *yml = malloc((size_t)sz + 1);
                 if (yml) {
                     fread(yml, 1, (size_t)sz, f); yml[sz] = '\0';
+                    const char *ct = strstr(uri, ".json")
+                        ? "application/json" : "text/yaml; charset=UTF-8";
                     mg_http_reply(c, 200,
-                        "Content-Type: text/plain; charset=UTF-8\r\n"
+                        "Content-Type: %s\r\n"
                         "Access-Control-Allow-Origin: *\r\n",
-                        "%s", yml);
+                        ct, "%s", yml);
                     free(yml);
                 } else {
                     send_error_json(c, 500, "OOM");
                 }
                 fclose(f);
             } else {
-                send_error_json(c, 404, "openapi.yml not found");
+                send_error_json(c, 404, "openapi.yaml not found");
             }
         }
+
+    /* ── API ドキュメント（Scalar UI） ──────────────────────────────────── */
+    } else if (strcmp(uri, "/docs") == 0 || strcmp(uri, "/docs/") == 0) {
+        if (IS_GET) {
+            static const char DOCS_HTML[] =
+"<!DOCTYPE html>\n"
+"<html>\n"
+"<head>\n"
+"<meta charset='UTF-8'>\n"
+"<meta name='viewport' content='width=device-width,initial-scale=1'>\n"
+"<title>Asoview API Reference</title>\n"
+"<style>body{margin:0;}</style>\n"
+"</head>\n"
+"<body>\n"
+"<script id='api-reference' data-url='/openapi.yaml'></script>\n"
+"<script src='https://cdn.jsdelivr.net/npm/@scalar/api-reference'></script>\n"
+"</body>\n"
+"</html>\n";
+            mg_http_reply(c, 200,
+                "Content-Type: text/html; charset=UTF-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", DOCS_HTML);
+        }
+
+    /* ── ユーザーポータル ─────────────────────────────────────────────── */
+    } else if (strcmp(uri, "/ui") == 0 || strcmp(uri, "/ui/") == 0 ||
+               strcmp(uri, "/") == 0) {
+        if (IS_GET) handle_portal(c, hm, db);
 
     /* ── セットアップウィザード ───────────────────────────────────────────── */
     } else if (strcmp(uri, "/setup") == 0 || strcmp(uri, "/setup/") == 0) {
