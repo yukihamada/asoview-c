@@ -256,15 +256,71 @@ curl http://localhost:3001/api/v1/health
 # {"status":"ok","db":"ok"}
 ```
 
-### 4. Nginx で TLS を終端する
+### 4. リバースプロキシ + TLS
+
+#### Nginx
 
 ```nginx
-location / {
-    proxy_pass http://127.0.0.1:3001;
+# /etc/nginx/sites-available/asoview
+server {
+    listen 443 ssl http2;
+    server_name yourdomain.com;
+
+    ssl_certificate     /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/yourdomain.com/privkey.pem;
+
+    # gzip（asoview-c 側でも圧縮するが二重圧縮防止）
+    gzip off;
+
+    location / {
+        proxy_pass         http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        # Stripe Webhook 用にボディを保持
+        proxy_request_buffering off;
+        # 大きなファイルアップロード対応
+        client_max_body_size 20m;
+    }
+}
+
+server {
+    listen 80;
+    server_name yourdomain.com;
+    return 301 https://$host$request_uri;
 }
 ```
 
-詳細は [docs/deployment.md](docs/deployment.md) を参照。
+```bash
+# Let's Encrypt 証明書取得
+certbot --nginx -d yourdomain.com
+systemctl reload nginx
+```
+
+#### Caddy（推奨・自動 HTTPS）
+
+```caddyfile
+# /etc/caddy/Caddyfile
+yourdomain.com {
+    reverse_proxy localhost:3001
+}
+```
+
+```bash
+systemctl enable --now caddy
+```
+
+#### ファイアウォール
+
+```bash
+# 3001 番は外部に開けない（nginx/caddy のみ許可）
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw deny 3001/tcp
+ufw enable
+```
 
 ---
 
