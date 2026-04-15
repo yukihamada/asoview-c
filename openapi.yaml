@@ -50,6 +50,10 @@ tags:
     description: Stripe Webhook
   - name: admin
     description: 管理者API（X-Admin-Key必須）
+  - name: checkout
+    description: Stripe Checkout（決済フロー）
+  - name: waitlist
+    description: ウェイトリスト
 
 paths:
   /api/v1/health:
@@ -1101,6 +1105,202 @@ paths:
                   total: { type: integer }
         "403": { description: 管理者キーエラー }
 
+  /api/v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: JWT リフレッシュ（有効期限の延長）
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: 新しいトークンを発行
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  message: { type: string }
+        "401": { description: 未認証 }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: ログアウト（JWT をブラックリストに追加）
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: ログアウト成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+        "401": { description: 未認証 }
+
+  /api/v1/checkout/session:
+    post:
+      tags: [bookings]
+      summary: Stripe Checkout Session 作成（¥50,000 固定）
+      description: |
+        4ページ目の決済フロー用。Stripe Hosted Checkout ページへのリダイレクト URL を返す。
+        決済完了後、`success_url` にリダイレクトされる。
+        `checkout.session.completed` webhook を受信すると booking の status が `confirmed` に更新される。
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                success_url:
+                  type: string
+                  format: uri
+                  description: 決済完了後のリダイレクト先（省略時は /payment/success）
+                cancel_url:
+                  type: string
+                  format: uri
+                  description: キャンセル時のリダイレクト先（省略時は /payment/cancel）
+                metadata:
+                  type: object
+                  description: Stripe metadata に追加するキーバリューペア
+      responses:
+        "200":
+          description: Checkout Session 作成成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id: { type: string, example: "cs_test_..." }
+                  url: { type: string, format: uri, description: Stripe Checkout ページ URL }
+                  amount: { type: integer, example: 50000 }
+        "400": { description: 不正な URL（SSRF 防止） }
+        "401": { description: 未認証 }
+        "502": { description: Stripe API エラー }
+
+  /api/v1/waitlist:
+    post:
+      tags: [bookings]
+      summary: ウェイトリスト登録
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [schedule_id]
+              properties:
+                schedule_id: { type: integer }
+      responses:
+        "201":
+          description: 登録成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  user_id: { type: integer }
+                  schedule_id: { type: integer }
+                  position: { type: integer, description: 現在の順位 }
+                  message: { type: string }
+        "400": { description: schedule_id 欠落 }
+        "401": { description: 未認証 }
+        "404": { description: スケジュールが存在しない }
+        "409": { description: 既に登録済み }
+
+  /api/v1/waitlist/schedule/{schedule_id}:
+    get:
+      tags: [bookings]
+      summary: ウェイトリスト一覧取得
+      parameters:
+        - name: schedule_id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: ウェイトリスト一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  schedule_id: { type: integer }
+                  waitlist:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        user_id: { type: integer }
+                        user_name: { type: string }
+                        schedule_id: { type: integer }
+                        position: { type: integer }
+                        created_at: { type: string, format: date-time }
+
+  /api/v1/waitlist/{id}:
+    delete:
+      tags: [bookings]
+      summary: ウェイトリストから削除（自分のエントリのみ）
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { description: 削除成功 }
+        "401": { description: 未認証 }
+        "404": { description: 見つからない（他人のエントリ含む） }
+
+  /api/v1/admin/upload-url:
+    post:
+      tags: [admin]
+      summary: S3 Presigned URL 取得（画像アップロード用）
+      description: AWS S3 / 互換ストレージの署名付き PUT URL を返す。`AWS_S3_BUCKET` 等が未設定の場合は 503。
+      security: [{ adminAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filename, content_type]
+              properties:
+                filename: { type: string, example: "photo.jpg" }
+                content_type: { type: string, example: "image/jpeg" }
+      responses:
+        "200":
+          description: Presigned URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  upload_url: { type: string, format: uri }
+                  public_url: { type: string, format: uri }
+                  expires_in: { type: integer, description: 有効秒数 }
+        "400": { description: パラメータ不足 }
+        "403": { description: 管理者キーエラー }
+        "503": { description: S3 設定未完了 }
+
+  /api/v1/metrics:
+    get:
+      tags: [admin]
+      summary: Prometheus メトリクス
+      description: Prometheus フォーマットのメトリクスを返す。`/metrics` エンドポイントとしてスクレイプ可能。
+      responses:
+        "200":
+          description: Prometheus テキストフォーマット
+          content:
+            text/plain:
+              schema:
+                type: string
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1108,6 +1308,10 @@ components:
       scheme: bearer
       bearerFormat: JWT
     adminKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+    adminAuth:
       type: apiKey
       in: header
       name: X-Admin-Key

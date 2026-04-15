@@ -109,6 +109,104 @@ int stripe_create_payment_intent(long amount_jpy,
     return ok ? 0 : -1;
 }
 
+/* ─── Stripe Checkout Session 作成 ───────────────────────────────── */
+
+int stripe_create_checkout_session(long amount_jpy,
+                                   const char *metadata_key,
+                                   const char *metadata_val,
+                                   const char *success_url,
+                                   const char *cancel_url,
+                                   char *session_id_out, size_t sid_size,
+                                   char *url_out,        size_t url_size) {
+    const char *sk = getenv("STRIPE_SECRET_KEY");
+    if (!sk || !*sk) return -1;
+
+    CURL *curl = curl_easy_init();
+    if (!curl) return -1;
+
+    /* URL-encode helper — only alphanumeric and -_.~ are safe; encode ':' '/' '?' '=' '&' */
+    char su_enc[512] = {0}, cu_enc[512] = {0};
+    {
+        /* simple percent-encode */
+        const char *safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:/?#[]@!$&'()*+,;=";
+        const char *src; char *dst;
+        for (src = success_url, dst = su_enc; *src && (dst - su_enc) < 500; src++) {
+            if (strchr(safe, *src)) *dst++ = *src;
+            else { snprintf(dst, 4, "%%%02X", (unsigned char)*src); dst += 3; }
+        }
+        for (src = cancel_url, dst = cu_enc; *src && (dst - cu_enc) < 500; src++) {
+            if (strchr(safe, *src)) *dst++ = *src;
+            else { snprintf(dst, 4, "%%%02X", (unsigned char)*src); dst += 3; }
+        }
+    }
+
+    char post[1024];
+    snprintf(post, sizeof(post),
+        "mode=payment"
+        "&line_items[0][price_data][currency]=jpy"
+        "&line_items[0][price_data][unit_amount]=%ld"
+        "&line_items[0][price_data][product_data][name]=%%E3%%82%%A2%%E3%%82%%AF%%E3%%83%%86%%E3%%82%%A3%%E3%%83%%93%%E3%%83%%86%%E3%%82%%A3%%E4%%BA%%88%%E7%%B4%%84"
+        "&line_items[0][quantity]=1"
+        "&success_url=%s"
+        "&cancel_url=%s"
+        "&metadata[%s]=%s",
+        amount_jpy,
+        su_enc, cu_enc,
+        metadata_key ? metadata_key : "ref",
+        metadata_val ? metadata_val : "");
+
+    char auth_hdr[256];
+    snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s", sk);
+
+    struct curl_slist *hdrs = NULL;
+    hdrs = curl_slist_append(hdrs, auth_hdr);
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/x-www-form-urlencoded");
+
+    Buf buf = { calloc(1, 1024), 0, 1024 };
+
+    curl_easy_setopt(curl, CURLOPT_URL,
+                     "https://api.stripe.com/v1/checkout/sessions");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER,    hdrs);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    post);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &buf);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT,       10L);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK || !buf.data) {
+        fprintf(stderr, "[stripe] checkout curl error: %s\n", curl_easy_strerror(res));
+        free(buf.data);
+        return -1;
+    }
+
+    cJSON *j = cJSON_Parse(buf.data);
+    free(buf.data);
+    if (!j) return -1;
+
+    cJSON *err = cJSON_GetObjectItem(j, "error");
+    if (err) {
+        const char *msg = cJSON_GetStringValue(cJSON_GetObjectItem(err, "message"));
+        fprintf(stderr, "[stripe] checkout API error: %s\n", msg ? msg : "(unknown)");
+        cJSON_Delete(j);
+        return -1;
+    }
+
+    const char *id  = cJSON_GetStringValue(cJSON_GetObjectItem(j, "id"));
+    const char *url = cJSON_GetStringValue(cJSON_GetObjectItem(j, "url"));
+
+    int ok = 0;
+    if (id && url) {
+        strncpy(session_id_out, id,  sid_size - 1); session_id_out[sid_size - 1] = '\0';
+        strncpy(url_out,        url, url_size  - 1); url_out[url_size  - 1] = '\0';
+        ok = 1;
+    }
+    cJSON_Delete(j);
+    return ok ? 0 : -1;
+}
+
 /* ─── Stripe Refund 作成 ──────────────────────────────────────────── */
 
 int stripe_create_refund(const char *payment_intent_id) {

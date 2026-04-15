@@ -157,12 +157,14 @@ char *jwt_create(long user_id, const char *secret) {
     char hdr_b64[64];
     b64url_encode((const uint8_t*)hdr, strlen(hdr), hdr_b64);
 
-    /* payload */
+    /* payload — jti は乱数で一意性を保証（同秒内の複数発行でも衝突しない） */
     time_t now = time(NULL);
     time_t exp = now + 7*24*3600;
-    char pay[128];
+    unsigned jti = (unsigned)rand() ^ (unsigned)(now & 0xFFFF);
+    char pay[160];
     snprintf(pay, sizeof(pay),
-             "{\"sub\":\"%ld\",\"iat\":%ld,\"exp\":%ld}", user_id, (long)now, (long)exp);
+             "{\"sub\":\"%ld\",\"iat\":%ld,\"exp\":%ld,\"jti\":%u}",
+             user_id, (long)now, (long)exp, jti);
     char pay_b64[256];
     b64url_encode((const uint8_t*)pay, strlen(pay), pay_b64);
 

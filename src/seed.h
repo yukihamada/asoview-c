@@ -1,5 +1,5 @@
 #pragma once
-#include <sqlite3.h>
+#include "db_driver.h"
 
 /* DB が空なら初期データを挿入する */
-int seed_if_empty(sqlite3 *db);
+int seed_if_empty(DbConn *db);

@@ -3,39 +3,34 @@
 #include <stdio.h>
 #include <string.h>
 
-static int exec(sqlite3 *db, const char *sql) {
-    char *err = NULL;
-    int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "[seed] %s\n", err ? err : "unknown");
-        sqlite3_free(err);
-        return -1;
-    }
-    return 0;
-}
-
-static int insert_schedule(sqlite3 *db, long plan_id, const char *date,
-                           const char *start, const char *end, int cap) {
-    sqlite3_stmt *s;
-    sqlite3_prepare_v2(db,
-        "INSERT INTO schedules (plan_id,date,start_time,end_time,capacity) VALUES(?,?,?,?,?)",
-        -1, &s, NULL);
-    sqlite3_bind_int64(s, 1, plan_id);
-    sqlite3_bind_text(s, 2, date,  -1, SQLITE_STATIC);
-    sqlite3_bind_text(s, 3, start, -1, SQLITE_STATIC);
-    sqlite3_bind_text(s, 4, end,   -1, SQLITE_STATIC);
-    sqlite3_bind_int(s, 5, cap);
-    int rc = sqlite3_step(s) == SQLITE_DONE ? 0 : -1;
-    sqlite3_finalize(s);
+static int exec(DbConn *db, const char *sql) {
+    int rc = db_exec(db, sql);
+    if (rc != 0)
+        fprintf(stderr, "[seed] exec failed: %s\n", sql);
     return rc;
 }
 
-int seed_if_empty(sqlite3 *db) {
+static int insert_schedule(DbConn *db, long plan_id, const char *date,
+                           const char *start, const char *end, int cap) {
+    DbStmt *s = NULL;
+    s = db_prepare(db,
+        "INSERT INTO schedules (plan_id,date,start_time,end_time,capacity) VALUES(?,?,?,?,?)");
+    db_bind_int(s, 1, plan_id);
+    db_bind_text(s, 2, date);
+    db_bind_text(s, 3, start);
+    db_bind_text(s, 4, end);
+    db_bind_int(s, 5, cap);
+    int rc = db_step(s) == 0 ? 0 : -1;
+    db_finalize(s);
+    return rc;
+}
+
+int seed_if_empty(DbConn *db) {
     long count = 0;
-    sqlite3_stmt *s;
-    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM areas", -1, &s, NULL);
-    if (sqlite3_step(s) == SQLITE_ROW) count = sqlite3_column_int64(s, 0);
-    sqlite3_finalize(s);
+    DbStmt *s = NULL;
+    s = db_prepare(db, "SELECT COUNT(*) FROM areas");
+    if (db_step(s) == 1) count = db_col_int(s, 0);
+    db_finalize(s);
     if (count > 0) return 0;
 
     /* ─── Areas ───────────────────────────────────────────────────────
@@ -573,21 +568,20 @@ int seed_if_empty(sqlite3 *db) {
     char hash[128];
     hash_password("password123", hash, sizeof(hash));
 
-    sqlite3_stmt *us;
-    sqlite3_prepare_v2(db,
-        "INSERT INTO users(email,name,phone,password_hash) VALUES(?,?,?,?)",
-        -1, &us, NULL);
-    sqlite3_bind_text(us, 1, "taro@example.com",   -1, SQLITE_STATIC);
-    sqlite3_bind_text(us, 2, "田中太郎",            -1, SQLITE_STATIC);
-    sqlite3_bind_text(us, 3, "090-1234-5678",       -1, SQLITE_STATIC);
-    sqlite3_bind_text(us, 4, hash,                  -1, SQLITE_TRANSIENT);
-    sqlite3_step(us); sqlite3_reset(us);
+    DbStmt *us = NULL;
+    us = db_prepare(db,
+        "INSERT INTO users(email,name,phone,password_hash) VALUES(?,?,?,?)");
+    db_bind_text(us, 1, "taro@example.com");
+    db_bind_text(us, 2, "田中太郎");
+    db_bind_text(us, 3, "090-1234-5678");
+    db_bind_text(us, 4, hash);
+    db_step(us); db_reset(us);
 
-    sqlite3_bind_text(us, 1, "hanako@example.com",  -1, SQLITE_STATIC);
-    sqlite3_bind_text(us, 2, "山田花子",            -1, SQLITE_STATIC);
-    sqlite3_bind_text(us, 3, "090-8765-4321",       -1, SQLITE_STATIC);
-    sqlite3_bind_text(us, 4, hash,                  -1, SQLITE_TRANSIENT);
-    sqlite3_step(us); sqlite3_finalize(us);
+    db_bind_text(us, 1, "hanako@example.com");
+    db_bind_text(us, 2, "山田花子");
+    db_bind_text(us, 3, "090-8765-4321");
+    db_bind_text(us, 4, hash);
+    db_step(us); db_finalize(us);
 
     /* ─── Pre-seeded reviews（リアルなレビューデータ）──────────────── */
     /* user_id 1 = taro, 2 = hanako */

@@ -12,14 +12,23 @@
 ```bash
 git clone <repo>
 cd asoview-c
-make release
-# → ./asoview-c (statically-linked binary)
+make schema   # schema_embed.h を生成
+make          # → ./asoview-c
+```
+
+### PostgreSQL / MySQL バックエンド
+
+```bash
+# PostgreSQL
+make DB=postgres
+# MySQL
+make DB=mysql
 ```
 
 ### Cross-compile (ARM / musl)
 
 ```bash
-CC=aarch64-linux-musl-gcc make release
+CC=aarch64-linux-musl-gcc make
 ```
 
 ## 2. Environment Variables
@@ -29,12 +38,22 @@ CC=aarch64-linux-musl-gcc make release
 | `JWT_SECRET` | **Required in prod** | insecure default | JWT signing key (≥32 chars) |
 | `ADMIN_KEY` | **Required in prod** | insecure default | X-Admin-Key value |
 | `PORT` | No | `3001` | Listen port |
-| `DATABASE_URL` | No | `asoview.db` | SQLite file path |
+| `DATABASE_URL` | No | `asoview.db` | SQLite ファイルパス または `postgres://...` / `mysql://...` URI |
+| `CORS_ORIGIN` | No | `*` | 許可するオリジン（例: `https://yourdomain.com`）未設定で警告ログ出力 |
 | `RESEND_API_KEY` | No | — | Resend email API key |
 | `RESEND_FROM` | No | `noreply@example.com` | From address |
-| `FRONTEND_URL` | No | `http://localhost:3000` | Used in password reset email links |
+| `FRONTEND_URL` | No | `http://localhost:3000` | パスワードリセットメール内のリンクに使用 |
 | `STRIPE_SECRET_KEY` | No | — | Stripe secret key (sk_live_…) |
 | `STRIPE_WEBHOOK_SECRET` | No | — | Stripe webhook signing secret (whsec_…) |
+| `AWS_ACCESS_KEY_ID` | No | — | S3 画像アップロード用 |
+| `AWS_SECRET_ACCESS_KEY` | No | — | S3 画像アップロード用 |
+| `AWS_S3_BUCKET` | No | — | S3 バケット名 |
+| `AWS_S3_REGION` | No | `ap-northeast-1` | S3 リージョン |
+| `MYSQL_HOST` | MySQL時 | `127.0.0.1` | MySQL ホスト（`DB=mysql` ビルド時） |
+| `MYSQL_PORT` | MySQL時 | `3306` | MySQL ポート |
+| `MYSQL_USER` | MySQL時 | `root` | MySQL ユーザー |
+| `MYSQL_PASSWORD` | MySQL時 | — | MySQL パスワード |
+| `MYSQL_DATABASE` | MySQL時 | `asoview` | MySQL データベース名 |
 
 Create a `.env` file (never commit this):
 

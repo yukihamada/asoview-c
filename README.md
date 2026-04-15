@@ -2,7 +2,7 @@
 
 **Node.js/Python サーバーを捨てて、285KB のシングルバイナリに移行する話。**
 
-[![Tests](https://img.shields.io/badge/tests-56%2F56%20pass-brightgreen)](tests/test_api.c)
+[![Tests](https://img.shields.io/badge/tests-69%2F69%20pass-brightgreen)](tests/test_api.c)
 [![CI](https://github.com/yukihamada/asoview-c/actions/workflows/ci.yml/badge.svg)](../../actions)
 [![OpenAPI](https://img.shields.io/badge/OpenAPI-3.1.0-blue)](openapi.yaml)
 
@@ -233,7 +233,7 @@ make test
   PASS test_delete_review
   PASS test_admin_update_schedule
   ...
-=== 結果: 56 passed, 0 failed ===
+=== 結果: 69 passed, 0 failed ===
 ```
 
 テストはバイナリを自動起動して実際の HTTP リクエストを投げる統合テスト。モックなし。

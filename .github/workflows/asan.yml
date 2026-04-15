@@ -1,0 +1,36 @@
+name: ASAN / UBSAN
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  asan:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libcurl4-openssl-dev \
+            libssl-dev clang
+
+      - name: Generate schema embed
+        run: python3 scripts/gen_schema_embed.py
+
+      - name: Build with ASAN + UBSAN
+        run: |
+          make CC=clang test-asan
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+      - name: Run ASAN tests
+        run: |
+          ASAN_OPTIONS=detect_leaks=0 ./tests/run_tests_asan
+        env:
+          JWT_SECRET: test-secret-for-asan-at-least-32-chars
+          ADMIN_KEY: asoview-admin-dev

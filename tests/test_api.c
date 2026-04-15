@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <curl/curl.h>
+#include <time.h>
 /* cJSON はコンパイル時に deps/ から */
 #include "../deps/cJSON.h"
 
@@ -226,6 +227,111 @@ static Resp http_patch_auth_body(const char *url, const char *json_body, const c
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_perform(curl);
+    Resp r = { buf.data, 0 };
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    return r;
+}
+
+/* ─── レスポンスヘッダーキャプチャ用グローバル ───────────────────────────── */
+static char        g_captured_header_val[256] = {0};
+static const char *g_header_to_capture        = NULL;
+
+static size_t generic_header_cb(void *ptr, size_t sz, size_t nmemb, void *ud) {
+    (void)ud;
+    size_t len = sz * nmemb;
+    if (!g_header_to_capture) return len;
+    char line[512] = {0};
+    size_t cp = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
+    memcpy(line, ptr, cp);
+    size_t hl = strlen(g_header_to_capture);
+    if (strncasecmp(line, g_header_to_capture, hl) == 0 && line[hl] == ':') {
+        char *val = line + hl + 1;
+        while (*val == ' ') val++;
+        size_t vl = strlen(val);
+        while (vl > 0 && (val[vl-1] == '\r' || val[vl-1] == '\n')) { val[--vl] = '\0'; }
+        strncpy(g_captured_header_val, val, sizeof(g_captured_header_val) - 1);
+        g_captured_header_val[sizeof(g_captured_header_val) - 1] = '\0';
+    }
+    return len;
+}
+
+/* 特定のレスポンスヘッダーをキャプチャする GET */
+static Resp http_get_capture_header(const char *url, const char *header_name) {
+    CURL *curl = curl_easy_init();
+    Buf buf = { malloc(1), 0 };
+    g_header_to_capture = header_name;
+    g_captured_header_val[0] = '\0';
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, generic_header_cb);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, NULL);
+    curl_easy_perform(curl);
+    g_header_to_capture = NULL;
+    Resp r = { buf.data, 0 };
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
+    curl_easy_cleanup(curl);
+    return r;
+}
+
+/* If-None-Match ヘッダー付き GET（ETag 検証用） */
+static Resp http_get_if_none_match(const char *url, const char *etag) {
+    return http_get_with_header(url, "If-None-Match", etag);
+}
+
+/* ─── Stripe Webhook テスト用ヘルパー ──────────────────────────────────── */
+extern void platform_hmac_sha256(const char *key, size_t klen,
+                                  const void *data, size_t dlen,
+                                  void *mac_out);
+#define WH_HMAC_LEN 32
+
+static void hex_encode_wh(const unsigned char *src, size_t len, char *out) {
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        out[i*2]   = hex[src[i] >> 4];
+        out[i*2+1] = hex[src[i] & 0x0f];
+    }
+    out[len*2] = '\0';
+}
+
+/* 有効な Stripe-Signature を計算して POST する */
+static Resp http_post_stripe(const char *url, const char *payload,
+                              const char *secret) {
+    long ts = (long)time(NULL);
+    char ts_str[32]; snprintf(ts_str, sizeof(ts_str), "%ld", ts);
+    size_t ts_len  = strlen(ts_str);
+    size_t pay_len = strlen(payload);
+
+    /* 署名対象: "TIMESTAMP.PAYLOAD" */
+    char *signed_msg = malloc(ts_len + 1 + pay_len + 1);
+    memcpy(signed_msg, ts_str, ts_len);
+    signed_msg[ts_len] = '.';
+    memcpy(signed_msg + ts_len + 1, payload, pay_len + 1);
+
+    unsigned char mac[WH_HMAC_LEN];
+    platform_hmac_sha256(secret, strlen(secret),
+                          signed_msg, ts_len + 1 + pay_len, mac);
+    free(signed_msg);
+
+    char sig_hex[WH_HMAC_LEN * 2 + 1];
+    hex_encode_wh(mac, WH_HMAC_LEN, sig_hex);
+
+    char stripe_sig_hdr[320];
+    snprintf(stripe_sig_hdr, sizeof(stripe_sig_hdr),
+             "Stripe-Signature: t=%s,v1=%s", ts_str, sig_hex);
+
+    CURL *curl = curl_easy_init();
+    Buf buf = { malloc(1), 0 };
+    struct curl_slist *hdrs = curl_slist_append(NULL, "Content-Type: application/json");
+    hdrs = curl_slist_append(hdrs, stripe_sig_hdr);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
     curl_easy_perform(curl);
@@ -1432,6 +1538,384 @@ static void test_admin_upload_url(void) {
     PASS();
 }
 
+/* ── 管理者ダッシュボード HTML ────────────────────────────────────────── */
+
+static void test_admin_dashboard(void) {
+    char url[256]; snprintf(url, sizeof(url), "%s/admin", BASE_URL);
+
+    /* GET /admin → 200 HTML */
+    Resp r = http_get(url);
+    ASSERT(r.status == 200, "GET /admin → 200");
+    ASSERT(r.body && strstr(r.body, "Asoview Admin"), "contains title");
+    ASSERT(r.body && strstr(r.body, "管理エンドポイント"), "contains 管理エンドポイント");
+    ASSERT(r.body && strstr(r.body, "/api/v1/metrics"), "contains metrics link");
+    resp_free(&r);
+
+    /* /admin/ (trailing slash) も同じ */
+    char url2[256]; snprintf(url2, sizeof(url2), "%s/admin/", BASE_URL);
+    Resp r2 = http_get(url2);
+    ASSERT(r2.status == 200, "GET /admin/ → 200");
+    resp_free(&r2);
+
+    PASS();
+}
+
+/* ── Prometheus メトリクス ────────────────────────────────────────────── */
+
+static void test_metrics(void) {
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/metrics", BASE_URL);
+
+    Resp r = http_get(url);
+    ASSERT(r.status == 200, "GET /metrics → 200");
+    ASSERT(r.body && strstr(r.body, "asoview_requests_total"),
+           "has requests_total counter");
+    ASSERT(r.body && strstr(r.body, "asoview_errors_4xx_total"),
+           "has 4xx counter");
+    ASSERT(r.body && strstr(r.body, "asoview_errors_5xx_total"),
+           "has 5xx counter");
+    ASSERT(r.body && strstr(r.body, "asoview_uptime_seconds"),
+           "has uptime gauge");
+    resp_free(&r);
+
+    /* カウンターが 0 より大きい（テストが進んだ後なので確実に > 0）*/
+    Resp r2 = http_get(url);
+    cJSON *j = cJSON_Parse(r2.body);
+    /* Prometheus テキストフォーマット（JSON ではない）— body に数値が含まれること */
+    ASSERT(r2.body && strlen(r2.body) > 20, "non-empty Prometheus text");
+    cJSON_Delete(j); resp_free(&r2);
+
+    PASS();
+}
+
+/* ── X-Request-ID ────────────────────────────────────────────────────── */
+
+static void test_x_request_id(void) {
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/health", BASE_URL);
+
+    Resp r = http_get_capture_header(url, "X-Request-ID");
+    ASSERT(r.status == 200, "health → 200");
+    ASSERT(g_captured_header_val[0] != '\0', "X-Request-ID header present");
+    /* UUID 形式: 8-4-4-4-12 = 36文字 */
+    ASSERT(strlen(g_captured_header_val) >= 32, "X-Request-ID has UUID-like length");
+    resp_free(&r);
+
+    /* 2回連続で異なる X-Request-ID */
+    char first_id[256];
+    strncpy(first_id, g_captured_header_val, sizeof(first_id) - 1);
+    Resp r2 = http_get_capture_header(url, "X-Request-ID");
+    ASSERT(r2.status == 200, "second request → 200");
+    ASSERT(strcmp(first_id, g_captured_header_val) != 0, "X-Request-ID is unique per request");
+    resp_free(&r2);
+
+    PASS();
+}
+
+/* ── ETag キャッシング ───────────────────────────────────────────────── */
+
+static void test_etag_caching(void) {
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/venues", BASE_URL);
+
+    /* 最初のリクエスト → 200 + ETag */
+    Resp r1 = http_get_capture_header(url, "ETag");
+    ASSERT(r1.status == 200, "first request → 200");
+    ASSERT(g_captured_header_val[0] != '\0', "ETag header present");
+    char etag[256];
+    strncpy(etag, g_captured_header_val, sizeof(etag) - 1);
+    resp_free(&r1);
+
+    /* If-None-Match が一致 → 304 Not Modified */
+    Resp r2 = http_get_if_none_match(url, etag);
+    ASSERT(r2.status == 304, "If-None-Match match → 304");
+    resp_free(&r2);
+
+    /* 異なる ETag → 200 */
+    Resp r3 = http_get_if_none_match(url, "\"0000000000000000\"");
+    ASSERT(r3.status == 200, "wrong ETag → 200");
+    resp_free(&r3);
+
+    /* /api/v1/plans も ETag 対応 */
+    char purl[256]; snprintf(purl, sizeof(purl), "%s/api/v1/plans", BASE_URL);
+    Resp r4 = http_get_capture_header(purl, "ETag");
+    ASSERT(r4.status == 200, "plans → 200");
+    ASSERT(g_captured_header_val[0] != '\0', "plans has ETag");
+    char plan_etag[256];
+    strncpy(plan_etag, g_captured_header_val, sizeof(plan_etag) - 1);
+    resp_free(&r4);
+
+    Resp r5 = http_get_if_none_match(purl, plan_etag);
+    ASSERT(r5.status == 304, "plans If-None-Match → 304");
+    resp_free(&r5);
+
+    PASS();
+}
+
+/* ── ウェイトリスト CRUD ─────────────────────────────────────────────── */
+
+static long g_waitlist_id = 0;
+
+static void test_waitlist(void) {
+    char url[256];
+
+    /* 未認証で POST → 401 */
+    snprintf(url, sizeof(url), "%s/api/v1/waitlist", BASE_URL);
+    Resp r0 = http_post(url, "{\"schedule_id\":10}");
+    ASSERT(r0.status == 401, "no auth → 401");
+    resp_free(&r0);
+
+    /* schedule_id 欠落 → 400 */
+    Resp r_bad = http_post_auth(url, "{}", g_token);
+    ASSERT(r_bad.status == 400, "missing schedule_id → 400");
+    resp_free(&r_bad);
+
+    /* 存在しない schedule_id → 404 */
+    Resp r_nf = http_post_auth(url, "{\"schedule_id\":999999}", g_token);
+    ASSERT(r_nf.status == 404, "unknown schedule → 404");
+    resp_free(&r_nf);
+
+    /* 正常登録 → 201 */
+    Resp r1 = http_post_auth(url, "{\"schedule_id\":10}", g_token);
+    ASSERT(r1.status == 201, "create waitlist → 201");
+    cJSON *j1 = cJSON_Parse(r1.body);
+    ASSERT(j1 != NULL, "valid JSON");
+    ASSERT(cJSON_GetNumberValue(cJSON_GetObjectItem(j1, "id")) >= 1, "id >= 1");
+    ASSERT(cJSON_GetNumberValue(cJSON_GetObjectItem(j1, "position")) >= 1, "position >= 1");
+    g_waitlist_id = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(j1, "id"));
+    cJSON_Delete(j1); resp_free(&r1);
+
+    /* 重複登録 → 409 */
+    Resp r2 = http_post_auth(url, "{\"schedule_id\":10}", g_token);
+    ASSERT(r2.status == 409, "duplicate → 409");
+    resp_free(&r2);
+
+    /* hanako も同じスケジュールに登録 (position=2 になるはず) */
+    Resp r3 = http_post_auth(url, "{\"schedule_id\":10}", g_token2);
+    ASSERT(r3.status == 201, "hanako waitlist → 201");
+    cJSON *j3 = cJSON_Parse(r3.body);
+    ASSERT(cJSON_GetNumberValue(cJSON_GetObjectItem(j3, "position")) == 2, "hanako is position 2");
+    long hanako_wid = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(j3, "id"));
+    cJSON_Delete(j3); resp_free(&r3);
+
+    /* GET ウェイトリスト一覧 */
+    snprintf(url, sizeof(url), "%s/api/v1/waitlist/schedule/10", BASE_URL);
+    Resp r4 = http_get(url);
+    ASSERT(r4.status == 200, "list waitlist → 200");
+    cJSON *j4 = cJSON_Parse(r4.body);
+    cJSON *wl = cJSON_GetObjectItem(j4, "waitlist");
+    ASSERT(cJSON_IsArray(wl) && cJSON_GetArraySize(wl) == 2, "2 entries");
+    cJSON_Delete(j4); resp_free(&r4);
+
+    /* 他人のエントリを削除 → 404（hanako が taro のエントリを削除） */
+    char del_url[256];
+    snprintf(del_url, sizeof(del_url), "%s/api/v1/waitlist/%ld", BASE_URL, g_waitlist_id);
+    Resp r5 = http_delete_auth(del_url, g_token2);
+    ASSERT(r5.status == 404, "delete other's entry → 404");
+    resp_free(&r5);
+
+    /* 自分のエントリを削除 */
+    snprintf(del_url, sizeof(del_url), "%s/api/v1/waitlist/%ld", BASE_URL, hanako_wid);
+    Resp r6 = http_delete_auth(del_url, g_token2);
+    ASSERT(r6.status == 200, "hanako self-delete → 200");
+    resp_free(&r6);
+
+    /* taro も削除 */
+    snprintf(del_url, sizeof(del_url), "%s/api/v1/waitlist/%ld", BASE_URL, g_waitlist_id);
+    Resp r7 = http_delete_auth(del_url, g_token);
+    ASSERT(r7.status == 200, "taro self-delete → 200");
+    resp_free(&r7);
+
+    /* 削除後はリストが空 */
+    snprintf(url, sizeof(url), "%s/api/v1/waitlist/schedule/10", BASE_URL);
+    Resp r8 = http_get(url);
+    cJSON *j8 = cJSON_Parse(r8.body);
+    ASSERT(cJSON_GetArraySize(cJSON_GetObjectItem(j8, "waitlist")) == 0, "empty after delete");
+    cJSON_Delete(j8); resp_free(&r8);
+
+    PASS();
+}
+
+/* ── JWT ログアウト / ブラックリスト ───────────────────────────────────── */
+
+static void test_auth_logout(void) {
+    char login_url[256], logout_url[256], profile_url[256];
+    snprintf(login_url,   sizeof(login_url),   "%s/api/v1/auth/login",   BASE_URL);
+    snprintf(logout_url,  sizeof(logout_url),  "%s/api/v1/auth/logout",  BASE_URL);
+    snprintf(profile_url, sizeof(profile_url), "%s/api/v1/users/1",      BASE_URL);
+
+    /* ログアウト専用の新規トークンを取得（g_token は汚染しない） */
+    Resp lr = http_post(login_url,
+        "{\"email\":\"taro@example.com\",\"password\":\"resetpass456\"}");
+    ASSERT(lr.status == 200, "re-login → 200");
+    cJSON *lj = cJSON_Parse(lr.body);
+    const char *tp = cJSON_GetStringValue(cJSON_GetObjectItem(lj, "token"));
+    ASSERT(tp && strlen(tp) > 10, "got logout_token");
+    char logout_tok[512] = {0};
+    strncpy(logout_tok, tp, sizeof(logout_tok) - 1);
+    cJSON_Delete(lj); resp_free(&lr);
+
+    /* 認証なしでログアウト → 401 */
+    Resp r1 = http_post(logout_url, "");
+    ASSERT(r1.status == 401, "logout without token → 401");
+    resp_free(&r1);
+
+    /* ログアウト前にトークンは有効 */
+    Resp r2 = http_get_auth(profile_url, logout_tok);
+    ASSERT(r2.status == 200, "token valid before logout");
+    resp_free(&r2);
+
+    /* ログアウト → 200 */
+    Resp r3 = http_post_auth(logout_url, "", logout_tok);
+    ASSERT(r3.status == 200, "logout → 200");
+    resp_free(&r3);
+
+    /* ログアウト済みトークンは 401 */
+    Resp r4 = http_get_auth(profile_url, logout_tok);
+    ASSERT(r4.status == 401, "blacklisted token → 401");
+    resp_free(&r4);
+
+    /* g_token は別のトークンなので影響なし */
+    Resp r5 = http_get_auth(profile_url, g_token);
+    ASSERT(r5.status == 200, "g_token still valid after other logout");
+    resp_free(&r5);
+
+    PASS();
+}
+
+/* ── アカウントロックアウト ──────────────────────────────────────────── */
+
+static void test_account_lockout(void) {
+    char reg_url[256], login_url[256];
+    snprintf(reg_url,   sizeof(reg_url),   "%s/api/v1/users",      BASE_URL);
+    snprintf(login_url, sizeof(login_url), "%s/api/v1/auth/login", BASE_URL);
+
+    /* テスト専用ユーザー作成 */
+    Resp r0 = http_post(reg_url,
+        "{\"email\":\"lockme@example.com\",\"name\":\"LockTest\","
+        "\"password\":\"LockPass123\"}");
+    ASSERT(r0.status == 201, "create locktest user → 201");
+    resp_free(&r0);
+
+    /* 5回連続ログイン失敗（それぞれ 400）*/
+    for (int i = 0; i < 5; i++) {
+        Resp rf = http_post(login_url,
+            "{\"email\":\"lockme@example.com\",\"password\":\"wrongpass\"}");
+        ASSERT(rf.status == 400, "wrong password → 400");
+        resp_free(&rf);
+    }
+
+    /* 6回目 → 429 (アカウントロック) */
+    Resp rl = http_post(login_url,
+        "{\"email\":\"lockme@example.com\",\"password\":\"wrongpass\"}");
+    ASSERT(rl.status == 429, "6th attempt → 429 locked");
+    cJSON *jl = cJSON_Parse(rl.body);
+    ASSERT(jl != NULL, "valid JSON on lockout");
+    const char *errmsg = cJSON_GetStringValue(cJSON_GetObjectItem(jl, "error"));
+    ASSERT(errmsg && strstr(errmsg, "ロック"), "error mentions lockout");
+    cJSON_Delete(jl); resp_free(&rl);
+
+    /* 正しいパスワードでも locked_until が切れるまで 429 */
+    Resp rl2 = http_post(login_url,
+        "{\"email\":\"lockme@example.com\",\"password\":\"LockPass123\"}");
+    ASSERT(rl2.status == 429, "correct pass during lock → 429");
+    resp_free(&rl2);
+
+    PASS();
+}
+
+/* ── Webhook 冪等性 ──────────────────────────────────────────────────── */
+
+static void test_webhook_idempotency(void) {
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/webhooks/stripe", BASE_URL);
+    const char *secret  = "whtest-secret";
+    /* 固有の event_id を持つテストペイロード */
+    const char *payload =
+        "{\"id\":\"evt_test_idempotency_9001\","
+        "\"type\":\"payment_intent.payment_failed\","
+        "\"data\":{\"object\":{\"metadata\":{}}}}";
+
+    /* 1回目: 正常受信 → 200 {"received":true} */
+    Resp r1 = http_post_stripe(url, payload, secret);
+    ASSERT(r1.status == 200, "first webhook → 200");
+    ASSERT(r1.body && strstr(r1.body, "received"), "body has 'received'");
+    resp_free(&r1);
+
+    /* 2回目: 同一 event_id → 200 {"status":"already processed"} */
+    Resp r2 = http_post_stripe(url, payload, secret);
+    ASSERT(r2.status == 200, "duplicate webhook → 200");
+    ASSERT(r2.body && strstr(r2.body, "already processed"),
+           "body has 'already processed'");
+    resp_free(&r2);
+
+    /* 3回目も冪等（何度送っても同じ） */
+    Resp r3 = http_post_stripe(url, payload, secret);
+    ASSERT(r3.status == 200, "third webhook → 200");
+    ASSERT(r3.body && strstr(r3.body, "already processed"),
+           "third also 'already processed'");
+    resp_free(&r3);
+
+    /* 別の event_id → 新規受信 */
+    const char *payload2 =
+        "{\"id\":\"evt_test_idempotency_9002\","
+        "\"type\":\"payment_intent.payment_failed\","
+        "\"data\":{\"object\":{\"metadata\":{}}}}";
+    Resp r4 = http_post_stripe(url, payload2, secret);
+    ASSERT(r4.status == 200, "new event_id → 200");
+    ASSERT(r4.body && strstr(r4.body, "received"), "new event has 'received'");
+    resp_free(&r4);
+
+    /* 署名なし → 400 */
+    Resp r5 = http_post(url, payload);
+    ASSERT(r5.status == 400, "no Stripe-Signature → 400");
+    resp_free(&r5);
+
+    PASS();
+}
+
+/* ── POST /api/v1/checkout/session ──────────────────────────────────── */
+
+static void test_checkout_session(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/v1/checkout/session", BASE_URL);
+
+    /* 未認証 → 401 */
+    Resp r_unauth = http_post(url, "{\"success_url\":\"http://localhost/ok\","
+                                    "\"cancel_url\":\"http://localhost/cancel\"}");
+    ASSERT(r_unauth.status == 401, "checkout no auth → 401");
+    resp_free(&r_unauth);
+
+    /* 不正な success_url (SSRF 防止) → 400 */
+    Resp r_ssrf = http_post_auth(url,
+        "{\"success_url\":\"javascript:alert(1)\","
+        "\"cancel_url\":\"http://localhost/cancel\"}",
+        g_token);
+    ASSERT(r_ssrf.status == 400, "checkout javascript: url → 400");
+    resp_free(&r_ssrf);
+
+    /* cancel_url が不正 → 400 */
+    Resp r_ssrf2 = http_post_auth(url,
+        "{\"success_url\":\"http://localhost/ok\","
+        "\"cancel_url\":\"file:///etc/passwd\"}",
+        g_token);
+    ASSERT(r_ssrf2.status == 400, "checkout file: url → 400");
+    resp_free(&r_ssrf2);
+
+    /* Stripe キー未設定なので 502 になる（Stripe APIへの接続失敗） */
+    Resp r_ok = http_post_auth(url,
+        "{\"success_url\":\"http://localhost/ok\","
+        "\"cancel_url\":\"http://localhost/cancel\"}",
+        g_token);
+    ASSERT(r_ok.status == 502 || r_ok.status == 200,
+           "checkout with no Stripe key → 502 (or 200 if key is set)");
+    resp_free(&r_ok);
+
+    /* success_url / cancel_url 省略時はデフォルトを使う → 同じく 502/200 */
+    Resp r_def = http_post_auth(url, "{}", g_token);
+    ASSERT(r_def.status == 502 || r_def.status == 200,
+           "checkout defaults → 502/200");
+    resp_free(&r_def);
+
+    PASS();
+}
+
 /* ─── Server startup (fork) ──────────────────────────────────────────── */
 
 static int wait_for_port(int port, int timeout_ms) {
@@ -1462,6 +1946,9 @@ int main(void) {
     unlink(db_path);
     unlink("/tmp/asoview_c_test.db-wal");
     unlink("/tmp/asoview_c_test.db-shm");
+
+    /* Webhook テスト用シークレットを子プロセスに継承させる */
+    setenv("STRIPE_WEBHOOK_SECRET", "whtest-secret", 1);
 
     /* Start server as child process */
     pid_t pid = fork();
@@ -1553,6 +2040,19 @@ int main(void) {
     test_create_user_invalid_email();
     test_auth_refresh();
     test_admin_upload_url();
+
+    /* ── Batch 4: 11機能の新規テスト ── */
+    test_admin_dashboard();
+    test_metrics();
+    test_x_request_id();
+    test_etag_caching();
+    test_waitlist();
+    test_auth_logout();
+    test_account_lockout();
+    test_webhook_idempotency();
+
+    /* ── Batch 5: Checkout Session ── */
+    test_checkout_session();
 
     kill(pid, 15);
 

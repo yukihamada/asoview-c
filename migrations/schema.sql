@@ -85,6 +85,8 @@ CREATE TABLE IF NOT EXISTS users (
     name          TEXT NOT NULL,
     phone         TEXT,
     password_hash TEXT NOT NULL,
+    failed_logins INTEGER NOT NULL DEFAULT 0,
+    locked_until  TEXT,
     created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -167,4 +169,49 @@ BEGIN
     UPDATE schedules SET
         booked_count = booked_count + NEW.count
     WHERE id = (SELECT schedule_id FROM bookings WHERE id = NEW.booking_id);
+END;
+
+-- ウェイトリスト（満席時の待機リスト）
+CREATE TABLE IF NOT EXISTS waitlist (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    schedule_id INTEGER NOT NULL REFERENCES schedules(id),
+    notified    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, schedule_id)
+);
+
+-- Stripe webhook イベント冪等性管理
+CREATE TABLE IF NOT EXISTS webhook_events (
+    event_id     TEXT PRIMARY KEY,  -- Stripe evt_xxx
+    processed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- JWT ブラックリスト（ログアウト・パスワード変更後のトークン無効化）
+CREATE TABLE IF NOT EXISTS jwt_blocklist (
+    jti        TEXT PRIMARY KEY,  -- トークン署名（.以降の最終パート）
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- FTS5 全文検索（plans の title / description を索引化）
+CREATE VIRTUAL TABLE IF NOT EXISTS plans_fts
+    USING fts5(title, description, content='plans', content_rowid='id');
+
+-- FTS5 同期トリガー
+CREATE TRIGGER IF NOT EXISTS plans_ai AFTER INSERT ON plans BEGIN
+    INSERT INTO plans_fts(rowid, title, description)
+        VALUES (new.id, new.title, new.description);
+END;
+
+CREATE TRIGGER IF NOT EXISTS plans_ad AFTER DELETE ON plans BEGIN
+    INSERT INTO plans_fts(plans_fts, rowid, title, description)
+        VALUES ('delete', old.id, old.title, old.description);
+END;
+
+CREATE TRIGGER IF NOT EXISTS plans_au AFTER UPDATE ON plans BEGIN
+    INSERT INTO plans_fts(plans_fts, rowid, title, description)
+        VALUES ('delete', old.id, old.title, old.description);
+    INSERT INTO plans_fts(rowid, title, description)
+        VALUES (new.id, new.title, new.description);
 END;

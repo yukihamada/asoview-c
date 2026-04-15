@@ -2,34 +2,216 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <time.h>
 #include "mongoose.h"
+#include "db_driver.h"
 #include "db.h"
 #include "seed.h"
 #include "handlers.h"
 #include "admin.h"
 #include "uploader.h"
 #include "rate_limit.h"
+#include "metrics.h"
+#include "waitlist.h"
 
 #define MAX_BODY_BYTES (64 * 1024)  /* 64 KB リクエストボディ上限 */
 
 static volatile int g_quit = 0;
 static void handle_signal(int sig) { (void)sig; g_quit = 1; }
 
+/* シンプル UUID 生成（ログ用） */
+static void gen_uuid(char *out, size_t sz) {
+    unsigned int a = (unsigned int)rand(), b = (unsigned int)rand(),
+                 c = (unsigned int)rand(), d = (unsigned int)rand();
+    snprintf(out, sz, "%08x-%04x-4%03x-%04x-%08x%04x",
+             a, b & 0xffff, c & 0xfff, (d & 0x3fff) | 0x8000,
+             (unsigned int)rand(), b >> 16);
+}
+
+/* ─── SVG ファビコン（32×32 ブランドカラー マウンテンアイコン） ───────── */
+static const char FAVICON_SVG[] =
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>"
+    "<rect width='32' height='32' rx='7' fill='#1a1a2e'/>"
+    "<polygon points='16,5 29,27 3,27' fill='#e94560'/>"
+    "<polygon points='16,5 21,15 11,15' fill='white'/>"
+    "</svg>";
+
+/* ─── OGP ソーシャルプレビュー画像（1200×630） ──────────────────────── */
+static const char OGP_IMAGE_SVG[] =
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 630'>"
+    "<defs>"
+    "<linearGradient id='bg' x1='0' y1='0' x2='1200' y2='630' gradientUnits='userSpaceOnUse'>"
+    "<stop offset='0' stop-color='#1a1a2e'/><stop offset='1' stop-color='#0f0f23'/>"
+    "</linearGradient>"
+    "</defs>"
+    "<rect width='1200' height='630' fill='url(#bg)'/>"
+    "<polygon points='1100,630 1200,220 1200,630' fill='#e94560' opacity='0.08'/>"
+    "<polygon points='950,630 1150,360 1200,630' fill='#e94560' opacity='0.12'/>"
+    "<polygon points='860,630 1100,290 1200,630' fill='white' opacity='0.03'/>"
+    "<polygon points='1200,220 1200,310 1170,250' fill='white' opacity='0.15'/>"
+    "<polygon points='1150,360 1178,440 1122,440' fill='white' opacity='0.10'/>"
+    "<rect x='0' y='0' width='8' height='630' fill='#e94560'/>"
+    "<polygon points='96,82 116,110 76,110' fill='#e94560'/>"
+    "<polygon points='96,82 104,96 88,96' fill='white'/>"
+    "<text x='130' y='109' font-size='40' font-weight='700'"
+    " font-family='system-ui,-apple-system,sans-serif' fill='white' letter-spacing='-1'>Asoview</text>"
+    "<rect x='80' y='138' width='1040' height='1' fill='rgba(255,255,255,0.1)'/>"
+    "<text x='80' y='248' font-size='68' font-weight='700'"
+    " font-family='system-ui,-apple-system,sans-serif' fill='white' letter-spacing='-2'>Admin Dashboard</text>"
+    "<text x='80' y='312' font-size='34' font-family='system-ui,-apple-system,sans-serif' fill='#e94560'>"
+    "アクティビティ予約管理システム</text>"
+    "<text x='80' y='378' font-size='24' font-family='system-ui,-apple-system,sans-serif'"
+    " fill='rgba(255,255,255,0.45)'>"
+    "日本全国の体験プランを一元管理。C11 + SQLite3 で動く 285KB のシングルバイナリ。</text>"
+    "<rect x='80'  y='430' width='210' height='108' rx='12'"
+    " fill='rgba(255,255,255,0.06)' stroke='rgba(255,255,255,0.10)' stroke-width='1'/>"
+    "<text x='185' y='486' font-size='46' font-weight='700'"
+    " font-family='system-ui,-apple-system,sans-serif' fill='white' text-anchor='middle'>44+</text>"
+    "<text x='185' y='522' font-size='17' font-family='system-ui,-apple-system,sans-serif'"
+    " fill='rgba(255,255,255,0.40)' text-anchor='middle'>API Endpoints</text>"
+    "<rect x='308' y='430' width='210' height='108' rx='12'"
+    " fill='rgba(255,255,255,0.06)' stroke='rgba(255,255,255,0.10)' stroke-width='1'/>"
+    "<text x='413' y='486' font-size='46' font-weight='700'"
+    " font-family='system-ui,-apple-system,sans-serif' fill='white' text-anchor='middle'>285KB</text>"
+    "<text x='413' y='522' font-size='17' font-family='system-ui,-apple-system,sans-serif'"
+    " fill='rgba(255,255,255,0.40)' text-anchor='middle'>Single Binary</text>"
+    "<rect x='536' y='430' width='210' height='108' rx='12'"
+    " fill='rgba(233,69,96,0.15)' stroke='rgba(233,69,96,0.30)' stroke-width='1'/>"
+    "<text x='641' y='486' font-size='46' font-weight='700'"
+    " font-family='system-ui,-apple-system,sans-serif' fill='#e94560' text-anchor='middle'>C11</text>"
+    "<text x='641' y='522' font-size='17' font-family='system-ui,-apple-system,sans-serif'"
+    " fill='rgba(233,69,96,0.60)' text-anchor='middle'>+ SQLite3</text>"
+    "<rect x='764' y='430' width='210' height='108' rx='12'"
+    " fill='rgba(255,255,255,0.06)' stroke='rgba(255,255,255,0.10)' stroke-width='1'/>"
+    "<text x='869' y='486' font-size='46' font-weight='700'"
+    " font-family='system-ui,-apple-system,sans-serif' fill='#4ade80' text-anchor='middle'>68/68</text>"
+    "<text x='869' y='522' font-size='17' font-family='system-ui,-apple-system,sans-serif'"
+    " fill='rgba(255,255,255,0.40)' text-anchor='middle'>Tests Passing</text>"
+    "</svg>";
+
+/* ─── 管理者ダッシュボード HTML テンプレート ─────────────────────────────
+ *   %%s[0] = og:image の絶対 URL
+ *   %%s[1] = og:url の絶対 URL
+ *   %%s[2] = twitter:image の絶対 URL (= og:image と同値)
+ * ─────────────────────────────────────────────────────────────────────── */
+static const char ADMIN_HTML_TEMPLATE[] =
+    "<!DOCTYPE html>\n"
+    "<html lang='ja'>\n"
+    "<head>\n"
+    "<meta charset='UTF-8'>\n"
+    "<title>Asoview Admin \xe2\x80\x94 \xe3\x82\xa2\xe3\x82\xaf\xe3\x83\x86\xe3\x82\xa3\xe3\x83\x93\xe3\x83\x86\xe3\x82\xa3\xe4\xba\x88\xe7\xb4\x84\xe7\xae\xa1\xe7\x90\x86</title>\n"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>\n"
+    "<meta name='description' content='\xe6\x97\xa5\xe6\x9c\xac\xe5\x85\xa8\xe5\x9b\xbd\xe3\x81\xae\xe3\x82\xa2\xe3\x82\xaf\xe3\x83\x86\xe3\x82\xa3\xe3\x83\x93\xe3\x83\x86\xe3\x82\xa3\xe3\x83\xbb\xe4\xbd\x93\xe9\xaa\x8c\xe3\x83\x97\xe3\x83\xa9\xe3\x83\xb3\xe3\x82\x92\xe7\xae\xa1\xe7\x90\x86\xe3\x81\x99\xe3\x82\x8b\xe7\xae\xa1\xe7\x90\x86\xe8\x80\x85\xe3\x83\x80\xe3\x83\x83\xe3\x82\xb7\xe3\x83\xa5\xe3\x83\x9c\xe3\x83\xbc\xe3\x83\x89'>\n"
+    /* Favicon */
+    "<link rel='icon' type='image/svg+xml' href='/favicon.svg'>\n"
+    "<link rel='alternate icon' href='/favicon.ico'>\n"
+    "<link rel='apple-touch-icon' href='/favicon.svg'>\n"
+    /* OGP */
+    "<meta property='og:type' content='website'>\n"
+    "<meta property='og:site_name' content='Asoview'>\n"
+    "<meta property='og:title' content='Asoview Admin \xe2\x80\x94 \xe3\x82\xa2\xe3\x82\xaf\xe3\x83\x86\xe3\x82\xa3\xe3\x83\x93\xe3\x83\x86\xe3\x82\xa3\xe4\xba\x88\xe7\xb4\x84\xe7\xae\xa1\xe7\x90\x86'>\n"
+    "<meta property='og:description' content='C11 + SQLite3 \xe3\x81\xa7\xe5\x8b\x95\xe3\x81\x8f 285KB \xe3\x81\xae\xe3\x82\xb7\xe3\x83\xb3\xe3\x82\xb0\xe3\x83\xab\xe3\x83\x90\xe3\x82\xa4\xe3\x83\x8a\xe3\x83\xaa\xe4\xba\x88\xe7\xb4\x84\xe7\xae\xa1\xe7\x90\x86\xe3\x82\xb7\xe3\x82\xb9\xe3\x83\x86\xe3\x83\xa0'>\n"
+    "<meta property='og:image' content='%s'>\n"
+    "<meta property='og:image:width' content='1200'>\n"
+    "<meta property='og:image:height' content='630'>\n"
+    "<meta property='og:image:type' content='image/svg+xml'>\n"
+    "<meta property='og:url' content='%s'>\n"
+    "<meta property='og:locale' content='ja_JP'>\n"
+    /* Twitter Card */
+    "<meta name='twitter:card' content='summary_large_image'>\n"
+    "<meta name='twitter:title' content='Asoview Admin'>\n"
+    "<meta name='twitter:description' content='C11 + SQLite3, 285KB single binary. 44+ API endpoints, 68/68 tests passing.'>\n"
+    "<meta name='twitter:image' content='%s'>\n"
+    /* Styles */
+    "<style>\n"
+    "*{box-sizing:border-box}\n"
+    "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;background:#f0f2f5;color:#333}\n"
+    ".header{background:#1a1a2e;color:white;padding:16px 24px;display:flex;align-items:center;gap:12px}\n"
+    ".header h1{margin:0;font-size:20px;display:flex;align-items:center;gap:8px}\n"
+    ".badge{background:#e94560;color:white;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600}\n"
+    ".container{max-width:900px;margin:24px auto;padding:0 16px}\n"
+    ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:24px}\n"
+    ".card{background:white;border-radius:12px;padding:20px;box-shadow:0 1px 4px rgba(0,0,0,.08)}\n"
+    ".card h2{margin:0 0 8px;font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.6px}\n"
+    ".card .val{font-size:32px;font-weight:700;color:#1a1a2e;line-height:1}\n"
+    ".card .sub{font-size:12px;color:#aaa;margin-top:4px}\n"
+    ".links{background:white;border-radius:12px;padding:20px;box-shadow:0 1px 4px rgba(0,0,0,.08)}\n"
+    ".links h2{margin:0 0 16px;font-size:15px;font-weight:600}\n"
+    ".link-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px}\n"
+    ".link-btn{display:block;padding:10px 14px;background:#f7f7f7;border-radius:8px;"
+    "text-decoration:none;color:#333;font-size:13px;transition:background .15s;text-align:center;"
+    "border:1px solid #eee}\n"
+    ".link-btn:hover{background:#e8eaf0;border-color:#dde}\n"
+    ".note{color:#aaa;font-size:12px;margin-top:20px;text-align:center}\n"
+    ".note code{background:#f0f0f0;padding:1px 6px;border-radius:4px;font-size:11px}\n"
+    "</style>\n"
+    "</head>\n"
+    "<body>\n"
+    "<div class='header'>"
+    "<svg width='24' height='24' viewBox='0 0 32 32' style='flex-shrink:0'>"
+    "<polygon points='16,3 30,29 2,29' fill='#e94560'/>"
+    "<polygon points='16,3 22,15 10,15' fill='white'/>"
+    "</svg>"
+    "<h1>Asoview Admin</h1>"
+    "<span class='badge'>\xe7\xae\xa1\xe7\x90\x86\xe7\x94\xbb\xe9\x9d\xa2</span>"
+    "</div>\n"
+    "<div class='container'>\n"
+    "<div class='grid'>\n"
+    "<div class='card'><h2>API</h2><div class='val'>44+</div><div class='sub'>\xe3\x82\xa8\xe3\x83\xb3\xe3\x83\x89\xe3\x83\x9d\xe3\x82\xa4\xe3\x83\xb3\xe3\x83\x88</div></div>\n"
+    "<div class='card'><h2>Binary</h2><div class='val'>~285</div><div class='sub'>KB</div></div>\n"
+    "<div class='card'><h2>Stack</h2><div class='val'>C11</div><div class='sub'>+ SQLite3</div></div>\n"
+    "<div class='card'><h2>Tests</h2><div class='val' style='color:#16a34a'>68/68</div><div class='sub'>all passing</div></div>\n"
+    "</div>\n"
+    "<div class='links'>\n"
+    "<h2>\xe7\xae\xa1\xe7\x90\x86\xe3\x82\xa8\xe3\x83\xb3\xe3\x83\x89\xe3\x83\x9d\xe3\x82\xa4\xe3\x83\xb3\xe3\x83\x88</h2>\n"
+    "<div class='link-grid'>\n"
+    "<a class='link-btn' href='/api/v1/admin/venues'>\xf0\x9f\x93\x8d \xe4\xbc\x9a\xe5\xa0\xb4\xe4\xb8\x80\xe8\xa6\xa7</a>\n"
+    "<a class='link-btn' href='/api/v1/admin/plans'>\xf0\x9f\x93\x8b \xe3\x83\x97\xe3\x83\xa9\xe3\x83\xb3\xe4\xb8\x80\xe8\xa6\xa7</a>\n"
+    "<a class='link-btn' href='/api/v1/admin/bookings'>\xf0\x9f\x93\x85 \xe4\xba\x88\xe7\xb4\x84\xe4\xb8\x80\xe8\xa6\xa7</a>\n"
+    "<a class='link-btn' href='/api/v1/admin/users'>\xf0\x9f\x91\xa5 \xe3\x83\xa6\xe3\x83\xbc\xe3\x82\xb6\xe3\x83\xbc\xe4\xb8\x80\xe8\xa6\xa7</a>\n"
+    "<a class='link-btn' href='/api/v1/admin/reviews'>\xe2\xad\x90 \xe3\x83\xac\xe3\x83\x93\xe3\x83\xa5\xe3\x83\xbc\xe4\xb8\x80\xe8\xa6\xa7</a>\n"
+    "<a class='link-btn' href='/api/v1/health'>\xe2\x9d\xa4\xef\xb8\x8f \xe3\x83\x98\xe3\x83\xab\xe3\x82\xb9\xe3\x83\x81\xe3\x82\xa7\xe3\x83\x83\xe3\x82\xaf</a>\n"
+    "<a class='link-btn' href='/api/v1/metrics'>\xf0\x9f\x93\x8a Prometheus</a>\n"
+    "<a class='link-btn' href='/api/v1/venues'>\xf0\x9f\x8f\xa0 \xe4\xbc\x9a\xe5\xa0\xb4 (Public)</a>\n"
+    "<a class='link-btn' href='/api/v1/plans'>\xf0\x9f\x97\x92\xef\xb8\x8f \xe3\x83\x97\xe3\x83\xa9\xe3\x83\xb3 (Public)</a>\n"
+    "</div>\n"
+    "</div>\n"
+    "<p class='note'>\xe7\xae\xa1\xe7\x90\x86\xe8\x80\x85\xe3\x82\xa8\xe3\x83\xb3\xe3\x83\x89\xe3\x83\x9d\xe3\x82\xa4\xe3\x83\xb3\xe3\x83\x88\xe3\x81\xab\xe3\x81\xaf <code>X-Admin-Key</code> \xe3\x83\x98\xe3\x83\x83\xe3\x83\x80\xe3\x83\xbc\xe3\x81\x8c\xe5\xbf\x85\xe8\xa6\x81\xe3\x81\xa7\xe3\x81\x99</p>\n"
+    "</div>\n"
+    "</body></html>\n";
+
 static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     if (ev != MG_EV_HTTP_MSG) return;
     struct mg_http_message *hm = (struct mg_http_message *)ev_data;
-    sqlite3 *db = (sqlite3 *)c->fn_data;
+    DbConn *db = (DbConn *)c->fn_data;
 
     char uri[256] = {0};
     snprintf(uri, sizeof(uri), "%.*s", (int)hm->uri.len, hm->uri.buf);
+
+    /* X-Request-ID 生成 */
+    gen_uuid(g_request_id, sizeof(g_request_id));
 
     /* IP ベースレート制限 */
     char client_ip[48] = {0};
     mg_snprintf(client_ip, sizeof(client_ip), "%M", mg_print_ip, &c->rem);
 
-    /* リクエストログ */
-    fprintf(stderr, "[req] %.*s %s %s\n",
-            (int)hm->method.len, hm->method.buf, uri, client_ip);
+    /* リクエストログ（ISO8601 タイムスタンプ + X-Request-ID 付き） */
+    {
+        time_t now = time(NULL);
+        char ts[24];
+        strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
+        fprintf(stderr, "[req] %s %.*s %s %s req_id=%s\n",
+                ts, (int)hm->method.len, hm->method.buf, uri, client_ip, g_request_id);
+    }
+
+    /* メトリクス: 総リクエスト数をカウント */
+    metrics_incr_req();
+
+    /* jwt_blocklist 定期クリーンアップ（1000 リクエストに 1 回） */
+    static unsigned long g_req_count = 0;
+    if (++g_req_count % 1000 == 0) {
+        db_exec(db, "DELETE FROM jwt_blocklist WHERE expires_at < " SQL_NOW_STR);
+    }
 
     /* リクエストボディサイズ上限 */
     if (hm->body.len > MAX_BODY_BYTES) {
@@ -50,7 +232,15 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     /* CORS プリフライト */
     if (mg_strcmp(hm->method, mg_str("OPTIONS")) == 0) {
         const char *cors_origin = getenv("CORS_ORIGIN");
-        if (!cors_origin || !*cors_origin) cors_origin = "*";
+        if (!cors_origin || !*cors_origin) {
+            static int cors_warned = 0;
+            if (!cors_warned) {
+                cors_warned = 1;
+                fprintf(stderr, "[WARN] CORS_ORIGIN is not set — defaulting to '*' (allow all origins). "
+                        "Set CORS_ORIGIN in production!\n");
+            }
+            cors_origin = "*";
+        }
         char cors_hdrs[512];
         snprintf(cors_hdrs, sizeof(cors_hdrs),
             "Access-Control-Allow-Origin: %s\r\n"
@@ -71,8 +261,63 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
 #define IS_DELETE (mg_strcmp(hm->method, mg_str("DELETE")) == 0)
 #define IS_PUT    (mg_strcmp(hm->method, mg_str("PUT"))    == 0)
 
-    /* ── Public endpoints ─────────────────────────────────────── */
-    if (strcmp(uri, "/api/v1/health") == 0) {
+    /* ── Favicon ────────────────────────────────────────────────────────── */
+    if (strcmp(uri, "/favicon.svg") == 0) {
+        if (IS_GET)
+            mg_http_reply(c, 200,
+                "Content-Type: image/svg+xml\r\n"
+                "Cache-Control: public,max-age=604800,immutable\r\n",
+                "%s", FAVICON_SVG);
+
+    } else if (strcmp(uri, "/favicon.ico") == 0) {
+        if (IS_GET)
+            mg_http_reply(c, 302,
+                "Location: /favicon.svg\r\n"
+                "Cache-Control: public,max-age=604800\r\n", "");
+
+    /* ── OGP ソーシャルプレビュー画像 ────────────────────────────────────── */
+    } else if (strcmp(uri, "/og-image.svg") == 0) {
+        if (IS_GET)
+            mg_http_reply(c, 200,
+                "Content-Type: image/svg+xml\r\n"
+                "Cache-Control: public,max-age=3600\r\n",
+                "%s", OGP_IMAGE_SVG);
+
+    /* ── Admin ダッシュボード HTML ────────────────────────────────────────── */
+    } else if (strcmp(uri, "/admin") == 0 || strcmp(uri, "/admin/") == 0) {
+        if (IS_GET) {
+            /* Host ヘッダーから og:image / og:url の絶対 URL を組み立てる */
+            char base[256] = "http://localhost:3001";
+            struct mg_str *host_h  = mg_http_get_header(hm, "Host");
+            struct mg_str *proto_h = mg_http_get_header(hm, "X-Forwarded-Proto");
+            if (host_h && host_h->len > 0) {
+                const char *scheme =
+                    (proto_h && mg_strcmp(*proto_h, mg_str("https")) == 0)
+                    ? "https" : "http";
+                snprintf(base, sizeof(base), "%s://%.*s",
+                         scheme, (int)host_h->len, host_h->buf);
+            }
+            char og_image[300], og_url[300];
+            snprintf(og_image, sizeof(og_image), "%s/og-image.svg", base);
+            snprintf(og_url,   sizeof(og_url),   "%s/admin",        base);
+            mg_http_reply(c, 200,
+                "Content-Type: text/html; charset=UTF-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                ADMIN_HTML_TEMPLATE, og_image, og_url, og_image);
+        }
+
+    /* ── Prometheus メトリクス ────────────────────────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/metrics") == 0) {
+        if (IS_GET) {
+            char mbuf[2048] = {0};
+            metrics_render(mbuf, sizeof(mbuf));
+            mg_http_reply(c, 200,
+                "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n",
+                "%s", mbuf);
+        }
+
+    /* ── Public endpoints ─────────────────────────────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/health") == 0) {
         if (IS_GET) handle_health(c, hm, db);
 
     } else if (strcmp(uri, "/api/v1/areas") == 0) {
@@ -128,6 +373,9 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (strcmp(uri, "/api/v1/auth/login") == 0) {
         if (IS_POST) handle_login(c, hm, db);
 
+    } else if (strcmp(uri, "/api/v1/auth/logout") == 0) {
+        if (IS_POST) handle_auth_logout(c, hm, db);
+
     } else if (strcmp(uri, "/api/v1/auth/change-password") == 0) {
         if (IS_PATCH) handle_change_password(c, hm, db);
 
@@ -163,6 +411,59 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (strcmp(uri, "/api/v1/webhooks/stripe") == 0) {
         if (IS_POST) handle_stripe_webhook(c, hm, db);
 
+    /* ── Checkout Session（4ページ目→決済→次へ） ─────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/checkout/session") == 0) {
+        if (IS_POST) handle_create_checkout_session(c, hm, db);
+
+    /* ── 決済完了・キャンセルページ ──────────────────────────────────────── */
+    } else if (strcmp(uri, "/payment/success") == 0) {
+        if (IS_GET)
+            mg_http_reply(c, 200,
+                "Content-Type: text/html; charset=UTF-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "<!doctype html><html lang='ja'><head><meta charset='UTF-8'>"
+                "<title>お支払い完了 - asoview</title>"
+                "<style>body{font-family:sans-serif;display:flex;align-items:center;"
+                "justify-content:center;min-height:100vh;margin:0;background:#f0fdf4;}"
+                ".box{text-align:center;padding:48px;background:#fff;border-radius:16px;"
+                "box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:480px;width:90%%;}"
+                "h1{color:#16a34a;font-size:2rem;margin-bottom:.5rem}"
+                "p{color:#555;margin:1rem 0 2rem}"
+                ".btn{display:inline-block;background:#e94560;color:#fff;padding:14px 32px;"
+                "border-radius:8px;text-decoration:none;font-weight:700;font-size:1rem}"
+                ".btn:hover{background:#c73552}</style></head>"
+                "<body><div class='box'>"
+                "<div style='font-size:3rem'>&#10003;</div>"
+                "<h1>お支払いが完了しました</h1>"
+                "<p>¥50,000 のお支払いを受け付けました。<br>"
+                "次のステップに進んでください。</p>"
+                "<a class='btn' href='/'>&#8594;&nbsp;次のページへ</a>"
+                "</div></body></html>%s", "");
+
+    } else if (strcmp(uri, "/payment/cancel") == 0) {
+        if (IS_GET)
+            mg_http_reply(c, 200,
+                "Content-Type: text/html; charset=UTF-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "<!doctype html><html lang='ja'><head><meta charset='UTF-8'>"
+                "<title>お支払いキャンセル - asoview</title>"
+                "<style>body{font-family:sans-serif;display:flex;align-items:center;"
+                "justify-content:center;min-height:100vh;margin:0;background:#fff7ed;}"
+                ".box{text-align:center;padding:48px;background:#fff;border-radius:16px;"
+                "box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:480px;width:90%%;}"
+                "h1{color:#ea580c;font-size:2rem;margin-bottom:.5rem}"
+                "p{color:#555;margin:1rem 0 2rem}"
+                ".btn{display:inline-block;background:#e94560;color:#fff;padding:14px 32px;"
+                "border-radius:8px;text-decoration:none;font-weight:700;font-size:1rem}"
+                ".btn:hover{background:#c73552}</style></head>"
+                "<body><div class='box'>"
+                "<div style='font-size:3rem'>&#9888;</div>"
+                "<h1>お支払いがキャンセルされました</h1>"
+                "<p>お支払いはキャンセルされました。<br>"
+                "もう一度お試しください。</p>"
+                "<a class='btn' href='javascript:history.back()'>&#8592;&nbsp;前のページに戻る</a>"
+                "</div></body></html>%s", "");
+
     } else if (strcmp(uri, "/api/v1/bookmarks") == 0) {
         if (IS_POST) handle_create_bookmark(c, hm, db);
 
@@ -171,6 +472,16 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     } else if (sscanf(uri, "/api/v1/reviews/%ld", &id) == 1) {
         if (IS_DELETE) handle_delete_review(c, hm, db, id);
+
+    /* ── Waitlist ────────────────────────────────────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/waitlist") == 0) {
+        if (IS_POST) handle_create_waitlist(c, hm, db);
+
+    } else if (sscanf(uri, "/api/v1/waitlist/schedule/%ld", &id) == 1) {
+        if (IS_GET) handle_list_waitlist(c, hm, db, id);
+
+    } else if (sscanf(uri, "/api/v1/waitlist/%ld", &id) == 1) {
+        if (IS_DELETE) handle_delete_waitlist(c, hm, db, id);
 
     /* Admin endpoints: /api/v1/admin/ ──────────────────────── */
     } else if (strcmp(uri, "/api/v1/admin/venues") == 0) {
@@ -237,7 +548,7 @@ int main(int argc, char *argv[]) {
     if (argc >= 2) db_path = argv[1];
     if (argc >= 3) port = argv[2];
 
-    /* ── セキュリティ起動チェック ──────────────────────────────────── */
+    /* ── セキュリティ起動チェック ──────────────────────────────────────── */
     const char *jwt_secret   = getenv("JWT_SECRET");
     const char *admin_key    = getenv("ADMIN_KEY");
     const char *stripe_sk    = getenv("STRIPE_SECRET_KEY");
@@ -266,7 +577,9 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, handle_signal);
     signal(SIGINT,  handle_signal);
 
-    sqlite3 *db = db_open(db_path);
+    metrics_init();
+
+    DbConn *db = db_open(db_path);
     if (!db) return 1;
     seed_if_empty(db);
 

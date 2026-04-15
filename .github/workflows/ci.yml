@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  test-sqlite:
     runs-on: ubuntu-latest
 
     steps:
@@ -27,3 +27,91 @@ jobs:
         env:
           JWT_SECRET: ci-test-jwt-secret-value-32chars-ok
           ADMIN_KEY: asoview-admin-dev
+
+  test-postgres:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: asoview
+          POSTGRES_PASSWORD: asoview
+          POSTGRES_DB: asoview
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libpq-dev libcurl4-openssl-dev libssl-dev
+
+      - name: Apply schema
+        run: |
+          PGPASSWORD=asoview psql -h localhost -U asoview -d asoview \
+            -f migrations/schema_postgres.sql
+
+      - name: Build schema embed
+        run: make schema
+
+      - name: Build & test (PostgreSQL)
+        run: make test DB=postgres
+        env:
+          JWT_SECRET: ci-test-jwt-secret-value-32chars-ok
+          ADMIN_KEY: asoview-admin-dev
+          DATABASE_URL: postgres://asoview:asoview@localhost:5432/asoview
+
+  test-mysql:
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: asoview
+          MYSQL_DATABASE: asoview
+          MYSQL_USER: asoview
+          MYSQL_PASSWORD: asoview
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -u root -pasoview"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential default-libmysqlclient-dev libcurl4-openssl-dev libssl-dev
+
+      - name: Apply schema
+        run: |
+          mysql -h 127.0.0.1 -u asoview -pasoview asoview \
+            < migrations/schema_mysql.sql
+
+      - name: Build schema embed
+        run: make schema
+
+      - name: Build & test (MySQL)
+        run: make test DB=mysql
+        env:
+          JWT_SECRET: ci-test-jwt-secret-value-32chars-ok
+          ADMIN_KEY: asoview-admin-dev
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_USER: asoview
+          MYSQL_PASSWORD: asoview
+          MYSQL_DATABASE: asoview

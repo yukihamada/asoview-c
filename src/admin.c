@@ -12,11 +12,13 @@
 /* 定数時間文字列比較（タイミング攻撃対策） */
 static int const_time_strcmp(const char *a, size_t a_len,
                               const char *b, size_t b_len) {
-    /* 長さが違えば必ず不一致。ただし長さ自体も漏らさないよう両方走査する */
+    /* 長さが違えば必ず不一致。長さ差もタイミングから漏らさないよう最大長まで走査する */
     unsigned char diff = (unsigned char)(a_len != b_len);
-    size_t n = a_len < b_len ? a_len : b_len;
+    size_t n = a_len > b_len ? a_len : b_len;
     for (size_t i = 0; i < n; i++) {
-        diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
+        unsigned char ca = i < a_len ? (unsigned char)a[i] : 0;
+        unsigned char cb = i < b_len ? (unsigned char)b[i] : 0;
+        diff |= ca ^ cb;
     }
     return diff == 0 ? 1 : 0;
 }
@@ -49,55 +51,54 @@ static long admin_query_long(struct mg_http_message *hm, const char *k, long def
 
 /* ─── Venues ──────────────────────────────────────────────────────────────── */
 
-void handle_admin_list_venues(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db) {
+void handle_admin_list_venues(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
     if (!require_admin(c, hm)) return;
     long page  = admin_query_long(hm, "page", 1);  if (page < 1) page = 1;
     long limit = admin_query_long(hm, "limit", 50); if (limit > 200) limit = 200;
     long offset = (page - 1) * limit;
 
-    sqlite3_stmt *ct;
-    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM venues", -1, &ct, NULL);
-    sqlite3_step(ct);
-    long total = sqlite3_column_int64(ct, 0);
-    sqlite3_finalize(ct);
+    DbStmt *ct = NULL;
+    ct = db_prepare(db, "SELECT COUNT(*) FROM venues");
+    db_step(ct);
+    long total = db_col_int(ct, 0);
+    db_finalize(ct);
 
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(db,
+    DbStmt *st = NULL;
+    st = db_prepare(db,
         "SELECT v.id,v.name,v.description,v.area_id,a.name,"
         "v.address,v.phone,v.website,v.review_count,v.review_avg,v.created_at "
         "FROM venues v LEFT JOIN areas a ON a.id=v.area_id "
-        "ORDER BY v.id LIMIT ? OFFSET ?",
-        -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, limit);
-    sqlite3_bind_int64(st, 2, offset);
+        "ORDER BY v.id LIMIT ? OFFSET ?");
+    db_bind_int(st, 1, limit);
+    db_bind_int(st, 2, offset);
 
     cJSON *venues = cJSON_CreateArray();
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    while (db_step(st) == 1) {
         cJSON *v = cJSON_CreateObject();
-        cJSON_AddNumberToObject(v, "id",           sqlite3_column_int64(st, 0));
-        cJSON_AddStringToObject(v, "name",         (const char*)sqlite3_column_text(st, 1));
-        if (sqlite3_column_type(st, 2) != SQLITE_NULL)
-            cJSON_AddStringToObject(v, "description", (const char*)sqlite3_column_text(st, 2));
+        cJSON_AddNumberToObject(v, "id",           db_col_int(st, 0));
+        cJSON_AddStringToObject(v, "name",         db_col_text(st, 1));
+        if (!db_col_is_null(st, 2))
+            cJSON_AddStringToObject(v, "description", db_col_text(st, 2));
         else cJSON_AddNullToObject(v, "description");
-        cJSON_AddNumberToObject(v, "area_id",      sqlite3_column_int64(st, 3));
-        if (sqlite3_column_type(st, 4) != SQLITE_NULL)
-            cJSON_AddStringToObject(v, "area_name", (const char*)sqlite3_column_text(st, 4));
+        cJSON_AddNumberToObject(v, "area_id",      db_col_int(st, 3));
+        if (!db_col_is_null(st, 4))
+            cJSON_AddStringToObject(v, "area_name", db_col_text(st, 4));
         else cJSON_AddNullToObject(v, "area_name");
-        if (sqlite3_column_type(st, 5) != SQLITE_NULL)
-            cJSON_AddStringToObject(v, "address",  (const char*)sqlite3_column_text(st, 5));
+        if (!db_col_is_null(st, 5))
+            cJSON_AddStringToObject(v, "address",  db_col_text(st, 5));
         else cJSON_AddNullToObject(v, "address");
-        if (sqlite3_column_type(st, 6) != SQLITE_NULL)
-            cJSON_AddStringToObject(v, "phone",    (const char*)sqlite3_column_text(st, 6));
+        if (!db_col_is_null(st, 6))
+            cJSON_AddStringToObject(v, "phone",    db_col_text(st, 6));
         else cJSON_AddNullToObject(v, "phone");
-        if (sqlite3_column_type(st, 7) != SQLITE_NULL)
-            cJSON_AddStringToObject(v, "website",  (const char*)sqlite3_column_text(st, 7));
+        if (!db_col_is_null(st, 7))
+            cJSON_AddStringToObject(v, "website",  db_col_text(st, 7));
         else cJSON_AddNullToObject(v, "website");
-        cJSON_AddNumberToObject(v, "review_count", sqlite3_column_int64(st, 8));
-        cJSON_AddNumberToObject(v, "review_avg",   sqlite3_column_double(st, 9));
-        cJSON_AddStringToObject(v, "created_at",   (const char*)sqlite3_column_text(st, 10));
+        cJSON_AddNumberToObject(v, "review_count", db_col_int(st, 8));
+        cJSON_AddNumberToObject(v, "review_avg",   db_col_double(st, 9));
+        cJSON_AddStringToObject(v, "created_at",   db_col_text(st, 10));
         cJSON_AddItemToArray(venues, v);
     }
-    sqlite3_finalize(st);
+    db_finalize(st);
 
     cJSON *res = cJSON_CreateObject();
     cJSON_AddItemToObject(res, "venues", venues);
@@ -108,7 +109,7 @@ void handle_admin_list_venues(struct mg_connection *c, struct mg_http_message *h
     cJSON_Delete(res);
 }
 
-void handle_admin_create_venue(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db) {
+void handle_admin_create_venue(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
     if (!require_admin(c, hm)) return;
     cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
     if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
@@ -129,21 +130,21 @@ void handle_admin_create_venue(struct mg_connection *c, struct mg_http_message *
         return;
     }
 
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(db,
+    DbStmt *st = NULL;
+    st = db_prepare(db,
         "INSERT INTO venues(name,description,area_id,address,latitude,longitude,phone,images)"
-        " VALUES(?,?,?,?,?,?,?,?)", -1, &st, NULL);
-    sqlite3_bind_text(st, 1, name,   -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 2, desc ? desc : "", -1, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 3, area_id);
-    sqlite3_bind_text(st, 4, address ? address : "", -1, SQLITE_STATIC);
-    sqlite3_bind_double(st, 5, lat);
-    sqlite3_bind_double(st, 6, lon);
-    sqlite3_bind_text(st, 7, phone ? phone : "", -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 8, imgs_str ? imgs_str : "[]", -1, SQLITE_STATIC);
-    sqlite3_step(st);
-    long vid = sqlite3_last_insert_rowid(db);
-    sqlite3_finalize(st);
+        " VALUES(?,?,?,?,?,?,?,?)");
+    db_bind_text(st, 1, name);
+    db_bind_text(st, 2, desc ? desc : "");
+    db_bind_int(st, 3, area_id);
+    db_bind_text(st, 4, address ? address : "");
+    db_bind_double(st, 5, lat);
+    db_bind_double(st, 6, lon);
+    db_bind_text(st, 7, phone ? phone : "");
+    db_bind_text(st, 8, imgs_str ? imgs_str : "[]");
+    db_step(st);
+    long vid = db_last_id(db);
+    db_finalize(st);
     if (imgs_str) cJSON_free(imgs_str);
     cJSON_Delete(body);
 
@@ -154,46 +155,46 @@ void handle_admin_create_venue(struct mg_connection *c, struct mg_http_message *
     cJSON_Delete(res);
 }
 
-void handle_admin_update_venue(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db, long id) {
+void handle_admin_update_venue(struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id) {
     if (!require_admin(c, hm)) return;
     cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
     if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
 
     /* 対象の存在確認 */
-    sqlite3_stmt *chk;
-    sqlite3_prepare_v2(db, "SELECT id FROM venues WHERE id=?", -1, &chk, NULL);
-    sqlite3_bind_int64(chk, 1, id);
-    if (sqlite3_step(chk) != SQLITE_ROW) {
-        sqlite3_finalize(chk); cJSON_Delete(body);
+    DbStmt *chk = NULL;
+    chk = db_prepare(db, "SELECT id FROM venues WHERE id=?");
+    db_bind_int(chk, 1, id);
+    if (db_step(chk) != 1) {
+        db_finalize(chk); cJSON_Delete(body);
         send_error_json(c, 404, "venue not found"); return;
     }
-    sqlite3_finalize(chk);
+    db_finalize(chk);
 
     /* partial update — あるフィールドだけ更新 */
     cJSON *it;
     it = cJSON_GetObjectItem(body, "name");
     if (it && cJSON_IsString(it)) {
-        sqlite3_stmt *u; sqlite3_prepare_v2(db, "UPDATE venues SET name=? WHERE id=?", -1, &u, NULL);
-        sqlite3_bind_text(u, 1, cJSON_GetStringValue(it), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(u, 2, id); sqlite3_step(u); sqlite3_finalize(u);
+        DbStmt *u = NULL; u = db_prepare(db, "UPDATE venues SET name=? WHERE id=?");
+        db_bind_text(u, 1, cJSON_GetStringValue(it));
+        db_bind_int(u, 2, id); db_step(u); db_finalize(u);
     }
     it = cJSON_GetObjectItem(body, "description");
     if (it && cJSON_IsString(it)) {
-        sqlite3_stmt *u; sqlite3_prepare_v2(db, "UPDATE venues SET description=? WHERE id=?", -1, &u, NULL);
-        sqlite3_bind_text(u, 1, cJSON_GetStringValue(it), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(u, 2, id); sqlite3_step(u); sqlite3_finalize(u);
+        DbStmt *u = NULL; u = db_prepare(db, "UPDATE venues SET description=? WHERE id=?");
+        db_bind_text(u, 1, cJSON_GetStringValue(it));
+        db_bind_int(u, 2, id); db_step(u); db_finalize(u);
     }
     it = cJSON_GetObjectItem(body, "address");
     if (it && cJSON_IsString(it)) {
-        sqlite3_stmt *u; sqlite3_prepare_v2(db, "UPDATE venues SET address=? WHERE id=?", -1, &u, NULL);
-        sqlite3_bind_text(u, 1, cJSON_GetStringValue(it), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(u, 2, id); sqlite3_step(u); sqlite3_finalize(u);
+        DbStmt *u = NULL; u = db_prepare(db, "UPDATE venues SET address=? WHERE id=?");
+        db_bind_text(u, 1, cJSON_GetStringValue(it));
+        db_bind_int(u, 2, id); db_step(u); db_finalize(u);
     }
     it = cJSON_GetObjectItem(body, "phone");
     if (it && cJSON_IsString(it)) {
-        sqlite3_stmt *u; sqlite3_prepare_v2(db, "UPDATE venues SET phone=? WHERE id=?", -1, &u, NULL);
-        sqlite3_bind_text(u, 1, cJSON_GetStringValue(it), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(u, 2, id); sqlite3_step(u); sqlite3_finalize(u);
+        DbStmt *u = NULL; u = db_prepare(db, "UPDATE venues SET phone=? WHERE id=?");
+        db_bind_text(u, 1, cJSON_GetStringValue(it));
+        db_bind_int(u, 2, id); db_step(u); db_finalize(u);
     }
     cJSON_Delete(body);
 
@@ -203,15 +204,15 @@ void handle_admin_update_venue(struct mg_connection *c, struct mg_http_message *
     cJSON_Delete(res);
 }
 
-void handle_admin_delete_venue(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db, long id) {
+void handle_admin_delete_venue(struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id) {
     if (!require_admin(c, hm)) return;
     /* active plans があれば 409 */
-    sqlite3_stmt *chk;
-    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM plans WHERE venue_id=? AND is_active=1", -1, &chk, NULL);
-    sqlite3_bind_int64(chk, 1, id);
-    sqlite3_step(chk);
-    long active = sqlite3_column_int64(chk, 0);
-    sqlite3_finalize(chk);
+    DbStmt *chk = NULL;
+    chk = db_prepare(db, "SELECT COUNT(*) FROM plans WHERE venue_id=? AND is_active=1");
+    db_bind_int(chk, 1, id);
+    db_step(chk);
+    long active = db_col_int(chk, 0);
+    db_finalize(chk);
     if (active > 0) { send_error_json(c, 409, "この施設にはアクティブなプランがあります"); return; }
     /* soft-deleted plans の関連データを順にカスケード削除 */
     const char *cascade[] = {
@@ -222,18 +223,18 @@ void handle_admin_delete_venue(struct mg_connection *c, struct mg_http_message *
         NULL
     };
     for (int ci = 0; cascade[ci]; ci++) {
-        sqlite3_stmt *dp;
-        sqlite3_prepare_v2(db, cascade[ci], -1, &dp, NULL);
-        sqlite3_bind_int64(dp, 1, id);
-        sqlite3_step(dp); sqlite3_finalize(dp);
+        DbStmt *dp = NULL;
+        dp = db_prepare(db, cascade[ci]);
+        db_bind_int(dp, 1, id);
+        db_step(dp); db_finalize(dp);
     }
     /* venue を削除 */
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(db, "DELETE FROM venues WHERE id=?", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, id);
-    int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
-    if (rc != SQLITE_DONE || sqlite3_changes(db) == 0) {
+    DbStmt *st = NULL;
+    st = db_prepare(db, "DELETE FROM venues WHERE id=?");
+    db_bind_int(st, 1, id);
+    int rc = db_step(st);
+    db_finalize(st);
+    if (rc == -1 || db_changes(db) == 0) {
         send_error_json(c, 404, "venue not found"); return;
     }
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"施設を削除しました\"}");
@@ -241,7 +242,7 @@ void handle_admin_delete_venue(struct mg_connection *c, struct mg_http_message *
 
 /* ─── Plans ───────────────────────────────────────────────────────────────── */
 
-void handle_admin_create_plan(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db) {
+void handle_admin_create_plan(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
     if (!require_admin(c, hm)) return;
     cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
     if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
@@ -267,24 +268,24 @@ void handle_admin_create_plan(struct mg_connection *c, struct mg_http_message *h
         return;
     }
 
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(db,
+    DbStmt *st = NULL;
+    st = db_prepare(db,
         "INSERT INTO plans(venue_id,category_id,title,description,duration_minutes,"
         "min_participants,max_participants,min_age,images,tags)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?)", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, venue_id);
-    sqlite3_bind_int64(st, 2, category_id);
-    sqlite3_bind_text(st, 3, title, -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 4, desc ? desc : "", -1, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 5, dur);
-    sqlite3_bind_int64(st, 6, minp > 0 ? minp : 1);
-    sqlite3_bind_int64(st, 7, maxp);
-    sqlite3_bind_int64(st, 8, minage);
-    sqlite3_bind_text(st, 9, imgs_str ? imgs_str : "[]", -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 10, tags_str ? tags_str : "[]", -1, SQLITE_STATIC);
-    sqlite3_step(st);
-    long pid = sqlite3_last_insert_rowid(db);
-    sqlite3_finalize(st);
+        " VALUES(?,?,?,?,?,?,?,?,?,?)");
+    db_bind_int(st, 1, venue_id);
+    db_bind_int(st, 2, category_id);
+    db_bind_text(st, 3, title);
+    db_bind_text(st, 4, desc ? desc : "");
+    db_bind_int(st, 5, dur);
+    db_bind_int(st, 6, minp > 0 ? minp : 1);
+    db_bind_int(st, 7, maxp);
+    db_bind_int(st, 8, minage);
+    db_bind_text(st, 9, imgs_str ? imgs_str : "[]");
+    db_bind_text(st, 10, tags_str ? tags_str : "[]");
+    db_step(st);
+    long pid = db_last_id(db);
+    db_finalize(st);
     if (imgs_str) cJSON_free(imgs_str);
     if (tags_str) cJSON_free(tags_str);
 
@@ -298,15 +299,14 @@ void handle_admin_create_plan(struct mg_connection *c, struct mg_http_message *h
             const char *lb = cJSON_GetStringValue(cJSON_GetObjectItem(pr, "label"));
             long price     = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(pr, "price"));
             if (!pt || !lb || price <= 0) continue;
-            sqlite3_stmt *pi;
-            sqlite3_prepare_v2(db,
-                "INSERT INTO plan_prices(plan_id,participant_type,label,price) VALUES(?,?,?,?)",
-                -1, &pi, NULL);
-            sqlite3_bind_int64(pi, 1, pid);
-            sqlite3_bind_text(pi, 2, pt, -1, SQLITE_STATIC);
-            sqlite3_bind_text(pi, 3, lb, -1, SQLITE_STATIC);
-            sqlite3_bind_int64(pi, 4, price);
-            sqlite3_step(pi); sqlite3_finalize(pi);
+            DbStmt *pi = NULL;
+            pi = db_prepare(db,
+                "INSERT INTO plan_prices(plan_id,participant_type,label,price) VALUES(?,?,?,?)");
+            db_bind_int(pi, 1, pid);
+            db_bind_text(pi, 2, pt);
+            db_bind_text(pi, 3, lb);
+            db_bind_int(pi, 4, price);
+            db_step(pi); db_finalize(pi);
         }
     }
     cJSON_Delete(body);
@@ -318,38 +318,38 @@ void handle_admin_create_plan(struct mg_connection *c, struct mg_http_message *h
     cJSON_Delete(res);
 }
 
-void handle_admin_update_plan(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db, long id) {
+void handle_admin_update_plan(struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id) {
     if (!require_admin(c, hm)) return;
     cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
     if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
 
-    sqlite3_stmt *chk;
-    sqlite3_prepare_v2(db, "SELECT id FROM plans WHERE id=?", -1, &chk, NULL);
-    sqlite3_bind_int64(chk, 1, id);
-    if (sqlite3_step(chk) != SQLITE_ROW) {
-        sqlite3_finalize(chk); cJSON_Delete(body);
+    DbStmt *chk = NULL;
+    chk = db_prepare(db, "SELECT id FROM plans WHERE id=?");
+    db_bind_int(chk, 1, id);
+    if (db_step(chk) != 1) {
+        db_finalize(chk); cJSON_Delete(body);
         send_error_json(c, 404, "plan not found"); return;
     }
-    sqlite3_finalize(chk);
+    db_finalize(chk);
 
     cJSON *it;
     it = cJSON_GetObjectItem(body, "title");
     if (it && cJSON_IsString(it)) {
-        sqlite3_stmt *u; sqlite3_prepare_v2(db, "UPDATE plans SET title=? WHERE id=?", -1, &u, NULL);
-        sqlite3_bind_text(u, 1, cJSON_GetStringValue(it), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(u, 2, id); sqlite3_step(u); sqlite3_finalize(u);
+        DbStmt *u = NULL; u = db_prepare(db, "UPDATE plans SET title=? WHERE id=?");
+        db_bind_text(u, 1, cJSON_GetStringValue(it));
+        db_bind_int(u, 2, id); db_step(u); db_finalize(u);
     }
     it = cJSON_GetObjectItem(body, "description");
     if (it && cJSON_IsString(it)) {
-        sqlite3_stmt *u; sqlite3_prepare_v2(db, "UPDATE plans SET description=? WHERE id=?", -1, &u, NULL);
-        sqlite3_bind_text(u, 1, cJSON_GetStringValue(it), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(u, 2, id); sqlite3_step(u); sqlite3_finalize(u);
+        DbStmt *u = NULL; u = db_prepare(db, "UPDATE plans SET description=? WHERE id=?");
+        db_bind_text(u, 1, cJSON_GetStringValue(it));
+        db_bind_int(u, 2, id); db_step(u); db_finalize(u);
     }
     it = cJSON_GetObjectItem(body, "is_active");
     if (it && cJSON_IsBool(it)) {
-        sqlite3_stmt *u; sqlite3_prepare_v2(db, "UPDATE plans SET is_active=? WHERE id=?", -1, &u, NULL);
-        sqlite3_bind_int(u, 1, cJSON_IsTrue(it) ? 1 : 0);
-        sqlite3_bind_int64(u, 2, id); sqlite3_step(u); sqlite3_finalize(u);
+        DbStmt *u = NULL; u = db_prepare(db, "UPDATE plans SET is_active=? WHERE id=?");
+        db_bind_int(u, 1, cJSON_IsTrue(it) ? 1 : 0);
+        db_bind_int(u, 2, id); db_step(u); db_finalize(u);
     }
     cJSON_Delete(body);
 
@@ -359,14 +359,14 @@ void handle_admin_update_plan(struct mg_connection *c, struct mg_http_message *h
     cJSON_Delete(res);
 }
 
-void handle_admin_delete_plan(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db, long id) {
+void handle_admin_delete_plan(struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id) {
     if (!require_admin(c, hm)) return;
     /* soft delete — is_active=0 */
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(db, "UPDATE plans SET is_active=0 WHERE id=?", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, id);
-    sqlite3_step(st); sqlite3_finalize(st);
-    if (sqlite3_changes(db) == 0) {
+    DbStmt *st = NULL;
+    st = db_prepare(db, "UPDATE plans SET is_active=0 WHERE id=?");
+    db_bind_int(st, 1, id);
+    db_step(st); db_finalize(st);
+    if (db_changes(db) == 0) {
         send_error_json(c, 404, "plan not found"); return;
     }
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"プランを非公開にしました\"}");
@@ -375,7 +375,7 @@ void handle_admin_delete_plan(struct mg_connection *c, struct mg_http_message *h
 /* ─── Schedules ───────────────────────────────────────────────────────────── */
 
 void handle_admin_create_schedule(struct mg_connection *c, struct mg_http_message *hm,
-                                   sqlite3 *db, long plan_id) {
+                                   DbConn *db, long plan_id) {
     if (!require_admin(c, hm)) return;
     cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
     if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
@@ -391,18 +391,18 @@ void handle_admin_create_schedule(struct mg_connection *c, struct mg_http_messag
         return;
     }
 
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(db,
+    DbStmt *st = NULL;
+    st = db_prepare(db,
         "INSERT INTO schedules(plan_id,date,start_time,end_time,capacity)"
-        " VALUES(?,?,?,?,?)", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, plan_id);
-    sqlite3_bind_text(st, 2, date,  -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 3, start, -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 4, end ? end : "", -1, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 5, cap);
-    sqlite3_step(st);
-    long sid = sqlite3_last_insert_rowid(db);
-    sqlite3_finalize(st);
+        " VALUES(?,?,?,?,?)");
+    db_bind_int(st, 1, plan_id);
+    db_bind_text(st, 2, date);
+    db_bind_text(st, 3, start);
+    db_bind_text(st, 4, end ? end : "");
+    db_bind_int(st, 5, cap);
+    db_step(st);
+    long sid = db_last_id(db);
+    db_finalize(st);
     cJSON_Delete(body);
 
     cJSON *res = cJSON_CreateObject();
@@ -413,27 +413,26 @@ void handle_admin_create_schedule(struct mg_connection *c, struct mg_http_messag
 }
 
 void handle_admin_delete_schedule(struct mg_connection *c, struct mg_http_message *hm,
-                                   sqlite3 *db, long id) {
+                                   DbConn *db, long id) {
     if (!require_admin(c, hm)) return;
     /* 予約があれば削除不可 */
-    sqlite3_stmt *chk;
-    sqlite3_prepare_v2(db,
-        "SELECT COUNT(*) FROM bookings WHERE schedule_id=? AND status!='cancelled'",
-        -1, &chk, NULL);
-    sqlite3_bind_int64(chk, 1, id);
-    sqlite3_step(chk);
-    long cnt = sqlite3_column_int64(chk, 0);
-    sqlite3_finalize(chk);
+    DbStmt *chk = NULL;
+    chk = db_prepare(db,
+        "SELECT COUNT(*) FROM bookings WHERE schedule_id=? AND status!='cancelled'");
+    db_bind_int(chk, 1, id);
+    db_step(chk);
+    long cnt = db_col_int(chk, 0);
+    db_finalize(chk);
     if (cnt > 0) {
         send_error_json(c, 409, "このスケジュールには有効な予約があるため削除できません");
         return;
     }
 
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(db, "DELETE FROM schedules WHERE id=?", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, id);
-    sqlite3_step(st); sqlite3_finalize(st);
-    if (sqlite3_changes(db) == 0) {
+    DbStmt *st = NULL;
+    st = db_prepare(db, "DELETE FROM schedules WHERE id=?");
+    db_bind_int(st, 1, id);
+    db_step(st); db_finalize(st);
+    if (db_changes(db) == 0) {
         send_error_json(c, 404, "schedule not found"); return;
     }
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"スケジュールを削除しました\"}");
@@ -442,7 +441,7 @@ void handle_admin_delete_schedule(struct mg_connection *c, struct mg_http_messag
 /* ─── Plan Prices ─────────────────────────────────────────────────────────── */
 
 void handle_admin_set_prices(struct mg_connection *c, struct mg_http_message *hm,
-                              sqlite3 *db, long plan_id) {
+                              DbConn *db, long plan_id) {
     if (!require_admin(c, hm)) return;
     cJSON *arr = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
     if (!arr || !cJSON_IsArray(arr)) {
@@ -451,10 +450,10 @@ void handle_admin_set_prices(struct mg_connection *c, struct mg_http_message *hm
     }
 
     /* 既存価格を削除して置き換え */
-    sqlite3_stmt *del;
-    sqlite3_prepare_v2(db, "DELETE FROM plan_prices WHERE plan_id=?", -1, &del, NULL);
-    sqlite3_bind_int64(del, 1, plan_id);
-    sqlite3_step(del); sqlite3_finalize(del);
+    DbStmt *del = NULL;
+    del = db_prepare(db, "DELETE FROM plan_prices WHERE plan_id=?");
+    db_bind_int(del, 1, plan_id);
+    db_step(del); db_finalize(del);
 
     int n = cJSON_GetArraySize(arr);
     for (int i = 0; i < n; i++) {
@@ -463,15 +462,14 @@ void handle_admin_set_prices(struct mg_connection *c, struct mg_http_message *hm
         const char *lb = cJSON_GetStringValue(cJSON_GetObjectItem(pr, "label"));
         long price     = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(pr, "price"));
         if (!pt || !lb || price <= 0) continue;
-        sqlite3_stmt *ins;
-        sqlite3_prepare_v2(db,
-            "INSERT INTO plan_prices(plan_id,participant_type,label,price) VALUES(?,?,?,?)",
-            -1, &ins, NULL);
-        sqlite3_bind_int64(ins, 1, plan_id);
-        sqlite3_bind_text(ins, 2, pt,    -1, SQLITE_STATIC);
-        sqlite3_bind_text(ins, 3, lb,    -1, SQLITE_STATIC);
-        sqlite3_bind_int64(ins, 4, price);
-        sqlite3_step(ins); sqlite3_finalize(ins);
+        DbStmt *ins = NULL;
+        ins = db_prepare(db,
+            "INSERT INTO plan_prices(plan_id,participant_type,label,price) VALUES(?,?,?,?)");
+        db_bind_int(ins, 1, plan_id);
+        db_bind_text(ins, 2, pt);
+        db_bind_text(ins, 3, lb);
+        db_bind_int(ins, 4, price);
+        db_step(ins); db_finalize(ins);
     }
     cJSON_Delete(arr);
 
@@ -480,7 +478,7 @@ void handle_admin_set_prices(struct mg_connection *c, struct mg_http_message *hm
 
 /* ─── GET /api/v1/admin/plans ─────────────────────────────────────────────── */
 
-void handle_admin_list_plans(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db) {
+void handle_admin_list_plans(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
     if (!require_admin(c, hm)) return;
     long page  = admin_query_long(hm, "page", 1);  if (page < 1) page = 1;
     long limit = admin_query_long(hm, "limit", 50); if (limit > 200) limit = 200;
@@ -491,18 +489,17 @@ void handle_admin_list_plans(struct mg_connection *c, struct mg_http_message *hm
     int has_active = mg_http_get_var(&hm->query, "is_active", active_str, sizeof(active_str)) > 0;
     int active_val = has_active ? (int)strtol(active_str, NULL, 10) : -1;
 
-    sqlite3_stmt *ct;
-    sqlite3_prepare_v2(db,
-        "SELECT COUNT(*) FROM plans WHERE (? < 0 OR is_active=?)",
-        -1, &ct, NULL);
-    sqlite3_bind_int64(ct, 1, active_val);
-    sqlite3_bind_int64(ct, 2, active_val);
-    sqlite3_step(ct);
-    long total = sqlite3_column_int64(ct, 0);
-    sqlite3_finalize(ct);
+    DbStmt *ct = NULL;
+    ct = db_prepare(db,
+        "SELECT COUNT(*) FROM plans WHERE (? < 0 OR is_active=?)");
+    db_bind_int(ct, 1, active_val);
+    db_bind_int(ct, 2, active_val);
+    db_step(ct);
+    long total = db_col_int(ct, 0);
+    db_finalize(ct);
 
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(db,
+    DbStmt *st = NULL;
+    st = db_prepare(db,
         "SELECT p.id,p.venue_id,v.name,p.category_id,c.name,"
         "p.title,p.is_active,p.min_participants,p.max_participants,"
         "p.duration_minutes,p.created_at "
@@ -510,34 +507,33 @@ void handle_admin_list_plans(struct mg_connection *c, struct mg_http_message *hm
         "JOIN venues v ON v.id=p.venue_id "
         "JOIN categories c ON c.id=p.category_id "
         "WHERE (? < 0 OR p.is_active=?) "
-        "ORDER BY p.id LIMIT ? OFFSET ?",
-        -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, active_val);
-    sqlite3_bind_int64(st, 2, active_val);
-    sqlite3_bind_int64(st, 3, limit);
-    sqlite3_bind_int64(st, 4, offset);
+        "ORDER BY p.id LIMIT ? OFFSET ?");
+    db_bind_int(st, 1, active_val);
+    db_bind_int(st, 2, active_val);
+    db_bind_int(st, 3, limit);
+    db_bind_int(st, 4, offset);
 
     cJSON *plans = cJSON_CreateArray();
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    while (db_step(st) == 1) {
         cJSON *p = cJSON_CreateObject();
-        cJSON_AddNumberToObject(p, "id",             sqlite3_column_int64(st, 0));
-        cJSON_AddNumberToObject(p, "venue_id",       sqlite3_column_int64(st, 1));
-        cJSON_AddStringToObject(p, "venue_name",     (const char*)sqlite3_column_text(st, 2));
-        cJSON_AddNumberToObject(p, "category_id",    sqlite3_column_int64(st, 3));
-        cJSON_AddStringToObject(p, "category_name",  (const char*)sqlite3_column_text(st, 4));
-        cJSON_AddStringToObject(p, "title",          (const char*)sqlite3_column_text(st, 5));
-        cJSON_AddBoolToObject(p, "is_active",        sqlite3_column_int(st, 6) == 1);
-        cJSON_AddNumberToObject(p, "min_participants",sqlite3_column_int64(st, 7));
-        if (sqlite3_column_type(st, 8) != SQLITE_NULL)
-            cJSON_AddNumberToObject(p, "max_participants", sqlite3_column_int64(st, 8));
+        cJSON_AddNumberToObject(p, "id",             db_col_int(st, 0));
+        cJSON_AddNumberToObject(p, "venue_id",       db_col_int(st, 1));
+        cJSON_AddStringToObject(p, "venue_name",     db_col_text(st, 2));
+        cJSON_AddNumberToObject(p, "category_id",    db_col_int(st, 3));
+        cJSON_AddStringToObject(p, "category_name",  db_col_text(st, 4));
+        cJSON_AddStringToObject(p, "title",          db_col_text(st, 5));
+        cJSON_AddBoolToObject(p, "is_active",        (int)db_col_int(st, 6) == 1);
+        cJSON_AddNumberToObject(p, "min_participants",db_col_int(st, 7));
+        if (!db_col_is_null(st, 8))
+            cJSON_AddNumberToObject(p, "max_participants", db_col_int(st, 8));
         else cJSON_AddNullToObject(p, "max_participants");
-        if (sqlite3_column_type(st, 9) != SQLITE_NULL)
-            cJSON_AddNumberToObject(p, "duration_minutes", sqlite3_column_int64(st, 9));
+        if (!db_col_is_null(st, 9))
+            cJSON_AddNumberToObject(p, "duration_minutes", db_col_int(st, 9));
         else cJSON_AddNullToObject(p, "duration_minutes");
-        cJSON_AddStringToObject(p, "created_at",     (const char*)sqlite3_column_text(st, 10));
+        cJSON_AddStringToObject(p, "created_at",     db_col_text(st, 10));
         cJSON_AddItemToArray(plans, p);
     }
-    sqlite3_finalize(st);
+    db_finalize(st);
 
     cJSON *res = cJSON_CreateObject();
     cJSON_AddItemToObject(res, "plans", plans);
@@ -551,21 +547,21 @@ void handle_admin_list_plans(struct mg_connection *c, struct mg_http_message *hm
 /* ─── PATCH /api/v1/admin/schedules/:id ────────────────────────────────────── */
 
 void handle_admin_update_schedule(struct mg_connection *c, struct mg_http_message *hm,
-                                   sqlite3 *db, long id) {
+                                   DbConn *db, long id) {
     if (!require_admin(c, hm)) return;
     cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
     if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
 
     /* 存在確認 */
-    sqlite3_stmt *chk;
-    sqlite3_prepare_v2(db, "SELECT booked_count FROM schedules WHERE id=?", -1, &chk, NULL);
-    sqlite3_bind_int64(chk, 1, id);
-    if (sqlite3_step(chk) != SQLITE_ROW) {
-        sqlite3_finalize(chk); cJSON_Delete(body);
+    DbStmt *chk = NULL;
+    chk = db_prepare(db, "SELECT booked_count FROM schedules WHERE id=?");
+    db_bind_int(chk, 1, id);
+    if (db_step(chk) != 1) {
+        db_finalize(chk); cJSON_Delete(body);
         send_error_json(c, 404, "schedule not found"); return;
     }
-    long booked = sqlite3_column_int64(chk, 0);
-    sqlite3_finalize(chk);
+    long booked = db_col_int(chk, 0);
+    db_finalize(chk);
 
     /* capacity 変更 — booked_count を下回る値は拒否 */
     cJSON *cap_item = cJSON_GetObjectItem(body, "capacity");
@@ -575,32 +571,32 @@ void handle_admin_update_schedule(struct mg_connection *c, struct mg_http_messag
             cJSON_Delete(body);
             send_error_json(c, 400, "capacity は現在の予約数を下回ることはできません"); return;
         }
-        sqlite3_stmt *u;
-        sqlite3_prepare_v2(db, "UPDATE schedules SET capacity=? WHERE id=?", -1, &u, NULL);
-        sqlite3_bind_int64(u, 1, new_cap); sqlite3_bind_int64(u, 2, id);
-        sqlite3_step(u); sqlite3_finalize(u);
+        DbStmt *u = NULL;
+        u = db_prepare(db, "UPDATE schedules SET capacity=? WHERE id=?");
+        db_bind_int(u, 1, new_cap); db_bind_int(u, 2, id);
+        db_step(u); db_finalize(u);
     }
     cJSON *it;
     it = cJSON_GetObjectItem(body, "date");
     if (it && cJSON_IsString(it)) {
-        sqlite3_stmt *u;
-        sqlite3_prepare_v2(db, "UPDATE schedules SET date=? WHERE id=?", -1, &u, NULL);
-        sqlite3_bind_text(u, 1, cJSON_GetStringValue(it), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(u, 2, id); sqlite3_step(u); sqlite3_finalize(u);
+        DbStmt *u = NULL;
+        u = db_prepare(db, "UPDATE schedules SET date=? WHERE id=?");
+        db_bind_text(u, 1, cJSON_GetStringValue(it));
+        db_bind_int(u, 2, id); db_step(u); db_finalize(u);
     }
     it = cJSON_GetObjectItem(body, "start_time");
     if (it && cJSON_IsString(it)) {
-        sqlite3_stmt *u;
-        sqlite3_prepare_v2(db, "UPDATE schedules SET start_time=? WHERE id=?", -1, &u, NULL);
-        sqlite3_bind_text(u, 1, cJSON_GetStringValue(it), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(u, 2, id); sqlite3_step(u); sqlite3_finalize(u);
+        DbStmt *u = NULL;
+        u = db_prepare(db, "UPDATE schedules SET start_time=? WHERE id=?");
+        db_bind_text(u, 1, cJSON_GetStringValue(it));
+        db_bind_int(u, 2, id); db_step(u); db_finalize(u);
     }
     it = cJSON_GetObjectItem(body, "end_time");
     if (it && cJSON_IsString(it)) {
-        sqlite3_stmt *u;
-        sqlite3_prepare_v2(db, "UPDATE schedules SET end_time=? WHERE id=?", -1, &u, NULL);
-        sqlite3_bind_text(u, 1, cJSON_GetStringValue(it), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(u, 2, id); sqlite3_step(u); sqlite3_finalize(u);
+        DbStmt *u = NULL;
+        u = db_prepare(db, "UPDATE schedules SET end_time=? WHERE id=?");
+        db_bind_text(u, 1, cJSON_GetStringValue(it));
+        db_bind_int(u, 2, id); db_step(u); db_finalize(u);
     }
     cJSON_Delete(body);
 
@@ -612,7 +608,7 @@ void handle_admin_update_schedule(struct mg_connection *c, struct mg_http_messag
 
 /* ─── GET /api/v1/admin/bookings ────────────────────────────────────────────── */
 
-void handle_admin_list_bookings(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db) {
+void handle_admin_list_bookings(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
     if (!require_admin(c, hm)) return;
     long page  = admin_query_long(hm, "page", 1);  if (page < 1) page = 1;
     long limit = admin_query_long(hm, "limit", 50); if (limit > 200) limit = 200;
@@ -632,15 +628,15 @@ void handle_admin_list_bookings(struct mg_connection *c, struct mg_http_message 
         "AND (? = 0 OR b.user_id=?) "
         "AND (? = 0 OR b.status=?) "
         "AND (? = 0 OR s.date=?)";
-    sqlite3_stmt *ct;
-    sqlite3_prepare_v2(db, cnt_sql, -1, &ct, NULL);
-    sqlite3_bind_int64(ct, 1, plan_id_f); sqlite3_bind_int64(ct, 2, plan_id_f);
-    sqlite3_bind_int64(ct, 3, user_id_f); sqlite3_bind_int64(ct, 4, user_id_f);
-    sqlite3_bind_int(ct,  5, has_status); sqlite3_bind_text(ct,  6, status_f, -1, SQLITE_STATIC);
-    sqlite3_bind_int(ct,  7, has_date);   sqlite3_bind_text(ct,  8, date_f,   -1, SQLITE_STATIC);
-    sqlite3_step(ct);
-    long total = sqlite3_column_int64(ct, 0);
-    sqlite3_finalize(ct);
+    DbStmt *ct = NULL;
+    ct = db_prepare(db, cnt_sql);
+    db_bind_int(ct, 1, plan_id_f); db_bind_int(ct, 2, plan_id_f);
+    db_bind_int(ct, 3, user_id_f); db_bind_int(ct, 4, user_id_f);
+    db_bind_int(ct,  5, has_status); db_bind_text(ct, 6, status_f);
+    db_bind_int(ct,  7, has_date);   db_bind_text(ct, 8, date_f);
+    db_step(ct);
+    long total = db_col_int(ct, 0);
+    db_finalize(ct);
 
     const char *sel_sql =
         "SELECT b.id, b.user_id, u.name, u.email, "
@@ -655,34 +651,34 @@ void handle_admin_list_bookings(struct mg_connection *c, struct mg_http_message 
         "AND (? = 0 OR b.status=?) "
         "AND (? = 0 OR s.date=?) "
         "ORDER BY b.created_at DESC LIMIT ? OFFSET ?";
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(db, sel_sql, -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, plan_id_f); sqlite3_bind_int64(st, 2, plan_id_f);
-    sqlite3_bind_int64(st, 3, user_id_f); sqlite3_bind_int64(st, 4, user_id_f);
-    sqlite3_bind_int(st,  5, has_status); sqlite3_bind_text(st,  6, status_f, -1, SQLITE_STATIC);
-    sqlite3_bind_int(st,  7, has_date);   sqlite3_bind_text(st,  8, date_f,   -1, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 9, limit); sqlite3_bind_int64(st, 10, offset);
+    DbStmt *st = NULL;
+    st = db_prepare(db, sel_sql);
+    db_bind_int(st, 1, plan_id_f); db_bind_int(st, 2, plan_id_f);
+    db_bind_int(st, 3, user_id_f); db_bind_int(st, 4, user_id_f);
+    db_bind_int(st,  5, has_status); db_bind_text(st, 6, status_f);
+    db_bind_int(st,  7, has_date);   db_bind_text(st, 8, date_f);
+    db_bind_int(st, 9, limit); db_bind_int(st, 10, offset);
 
     cJSON *bookings = cJSON_CreateArray();
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    while (db_step(st) == 1) {
         cJSON *b = cJSON_CreateObject();
-        cJSON_AddStringToObject(b, "id",           (const char*)sqlite3_column_text(st, 0));
-        cJSON_AddNumberToObject(b, "user_id",       sqlite3_column_int64(st, 1));
-        if (sqlite3_column_type(st, 2) != SQLITE_NULL)
-            cJSON_AddStringToObject(b, "user_name", (const char*)sqlite3_column_text(st, 2));
+        cJSON_AddStringToObject(b, "id",           db_col_text(st, 0));
+        cJSON_AddNumberToObject(b, "user_id",       db_col_int(st, 1));
+        if (!db_col_is_null(st, 2))
+            cJSON_AddStringToObject(b, "user_name", db_col_text(st, 2));
         else cJSON_AddNullToObject(b, "user_name");
-        cJSON_AddStringToObject(b, "user_email",    (const char*)sqlite3_column_text(st, 3));
-        cJSON_AddNumberToObject(b, "plan_id",        sqlite3_column_int64(st, 4));
-        cJSON_AddStringToObject(b, "plan_title",     (const char*)sqlite3_column_text(st, 5));
-        cJSON_AddNumberToObject(b, "schedule_id",    sqlite3_column_int64(st, 6));
-        cJSON_AddStringToObject(b, "schedule_date",  (const char*)sqlite3_column_text(st, 7));
-        cJSON_AddStringToObject(b, "schedule_start", (const char*)sqlite3_column_text(st, 8));
-        cJSON_AddStringToObject(b, "status",         (const char*)sqlite3_column_text(st, 9));
-        cJSON_AddNumberToObject(b, "total_price",    sqlite3_column_int64(st, 10));
-        cJSON_AddStringToObject(b, "created_at",     (const char*)sqlite3_column_text(st, 11));
+        cJSON_AddStringToObject(b, "user_email",    db_col_text(st, 3));
+        cJSON_AddNumberToObject(b, "plan_id",        db_col_int(st, 4));
+        cJSON_AddStringToObject(b, "plan_title",     db_col_text(st, 5));
+        cJSON_AddNumberToObject(b, "schedule_id",    db_col_int(st, 6));
+        cJSON_AddStringToObject(b, "schedule_date",  db_col_text(st, 7));
+        cJSON_AddStringToObject(b, "schedule_start", db_col_text(st, 8));
+        cJSON_AddStringToObject(b, "status",         db_col_text(st, 9));
+        cJSON_AddNumberToObject(b, "total_price",    db_col_int(st, 10));
+        cJSON_AddStringToObject(b, "created_at",     db_col_text(st, 11));
         cJSON_AddItemToArray(bookings, b);
     }
-    sqlite3_finalize(st);
+    db_finalize(st);
 
     cJSON *res = cJSON_CreateObject();
     cJSON_AddItemToObject(res, "bookings", bookings);
@@ -695,7 +691,7 @@ void handle_admin_list_bookings(struct mg_connection *c, struct mg_http_message 
 
 /* ─── GET /api/v1/admin/reviews ─────────────────────────────────────────────── */
 
-void handle_admin_list_reviews(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db) {
+void handle_admin_list_reviews(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
     if (!require_admin(c, hm)) return;
     long page    = admin_query_long(hm, "page", 1);  if (page < 1) page = 1;
     long limit   = admin_query_long(hm, "limit", 50); if (limit > 200) limit = 200;
@@ -703,50 +699,48 @@ void handle_admin_list_reviews(struct mg_connection *c, struct mg_http_message *
     long plan_id_f  = admin_query_long(hm, "plan_id", 0);
     long rating_f   = admin_query_long(hm, "rating", 0);
 
-    sqlite3_stmt *ct;
-    sqlite3_prepare_v2(db,
-        "SELECT COUNT(*) FROM reviews WHERE (? = 0 OR plan_id=?) AND (? = 0 OR rating=?)",
-        -1, &ct, NULL);
-    sqlite3_bind_int64(ct, 1, plan_id_f); sqlite3_bind_int64(ct, 2, plan_id_f);
-    sqlite3_bind_int64(ct, 3, rating_f);  sqlite3_bind_int64(ct, 4, rating_f);
-    sqlite3_step(ct);
-    long total = sqlite3_column_int64(ct, 0);
-    sqlite3_finalize(ct);
+    DbStmt *ct = NULL;
+    ct = db_prepare(db,
+        "SELECT COUNT(*) FROM reviews WHERE (? = 0 OR plan_id=?) AND (? = 0 OR rating=?)");
+    db_bind_int(ct, 1, plan_id_f); db_bind_int(ct, 2, plan_id_f);
+    db_bind_int(ct, 3, rating_f);  db_bind_int(ct, 4, rating_f);
+    db_step(ct);
+    long total = db_col_int(ct, 0);
+    db_finalize(ct);
 
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(db,
+    DbStmt *st = NULL;
+    st = db_prepare(db,
         "SELECT r.id, r.user_id, u.name, r.plan_id, p.title, "
         "r.rating, r.comment, r.created_at "
         "FROM reviews r "
         "LEFT JOIN users u ON u.id=r.user_id "
         "LEFT JOIN plans p ON p.id=r.plan_id "
         "WHERE (? = 0 OR r.plan_id=?) AND (? = 0 OR r.rating=?) "
-        "ORDER BY r.created_at DESC LIMIT ? OFFSET ?",
-        -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, plan_id_f); sqlite3_bind_int64(st, 2, plan_id_f);
-    sqlite3_bind_int64(st, 3, rating_f);  sqlite3_bind_int64(st, 4, rating_f);
-    sqlite3_bind_int64(st, 5, limit); sqlite3_bind_int64(st, 6, offset);
+        "ORDER BY r.created_at DESC LIMIT ? OFFSET ?");
+    db_bind_int(st, 1, plan_id_f); db_bind_int(st, 2, plan_id_f);
+    db_bind_int(st, 3, rating_f);  db_bind_int(st, 4, rating_f);
+    db_bind_int(st, 5, limit); db_bind_int(st, 6, offset);
 
     cJSON *reviews = cJSON_CreateArray();
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    while (db_step(st) == 1) {
         cJSON *rv = cJSON_CreateObject();
-        cJSON_AddNumberToObject(rv, "id",       sqlite3_column_int64(st, 0));
-        cJSON_AddNumberToObject(rv, "user_id",  sqlite3_column_int64(st, 1));
-        if (sqlite3_column_type(st, 2) != SQLITE_NULL)
-            cJSON_AddStringToObject(rv, "user_name", (const char*)sqlite3_column_text(st, 2));
+        cJSON_AddNumberToObject(rv, "id",       db_col_int(st, 0));
+        cJSON_AddNumberToObject(rv, "user_id",  db_col_int(st, 1));
+        if (!db_col_is_null(st, 2))
+            cJSON_AddStringToObject(rv, "user_name", db_col_text(st, 2));
         else cJSON_AddNullToObject(rv, "user_name");
-        cJSON_AddNumberToObject(rv, "plan_id",  sqlite3_column_int64(st, 3));
-        if (sqlite3_column_type(st, 4) != SQLITE_NULL)
-            cJSON_AddStringToObject(rv, "plan_title", (const char*)sqlite3_column_text(st, 4));
+        cJSON_AddNumberToObject(rv, "plan_id",  db_col_int(st, 3));
+        if (!db_col_is_null(st, 4))
+            cJSON_AddStringToObject(rv, "plan_title", db_col_text(st, 4));
         else cJSON_AddNullToObject(rv, "plan_title");
-        cJSON_AddNumberToObject(rv, "rating",   sqlite3_column_int64(st, 5));
-        if (sqlite3_column_type(st, 6) != SQLITE_NULL)
-            cJSON_AddStringToObject(rv, "comment", (const char*)sqlite3_column_text(st, 6));
+        cJSON_AddNumberToObject(rv, "rating",   db_col_int(st, 5));
+        if (!db_col_is_null(st, 6))
+            cJSON_AddStringToObject(rv, "comment", db_col_text(st, 6));
         else cJSON_AddNullToObject(rv, "comment");
-        cJSON_AddStringToObject(rv, "created_at", (const char*)sqlite3_column_text(st, 7));
+        cJSON_AddStringToObject(rv, "created_at", db_col_text(st, 7));
         cJSON_AddItemToArray(reviews, rv);
     }
-    sqlite3_finalize(st);
+    db_finalize(st);
 
     cJSON *res = cJSON_CreateObject();
     cJSON_AddItemToObject(res, "reviews", reviews);
@@ -760,29 +754,29 @@ void handle_admin_list_reviews(struct mg_connection *c, struct mg_http_message *
 /* ─── DELETE /api/v1/admin/reviews/:id ──────────────────────────────────────── */
 
 void handle_admin_delete_review(struct mg_connection *c, struct mg_http_message *hm,
-                                 sqlite3 *db, long id) {
+                                 DbConn *db, long id) {
     if (!require_admin(c, hm)) return;
 
-    sqlite3_stmt *chk;
-    sqlite3_prepare_v2(db, "SELECT id FROM reviews WHERE id=?", -1, &chk, NULL);
-    sqlite3_bind_int64(chk, 1, id);
-    if (sqlite3_step(chk) != SQLITE_ROW) {
-        sqlite3_finalize(chk);
+    DbStmt *chk = NULL;
+    chk = db_prepare(db, "SELECT id FROM reviews WHERE id=?");
+    db_bind_int(chk, 1, id);
+    if (db_step(chk) != 1) {
+        db_finalize(chk);
         send_error_json(c, 404, "review not found"); return;
     }
-    sqlite3_finalize(chk);
+    db_finalize(chk);
 
-    sqlite3_stmt *del;
-    sqlite3_prepare_v2(db, "DELETE FROM reviews WHERE id=?", -1, &del, NULL);
-    sqlite3_bind_int64(del, 1, id);
-    sqlite3_step(del); sqlite3_finalize(del);
+    DbStmt *del = NULL;
+    del = db_prepare(db, "DELETE FROM reviews WHERE id=?");
+    db_bind_int(del, 1, id);
+    db_step(del); db_finalize(del);
 
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"レビューを削除しました\"}");
 }
 
 /* ─── GET /api/v1/admin/users ───────────────────────────────────────────────── */
 
-void handle_admin_list_users(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db) {
+void handle_admin_list_users(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
     if (!require_admin(c, hm)) return;
     long page  = admin_query_long(hm, "page", 1);  if (page < 1) page = 1;
     long limit = admin_query_long(hm, "limit", 50); if (limit > 200) limit = 200;
@@ -803,39 +797,37 @@ void handle_admin_list_users(struct mg_connection *c, struct mg_http_message *hm
     char kw[260] = {0};
     if (has_q && q_esc[0]) snprintf(kw, sizeof(kw), "%%%s%%", q_esc);
 
-    sqlite3_stmt *ct;
-    sqlite3_prepare_v2(db,
-        "SELECT COUNT(*) FROM users WHERE (? = 0 OR email LIKE ? ESCAPE '\\')",
-        -1, &ct, NULL);
-    sqlite3_bind_int(ct, 1, has_q); sqlite3_bind_text(ct, 2, kw, -1, SQLITE_STATIC);
-    sqlite3_step(ct);
-    long total = sqlite3_column_int64(ct, 0);
-    sqlite3_finalize(ct);
+    DbStmt *ct = NULL;
+    ct = db_prepare(db,
+        "SELECT COUNT(*) FROM users WHERE (? = 0 OR email LIKE ? ESCAPE '\\')");
+    db_bind_int(ct, 1, has_q); db_bind_text(ct, 2, kw);
+    db_step(ct);
+    long total = db_col_int(ct, 0);
+    db_finalize(ct);
 
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(db,
+    DbStmt *st = NULL;
+    st = db_prepare(db,
         "SELECT u.id, u.name, u.email, u.created_at, "
         "(SELECT COUNT(*) FROM bookings b WHERE b.user_id=u.id AND b.status='confirmed') AS booking_count "
         "FROM users u "
         "WHERE (? = 0 OR u.email LIKE ? ESCAPE '\\') "
-        "ORDER BY u.id LIMIT ? OFFSET ?",
-        -1, &st, NULL);
-    sqlite3_bind_int(st, 1, has_q); sqlite3_bind_text(st, 2, kw, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 3, limit); sqlite3_bind_int64(st, 4, offset);
+        "ORDER BY u.id LIMIT ? OFFSET ?");
+    db_bind_int(st, 1, has_q); db_bind_text(st, 2, kw);
+    db_bind_int(st, 3, limit); db_bind_int(st, 4, offset);
 
     cJSON *users = cJSON_CreateArray();
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    while (db_step(st) == 1) {
         cJSON *u = cJSON_CreateObject();
-        cJSON_AddNumberToObject(u, "id",            sqlite3_column_int64(st, 0));
-        if (sqlite3_column_type(st, 1) != SQLITE_NULL)
-            cJSON_AddStringToObject(u, "name",      (const char*)sqlite3_column_text(st, 1));
+        cJSON_AddNumberToObject(u, "id",            db_col_int(st, 0));
+        if (!db_col_is_null(st, 1))
+            cJSON_AddStringToObject(u, "name",      db_col_text(st, 1));
         else cJSON_AddNullToObject(u, "name");
-        cJSON_AddStringToObject(u, "email",         (const char*)sqlite3_column_text(st, 2));
-        cJSON_AddStringToObject(u, "created_at",    (const char*)sqlite3_column_text(st, 3));
-        cJSON_AddNumberToObject(u, "booking_count", sqlite3_column_int64(st, 4));
+        cJSON_AddStringToObject(u, "email",         db_col_text(st, 2));
+        cJSON_AddStringToObject(u, "created_at",    db_col_text(st, 3));
+        cJSON_AddNumberToObject(u, "booking_count", db_col_int(st, 4));
         cJSON_AddItemToArray(users, u);
     }
-    sqlite3_finalize(st);
+    db_finalize(st);
 
     cJSON *res = cJSON_CreateObject();
     cJSON_AddItemToObject(res, "users", users);
