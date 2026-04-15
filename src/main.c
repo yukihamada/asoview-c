@@ -14,6 +14,7 @@
 #include "metrics.h"
 #include "waitlist.h"
 #include "setup.h"
+#include "webhooks.h"
 
 #define MAX_BODY_BYTES (64 * 1024)  /* 64 KB リクエストボディ上限 */
 
@@ -426,10 +427,12 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
         if (IS_POST) handle_create_booking(c, hm, db);
 
     } else if (sscanf(uri, "/api/v1/bookings/%36[^/]", booking_id) == 1) {
-        /* check suffix after the UUID to distinguish /:id vs /:id/cancel */
+        /* check suffix after the UUID to distinguish /:id vs /:id/cancel vs /:id/ical */
         size_t pfx = strlen("/api/v1/bookings/") + strlen(booking_id);
         if (strcmp(uri + pfx, "/cancel") == 0) {
             if (IS_PATCH) handle_cancel_booking(c, hm, db, booking_id);
+        } else if (strcmp(uri + pfx, "/ical") == 0) {
+            if (IS_GET)   handle_ical_booking(c, hm, db, booking_id);
         } else if (uri[pfx] == '\0') {
             if (IS_GET) handle_get_booking(c, hm, db, booking_id);
         } else {
@@ -545,7 +548,8 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     } else if (sscanf(uri, "/api/v1/admin/plans/%ld", &id) == 1
                && strstr(uri, "/schedules") == NULL
-               && strstr(uri, "/prices") == NULL) {
+               && strstr(uri, "/prices") == NULL
+               && strstr(uri, "/images") == NULL) {
         if (IS_PATCH)  handle_admin_update_plan(c, hm, db, id);
         else if (IS_DELETE) handle_admin_delete_plan(c, hm, db, id);
 
@@ -580,6 +584,75 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     } else if (strcmp(uri, "/admin/ui") == 0 || strcmp(uri, "/admin/ui/") == 0) {
         if (IS_GET) handle_admin_ui(c, hm, db);
+
+    /* ── 2FA ─────────────────────────────────────────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/auth/2fa/setup") == 0) {
+        if (IS_POST) handle_auth_2fa_setup(c, hm, db);
+
+    } else if (strcmp(uri, "/api/v1/auth/2fa/enable") == 0) {
+        if (IS_POST) handle_auth_2fa_enable(c, hm, db);
+
+    } else if (strcmp(uri, "/api/v1/auth/2fa/verify") == 0) {
+        if (IS_POST) handle_auth_2fa_verify(c, hm, db);
+
+    /* ── クーポン ────────────────────────────────────────────────────────── */
+    } else if (sscanf(uri, "/api/v1/coupons/%63s", booking_id) == 1) {
+        if (IS_GET) handle_validate_coupon(c, hm, db, booking_id);
+
+    /* ── Admin: 売上レポート ─────────────────────────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/admin/reports/sales") == 0) {
+        if (IS_GET) handle_admin_sales_report(c, hm, db);
+
+    /* ── Admin: Webhook ──────────────────────────────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/admin/webhooks") == 0) {
+        if (IS_GET)  handle_admin_list_webhooks(c, hm, db);
+        else if (IS_POST) handle_admin_create_webhook(c, hm, db);
+
+    } else if (sscanf(uri, "/api/v1/admin/webhooks/%ld", &id) == 1) {
+        if (IS_DELETE) handle_admin_delete_webhook(c, hm, db, id);
+
+    /* ── Admin: クーポン ─────────────────────────────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/admin/coupons") == 0) {
+        if (IS_GET)  handle_admin_list_coupons(c, hm, db);
+        else if (IS_POST) handle_admin_create_coupon(c, hm, db);
+
+    } else if (sscanf(uri, "/api/v1/admin/coupons/%ld", &id) == 1) {
+        if (IS_DELETE) handle_admin_delete_coupon(c, hm, db, id);
+
+    /* ── Admin: プラン画像 ───────────────────────────────────────────────── */
+    } else if (sscanf(uri, "/api/v1/admin/plans/%ld/images", &id) == 1
+               && strstr(uri, "/images") != NULL) {
+        if (IS_GET)  handle_admin_list_plan_images(c, hm, db, id);
+        else if (IS_POST) handle_admin_create_plan_image(c, hm, db, id);
+
+    } else if (sscanf(uri, "/api/v1/admin/plan-images/%ld", &id) == 1) {
+        if (IS_DELETE) handle_admin_delete_plan_image(c, hm, db, id);
+
+    /* ── OpenAPI スペック ────────────────────────────────────────────────── */
+    } else if (strcmp(uri, "/api/v1/openapi.json") == 0 ||
+               strcmp(uri, "/openapi.json") == 0) {
+        /* openapi.yml を読み込んで返す（開発用ルート — 本番では静的配信推奨） */
+        if (IS_GET) {
+            FILE *f = fopen("openapi.yml", "r");
+            if (!f) f = fopen("/app/openapi.yml", "r");
+            if (f) {
+                fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
+                char *yml = malloc((size_t)sz + 1);
+                if (yml) {
+                    fread(yml, 1, (size_t)sz, f); yml[sz] = '\0';
+                    mg_http_reply(c, 200,
+                        "Content-Type: text/plain; charset=UTF-8\r\n"
+                        "Access-Control-Allow-Origin: *\r\n",
+                        "%s", yml);
+                    free(yml);
+                } else {
+                    send_error_json(c, 500, "OOM");
+                }
+                fclose(f);
+            } else {
+                send_error_json(c, 404, "openapi.yml not found");
+            }
+        }
 
     /* ── セットアップウィザード ───────────────────────────────────────────── */
     } else if (strcmp(uri, "/setup") == 0 || strcmp(uri, "/setup/") == 0) {

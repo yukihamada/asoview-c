@@ -33,6 +33,12 @@ void platform_sha256(const void *data, size_t data_len, unsigned char out[32]) {
     CC_SHA256(data, (CC_LONG)data_len, out);
 }
 
+void platform_hmac_sha1(const void *key, size_t key_len,
+                         const void *data, size_t data_len,
+                         unsigned char out[20]) {
+    CCHmac(kCCHmacAlgSHA1, key, key_len, data, data_len, out);
+}
+
 #else
 /* ─── Linux: OpenSSL ───────────────────────────────────────────────────── */
 #include <openssl/hmac.h>
@@ -72,5 +78,14 @@ void platform_random(void *buf, size_t len) {
 
 void platform_sha256(const void *data, size_t data_len, unsigned char out[32]) {
     SHA256((const unsigned char *)data, data_len, out);
+}
+
+void platform_hmac_sha1(const void *key, size_t key_len,
+                         const void *data, size_t data_len,
+                         unsigned char out[20]) {
+    unsigned int out_len = 20;
+    HMAC(EVP_sha1(), key, (int)key_len,
+         (const unsigned char *)data, data_len,
+         out, &out_len);
 }
 #endif

@@ -213,6 +213,50 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     ip          TEXT
 );
 
+-- クーポン・プロモコード
+CREATE TABLE IF NOT EXISTS coupons (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    code           TEXT UNIQUE NOT NULL COLLATE NOCASE,
+    description    TEXT,
+    discount_type  TEXT NOT NULL DEFAULT 'percent', -- 'percent' | 'fixed'
+    discount_value INTEGER NOT NULL,                -- % または円
+    max_uses       INTEGER,                         -- NULL=無制限
+    used_count     INTEGER NOT NULL DEFAULT 0,
+    expires_at     TEXT,                            -- NULL=無期限
+    is_active      INTEGER NOT NULL DEFAULT 1,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- パートナー向け Webhook エンドポイント
+CREATE TABLE IF NOT EXISTS webhook_endpoints (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    url        TEXT NOT NULL,
+    secret     TEXT NOT NULL,               -- HMAC 署名シークレット
+    events     TEXT NOT NULL DEFAULT '[]',  -- JSON array: ["booking.created", ...]
+    is_active  INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Webhook 配信ログ
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    endpoint_id   INTEGER NOT NULL REFERENCES webhook_endpoints(id),
+    event         TEXT NOT NULL,
+    payload       TEXT NOT NULL,
+    response_code INTEGER,
+    delivered_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    success       INTEGER NOT NULL DEFAULT 0
+);
+
+-- プラン追加画像（メイン images JSON に加えて個別管理）
+CREATE TABLE IF NOT EXISTS plan_images (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id       INTEGER NOT NULL REFERENCES plans(id),
+    url           TEXT NOT NULL,
+    display_order INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- FTS5 同期トリガー
 CREATE TRIGGER IF NOT EXISTS plans_ai AFTER INSERT ON plans BEGIN
     INSERT INTO plans_fts(rowid, title, description)

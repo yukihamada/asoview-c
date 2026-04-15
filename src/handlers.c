@@ -800,10 +800,11 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
     cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
     if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
 
-    long plan_id    = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "plan_id"));
-    long sched_id   = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "schedule_id"));
-    cJSON *parts    = cJSON_GetObjectItem(body, "participants");
-    const char *note= cJSON_GetStringValue(cJSON_GetObjectItem(body, "note"));
+    long plan_id       = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "plan_id"));
+    long sched_id      = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "schedule_id"));
+    cJSON *parts       = cJSON_GetObjectItem(body, "participants");
+    const char *note   = cJSON_GetStringValue(cJSON_GetObjectItem(body, "note"));
+    const char *coupon_code_raw = cJSON_GetStringValue(cJSON_GetObjectItem(body, "coupon_code"));
 
     if (plan_id <= 0 || sched_id <= 0 ||
         !parts || !cJSON_IsArray(parts) || cJSON_GetArraySize(parts) == 0) {
@@ -856,6 +857,47 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
         total_price  += cnt * entries[i].unit_price;
     }
 
+    /* ── クーポン検証 ───────────────────────────────────────────────────── */
+    long coupon_id      = 0;
+    long discount_amount = 0;
+    char coupon_code[64] = {0};
+    if (coupon_code_raw && coupon_code_raw[0]) {
+        strncpy(coupon_code, coupon_code_raw, sizeof(coupon_code)-1);
+        DbStmt *cst = db_prepare(db,
+            "SELECT id,discount_type,discount_value,max_uses,used_count,expires_at,is_active"
+            " FROM coupons WHERE code=? COLLATE NOCASE");
+        db_bind_text(cst, 1, coupon_code);
+        if (db_step(cst) != 1) {
+            db_finalize(cst); cJSON_Delete(body);
+            send_error_json(c, 400, "クーポンコードが見つかりません"); return;
+        }
+        long cid        = db_col_int(cst, 0);
+        const char *dtp = db_col_text(cst, 1);
+        long dval       = db_col_int(cst, 2);
+        long max_uses   = db_col_int(cst, 3);
+        long used_cnt   = db_col_int(cst, 4);
+        const char *exp = db_col_text(cst, 5);
+        int active      = (int)db_col_int(cst, 6);
+        db_finalize(cst);
+
+        if (!active) { cJSON_Delete(body); send_error_json(c, 400, "このクーポンは無効です"); return; }
+        if (max_uses > 0 && used_cnt >= max_uses) { cJSON_Delete(body); send_error_json(c, 400, "クーポンの使用回数上限に達しています"); return; }
+        if (exp && *exp) {
+            time_t now = time(NULL); char now_str[20];
+            strftime(now_str, sizeof(now_str), "%Y-%m-%d", gmtime(&now));
+            if (strcmp(now_str, exp) > 0) { cJSON_Delete(body); send_error_json(c, 400, "クーポンの有効期限が切れています"); return; }
+        }
+        /* 割引額計算 */
+        if (dtp && strcmp(dtp, "fixed") == 0) {
+            discount_amount = dval;
+        } else {
+            discount_amount = total_price * dval / 100;
+        }
+        if (discount_amount > total_price) discount_amount = total_price;
+        coupon_id = cid;
+    }
+    long final_price = total_price - discount_amount;
+
     /* ── 書き込みロックを取得してから空き枠を再確認（競合防止） ── */
     db_begin(db);
 
@@ -896,17 +938,35 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
     const char *init_status = (stripe_sk && *stripe_sk) ? "pending_payment" : "confirmed";
 
     DbStmt *ins = NULL;
-    ins = db_prepare(db,
-        "INSERT INTO bookings(id,user_id,plan_id,schedule_id,status,total_price,note)"
-        " VALUES(?,?,?,?,?,?,?)");
-    db_bind_text(ins, 1, booking_id);
-    db_bind_int(ins, 2, auth_uid);
-    db_bind_int(ins, 3, plan_id);
-    db_bind_int(ins, 4, sched_id);
-    db_bind_text(ins, 5, init_status);
-    db_bind_int(ins, 6, total_price);
-    db_bind_text(ins, 7, note ? note : "");
-    int rc = db_step(ins);
+    int rc;
+    if (coupon_id > 0) {
+        /* クーポン適用あり: coupon_id / discount_amount を含む INSERT */
+        ins = db_prepare(db,
+            "INSERT INTO bookings(id,user_id,plan_id,schedule_id,status,total_price,note,coupon_id,discount_amount)"
+            " VALUES(?,?,?,?,?,?,?,?,?)");
+        db_bind_text(ins, 1, booking_id);
+        db_bind_int(ins, 2, auth_uid);
+        db_bind_int(ins, 3, plan_id);
+        db_bind_int(ins, 4, sched_id);
+        db_bind_text(ins, 5, init_status);
+        db_bind_int(ins, 6, final_price);
+        db_bind_text(ins, 7, note ? note : "");
+        db_bind_int(ins, 8, coupon_id);
+        db_bind_int(ins, 9, discount_amount);
+    } else {
+        /* クーポンなし: coupon_id は NULL（FK 制約回避） */
+        ins = db_prepare(db,
+            "INSERT INTO bookings(id,user_id,plan_id,schedule_id,status,total_price,note)"
+            " VALUES(?,?,?,?,?,?,?)");
+        db_bind_text(ins, 1, booking_id);
+        db_bind_int(ins, 2, auth_uid);
+        db_bind_int(ins, 3, plan_id);
+        db_bind_int(ins, 4, sched_id);
+        db_bind_text(ins, 5, init_status);
+        db_bind_int(ins, 6, final_price);
+        db_bind_text(ins, 7, note ? note : "");
+    }
+    rc = db_step(ins);
     db_finalize(ins);
 
     if (rc == -1) {
@@ -931,6 +991,15 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
     }
 
     db_commit(db);
+
+    /* クーポン使用回数インクリメント */
+    if (coupon_id > 0) {
+        DbStmt *cup = db_prepare(db,
+            "UPDATE coupons SET used_count=used_count+1 WHERE id=?");
+        db_bind_int(cup, 1, coupon_id);
+        db_step(cup); db_finalize(cup);
+    }
+
     cJSON_Delete(body);
 
     /* Stripe PaymentIntent 作成 */
@@ -982,8 +1051,12 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
         cJSON_AddNumberToObject(bk, "schedule_id",db_col_int(sel, 4));
         cJSON_AddStringToObject(bk, "schedule_date",       db_col_text(sel, 5));
         cJSON_AddStringToObject(bk, "schedule_start_time", db_col_text(sel, 6));
-        cJSON_AddStringToObject(bk, "status",     db_col_text(sel, 7));
-        cJSON_AddNumberToObject(bk, "total_price",db_col_int(sel, 8));
+        cJSON_AddStringToObject(bk, "status",          db_col_text(sel, 7));
+        cJSON_AddNumberToObject(bk, "total_price",     db_col_int(sel, 8));
+        if (discount_amount > 0) {
+            cJSON_AddNumberToObject(bk, "discount_amount", discount_amount);
+            cJSON_AddNumberToObject(bk, "original_price",  total_price);
+        }
         if (!db_col_is_null(sel, 9))
             cJSON_AddStringToObject(bk, "note",   db_col_text(sel, 9));
         else cJSON_AddNullToObject(bk, "note");
@@ -2385,4 +2458,344 @@ void handle_export_user_data(struct mg_connection *c, struct mg_http_message *hm
 
     mg_http_reply(c, 200, hdrs, "%.*s", (int)len, buf);
     free(buf);
+}
+
+/* ─── GET /api/v1/bookings/:id/ical ─────────────────────────────────────── */
+
+void handle_ical_booking(struct mg_connection *c, struct mg_http_message *hm,
+                          DbConn *db, const char *id) {
+    long auth_uid = require_auth(c, hm, db);
+    if (auth_uid < 0) return;
+
+    DbStmt *st = db_prepare(db,
+        "SELECT b.user_id, p.title, p.description, v.name, v.address, "
+        "s.date, s.start_time, s.end_time, b.total_price, b.status "
+        "FROM bookings b "
+        "JOIN plans p ON p.id=b.plan_id "
+        "JOIN venues v ON v.id=p.venue_id "
+        "JOIN schedules s ON s.id=b.schedule_id "
+        "WHERE b.id=?");
+    db_bind_text(st, 1, id);
+    if (db_step(st) != 1) {
+        db_finalize(st);
+        send_error_json(c, 404, "booking not found"); return;
+    }
+
+    long owner_id    = db_col_int(st, 0);
+    char title[256]  = {0}; const char *tv = db_col_text(st, 1); if (tv) strncpy(title, tv, sizeof(title)-1);
+    char desc[512]   = {0}; const char *dv = db_col_text(st, 2); if (dv) strncpy(desc, dv, sizeof(desc)-1);
+    char venue[256]  = {0}; const char *vv = db_col_text(st, 3); if (vv) strncpy(venue, vv, sizeof(venue)-1);
+    char addr[256]   = {0}; const char *av = db_col_text(st, 4); if (av) strncpy(addr, av, sizeof(addr)-1);
+    char date[16]    = {0}; const char *sdv= db_col_text(st, 5); if (sdv) strncpy(date, sdv, sizeof(date)-1);
+    char stime[8]    = {0}; const char *stv= db_col_text(st, 6); if (stv) strncpy(stime, stv, sizeof(stime)-1);
+    char etime[8]    = {0}; const char *etv= db_col_text(st, 7); if (etv) strncpy(etime, etv, sizeof(etime)-1);
+    long price       = db_col_int(st, 8);
+    char status[32]  = {0}; const char *sv = db_col_text(st, 9); if (sv) strncpy(status, sv, sizeof(status)-1);
+    db_finalize(st);
+
+    if (owner_id != auth_uid) {
+        send_error_json(c, 403, "この予約を取得する権限がありません"); return;
+    }
+    if (strcmp(status, "cancelled") == 0) {
+        send_error_json(c, 400, "キャンセル済みの予約は iCal エクスポートできません"); return;
+    }
+
+    /* DTSTART / DTEND を組み立てる: YYYYMMDDTHHMMSS */
+    char dtstart[20] = {0}, dtend[20] = {0};
+    /* date = "YYYY-MM-DD", stime = "HH:MM" */
+    char dy[5], dm[3], dd[3], sh[3], smin[3];
+    sscanf(date,  "%4s-%2s-%2s", dy, dm, dd);
+    sscanf(stime, "%2s:%2s", sh, smin);
+    snprintf(dtstart, sizeof(dtstart), "%s%s%sT%s%s00", dy, dm, dd, sh, smin);
+    if (etime[0]) {
+        char eh[3], emin[3];
+        sscanf(etime, "%2s:%2s", eh, emin);
+        snprintf(dtend, sizeof(dtend), "%s%s%sT%s%s00", dy, dm, dd, eh, emin);
+    } else {
+        /* end time 不明の場合は 2 時間後 */
+        int sh_i = atoi(sh); (void)smin;
+        sh_i = (sh_i + 2) % 24;
+        snprintf(dtend, sizeof(dtend), "%s%s%sT%02d%s00", dy, dm, dd, sh_i, smin);
+    }
+
+    time_t now = time(NULL);
+    char dtstamp[20];
+    struct tm *gmt = gmtime(&now);
+    strftime(dtstamp, sizeof(dtstamp), "%Y%m%dT%H%M%SZ", gmt);
+
+    char ical[2048];
+    snprintf(ical, sizeof(ical),
+        "BEGIN:VCALENDAR\r\n"
+        "VERSION:2.0\r\n"
+        "PRODID:-//Asoview//Booking//JA\r\n"
+        "CALSCALE:GREGORIAN\r\n"
+        "METHOD:PUBLISH\r\n"
+        "BEGIN:VEVENT\r\n"
+        "UID:%s@asoview\r\n"
+        "DTSTAMP:%s\r\n"
+        "DTSTART;TZID=Asia/Tokyo:%s\r\n"
+        "DTEND;TZID=Asia/Tokyo:%s\r\n"
+        "SUMMARY:%s\r\n"
+        "DESCRIPTION:%s\\n\\n会場: %s\\n料金: \\%ld\r\n"
+        "LOCATION:%s\r\n"
+        "STATUS:CONFIRMED\r\n"
+        "END:VEVENT\r\n"
+        "END:VCALENDAR\r\n",
+        id, dtstamp, dtstart, dtend,
+        title, desc, venue, price, addr);
+
+    char disp_hdr[128];
+    snprintf(disp_hdr, sizeof(disp_hdr),
+        "Content-Type: text/calendar; charset=UTF-8\r\n"
+        "Content-Disposition: attachment; filename=\"booking_%s.ics\"\r\n",
+        id);
+    mg_http_reply(c, 200, disp_hdr, "%s", ical);
+}
+
+/* ─── GET /api/v1/coupons/:code ─────────────────────────────────────────── */
+
+void handle_validate_coupon(struct mg_connection *c, struct mg_http_message *hm,
+                             DbConn *db, const char *code) {
+    (void)hm;
+    DbStmt *st = db_prepare(db,
+        "SELECT id,description,discount_type,discount_value,max_uses,used_count,expires_at,is_active"
+        " FROM coupons WHERE code=? COLLATE NOCASE");
+    db_bind_text(st, 1, code);
+    if (db_step(st) != 1) {
+        db_finalize(st);
+        send_error_json(c, 404, "クーポンが見つかりません"); return;
+    }
+    long cid      = db_col_int(st, 0);
+    long dval     = db_col_int(st, 3);
+    long max_uses = db_col_int(st, 4);
+    long used_cnt = db_col_int(st, 5);
+    int active    = (int)db_col_int(st, 7);
+    /* Copy strings before db_finalize invalidates SQLite's internal buffers */
+    char cdesc_buf[256] = {0};
+    char dtype_buf[32]  = {0};
+    char exp_buf[32]    = {0};
+    const char *cdesc_ptr = db_col_text(st, 1);
+    const char *dtype_ptr = db_col_text(st, 2);
+    const char *exp_ptr   = db_col_text(st, 6);
+    if (cdesc_ptr) strncpy(cdesc_buf, cdesc_ptr, sizeof(cdesc_buf)-1);
+    if (dtype_ptr) strncpy(dtype_buf, dtype_ptr, sizeof(dtype_buf)-1);
+    if (exp_ptr)   strncpy(exp_buf,   exp_ptr,   sizeof(exp_buf)-1);
+    db_finalize(st);
+
+    int valid = active;
+    const char *invalid_reason = NULL;
+    if (!active)                              { valid = 0; invalid_reason = "無効なクーポン"; }
+    if (max_uses > 0 && used_cnt >= max_uses) { valid = 0; invalid_reason = "使用回数上限に達しています"; }
+    if (exp_buf[0]) {
+        time_t now = time(NULL); char now_str[16];
+        strftime(now_str, sizeof(now_str), "%Y-%m-%d", gmtime(&now));
+        if (strcmp(now_str, exp_buf) > 0) { valid = 0; invalid_reason = "有効期限切れ"; }
+    }
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddNumberToObject(res, "id",             cid);
+    cJSON_AddStringToObject(res, "code",           code);
+    if (cdesc_buf[0]) cJSON_AddStringToObject(res, "description", cdesc_buf);
+    cJSON_AddStringToObject(res, "discount_type",  dtype_buf[0] ? dtype_buf : "percent");
+    cJSON_AddNumberToObject(res, "discount_value", dval);
+    cJSON_AddBoolToObject(res,   "valid",          valid);
+    if (!valid && invalid_reason)
+        cJSON_AddStringToObject(res, "invalid_reason", invalid_reason);
+    if (exp_buf[0]) cJSON_AddStringToObject(res, "expires_at", exp_buf);
+    char *s = cJSON_PrintUnformatted(res);
+    send_json_str(c, valid ? 200 : 200, CORS_HEADERS, s);
+    cJSON_free(s); cJSON_Delete(res);
+}
+
+/* ─── 2FA TOTP ───────────────────────────────────────────────────────────── */
+
+#include "platform.h"
+#include <stdint.h>
+
+/* Base32 エンコード（RFC 4648 — TOTP アプリが読める形式） */
+static const char B32CHARS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+static void base32_encode(const uint8_t *in, size_t in_len, char *out, size_t out_sz) {
+    size_t i = 0, j = 0;
+    uint32_t buf = 0; int bits = 0;
+    while (i < in_len && j + 1 < out_sz) {
+        buf = (buf << 8) | in[i++]; bits += 8;
+        while (bits >= 5 && j + 1 < out_sz) {
+            bits -= 5;
+            out[j++] = B32CHARS[(buf >> bits) & 0x1f];
+        }
+    }
+    if (bits > 0 && j + 1 < out_sz) out[j++] = B32CHARS[(buf << (5 - bits)) & 0x1f];
+    /* padding */
+    while (j % 8 != 0 && j + 1 < out_sz) out[j++] = '=';
+    out[j] = '\0';
+}
+
+/* HOTP(secret, counter) → 6 桁コード */
+static uint32_t hotp(const uint8_t *secret, size_t sec_len, uint64_t counter) {
+    uint8_t msg[8];
+    for (int i = 7; i >= 0; i--) { msg[i] = counter & 0xff; counter >>= 8; }
+    uint8_t mac[20];
+    platform_hmac_sha1(secret, sec_len, msg, 8, mac);
+    int off = mac[19] & 0x0f;
+    uint32_t code = ((uint32_t)(mac[off]   & 0x7f) << 24)
+                  | ((uint32_t) mac[off+1]          << 16)
+                  | ((uint32_t) mac[off+2]          <<  8)
+                  | ((uint32_t) mac[off+3]);
+    return code % 1000000;
+}
+
+/* TOTP 検証（±1 ステップ = ±30 秒の誤差を許容） */
+static int totp_verify(const char *b32_secret, const char *code_str) {
+    /* base32 デコード */
+    uint8_t sec[32]; size_t sec_len = 0;
+    const char *p = b32_secret;
+    uint32_t buf = 0; int bits = 0;
+    while (*p && *p != '=' && sec_len < sizeof(sec)) {
+        char c = *p++;
+        int v = -1;
+        if (c >= 'A' && c <= 'Z') v = c - 'A';
+        else if (c >= 'a' && c <= 'z') v = c - 'a';
+        else if (c >= '2' && c <= '7') v = c - '2' + 26;
+        if (v < 0) continue;
+        buf = (buf << 5) | (uint32_t)v; bits += 5;
+        if (bits >= 8) { bits -= 8; sec[sec_len++] = (buf >> bits) & 0xff; }
+    }
+    if (sec_len == 0) return 0;
+
+    long code = strtol(code_str, NULL, 10);
+    if (code < 0 || code > 999999) return 0;
+
+    uint64_t T = (uint64_t)time(NULL) / 30;
+    /* ±1 step の許容 */
+    for (int d = -1; d <= 1; d++) {
+        if ((long)hotp(sec, sec_len, (uint64_t)((int64_t)T + d)) == code) return 1;
+    }
+    return 0;
+}
+
+/* POST /api/v1/auth/2fa/setup — TOTP シークレット生成・返却 */
+void handle_auth_2fa_setup(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    long auth_uid = require_auth(c, hm, db);
+    if (auth_uid < 0) return;
+    (void)hm;
+
+    /* ユーザーのメールアドレスを取得 */
+    DbStmt *st = db_prepare(db, "SELECT email,totp_enabled FROM users WHERE id=?");
+    db_bind_int(st, 1, auth_uid);
+    if (db_step(st) != 1) { db_finalize(st); send_error_json(c, 404, "user not found"); return; }
+    char email[256] = {0};
+    const char *ev = db_col_text(st, 0); if (ev) strncpy(email, ev, sizeof(email)-1);
+    int already = (int)db_col_int(st, 1);
+    db_finalize(st);
+
+    if (already) { send_error_json(c, 400, "2FA はすでに有効です"); return; }
+
+    /* 20 バイトのランダムシークレット生成 */
+    uint8_t raw[20];
+    platform_random(raw, sizeof(raw));
+    char b32[40];
+    base32_encode(raw, sizeof(raw), b32, sizeof(b32));
+
+    /* temp_totp_secret を DB に保存（有効化前）*/
+    DbStmt *upd = db_prepare(db, "UPDATE users SET totp_secret=? WHERE id=?");
+    db_bind_text(upd, 1, b32);
+    db_bind_int(upd, 2, auth_uid);
+    db_step(upd); db_finalize(upd);
+
+    /* otpauth URI */
+    char qr_uri[512];
+    snprintf(qr_uri, sizeof(qr_uri),
+             "otpauth://totp/Asoview:%s?secret=%s&issuer=Asoview&algorithm=SHA1&digits=6&period=30",
+             email, b32);
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddStringToObject(res, "secret", b32);
+    cJSON_AddStringToObject(res, "qr_uri", qr_uri);
+    cJSON_AddStringToObject(res, "message",
+        "QR コードをオーセンティケーターアプリで読み取り、/auth/2fa/enable で有効化してください");
+    send_cjson(c, 200, res);
+    cJSON_Delete(res);
+}
+
+/* POST /api/v1/auth/2fa/enable — コード確認して 2FA を有効化 */
+void handle_auth_2fa_enable(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    long auth_uid = require_auth(c, hm, db);
+    if (auth_uid < 0) return;
+
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    const char *code = body ? cJSON_GetStringValue(cJSON_GetObjectItem(body, "code")) : NULL;
+    if (!code) { if (body) cJSON_Delete(body); send_error_json(c, 400, "code は必須です"); return; }
+
+    DbStmt *st = db_prepare(db, "SELECT totp_secret FROM users WHERE id=?");
+    db_bind_int(st, 1, auth_uid);
+    if (db_step(st) != 1) { db_finalize(st); cJSON_Delete(body); send_error_json(c, 404, "user not found"); return; }
+    char secret[40] = {0};
+    const char *sv = db_col_text(st, 0); if (sv) strncpy(secret, sv, sizeof(secret)-1);
+    db_finalize(st);
+
+    if (!secret[0]) { cJSON_Delete(body); send_error_json(c, 400, "まず /auth/2fa/setup を呼び出してください"); return; }
+    if (!totp_verify(secret, code)) { cJSON_Delete(body); send_error_json(c, 400, "コードが正しくありません"); return; }
+
+    DbStmt *upd = db_prepare(db, "UPDATE users SET totp_enabled=1 WHERE id=?");
+    db_bind_int(upd, 1, auth_uid);
+    db_step(upd); db_finalize(upd);
+
+    cJSON_Delete(body);
+    send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"2FA が有効になりました\"}");
+}
+
+/* POST /api/v1/auth/2fa/verify — ログイン後の TOTP 検証（temp_token → JWT） */
+void handle_auth_2fa_verify(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    const char *temp_token = body ? cJSON_GetStringValue(cJSON_GetObjectItem(body, "temp_token")) : NULL;
+    const char *code       = body ? cJSON_GetStringValue(cJSON_GetObjectItem(body, "code"))       : NULL;
+
+    if (!temp_token || !code) {
+        if (body) cJSON_Delete(body);
+        send_error_json(c, 400, "temp_token と code は必須です"); return;
+    }
+
+    /* temp_token は通常の JWT (2FA未確認状態) — 検証して user_id を取得 */
+    const char *secret = getenv("JWT_SECRET");
+    if (!secret || !*secret) secret = "asoview-jwt-secret-dev";
+    extern long jwt_verify(const char *token, const char *secret);
+    long uid = jwt_verify(temp_token, secret);
+    if (uid <= 0) {
+        cJSON_Delete(body);
+        send_error_json(c, 401, "temp_token が無効です"); return;
+    }
+
+    /* TOTP シークレット取得 */
+    DbStmt *st = db_prepare(db,
+        "SELECT totp_secret, totp_enabled FROM users WHERE id=?");
+    db_bind_int(st, 1, uid);
+    if (db_step(st) != 1) {
+        db_finalize(st); cJSON_Delete(body);
+        send_error_json(c, 404, "user not found"); return;
+    }
+    char totp_secret[40] = {0};
+    const char *tsv = db_col_text(st, 0); if (tsv) strncpy(totp_secret, tsv, sizeof(totp_secret)-1);
+    int enabled = (int)db_col_int(st, 1);
+    db_finalize(st);
+
+    if (!enabled || !totp_secret[0]) {
+        cJSON_Delete(body);
+        send_error_json(c, 400, "2FA が有効になっていません"); return;
+    }
+    if (!totp_verify(totp_secret, code)) {
+        cJSON_Delete(body);
+        send_error_json(c, 401, "コードが正しくありません"); return;
+    }
+
+    /* 正規の JWT を発行 */
+    extern char *jwt_create(long user_id, const char *secret);
+    char *tok = jwt_create(uid, secret);
+    cJSON_Delete(body);
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddStringToObject(res, "token", tok ? tok : "");
+    cJSON_AddStringToObject(res, "message", "2FA 認証成功");
+    send_cjson(c, 200, res);
+    cJSON_Delete(res);
+    free(tok);
 }

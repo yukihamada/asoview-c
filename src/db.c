@@ -70,6 +70,51 @@ DbConn *db_open(const char *path) {
     APPLY_MIGRATION(4, "ALTER TABLE plans ADD COLUMN cancel_days_full INTEGER NOT NULL DEFAULT 7");
     APPLY_MIGRATION(5, "ALTER TABLE plans ADD COLUMN cancel_days_partial INTEGER NOT NULL DEFAULT 3");
     APPLY_MIGRATION(6, "ALTER TABLE plans ADD COLUMN cancel_pct_partial INTEGER NOT NULL DEFAULT 50");
+    /* 2FA TOTP */
+    APPLY_MIGRATION(7, "ALTER TABLE users ADD COLUMN totp_secret TEXT");
+    APPLY_MIGRATION(8, "ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0");
+    /* クーポン */
+    APPLY_MIGRATION(9,
+        "CREATE TABLE IF NOT EXISTS coupons("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "code TEXT UNIQUE NOT NULL COLLATE NOCASE,"
+        "description TEXT,"
+        "discount_type TEXT NOT NULL DEFAULT 'percent',"
+        "discount_value INTEGER NOT NULL,"
+        "max_uses INTEGER,"
+        "used_count INTEGER NOT NULL DEFAULT 0,"
+        "expires_at TEXT,"
+        "is_active INTEGER NOT NULL DEFAULT 1,"
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')))");
+    /* Webhook エンドポイント */
+    APPLY_MIGRATION(10,
+        "CREATE TABLE IF NOT EXISTS webhook_endpoints("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "url TEXT NOT NULL,"
+        "secret TEXT NOT NULL,"
+        "events TEXT NOT NULL DEFAULT '[]',"
+        "is_active INTEGER NOT NULL DEFAULT 1,"
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')))");
+    APPLY_MIGRATION(11,
+        "CREATE TABLE IF NOT EXISTS webhook_deliveries("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "endpoint_id INTEGER NOT NULL REFERENCES webhook_endpoints(id),"
+        "event TEXT NOT NULL,"
+        "payload TEXT NOT NULL,"
+        "response_code INTEGER,"
+        "delivered_at TEXT NOT NULL DEFAULT (datetime('now')),"
+        "success INTEGER NOT NULL DEFAULT 0)");
+    /* プラン追加画像 */
+    APPLY_MIGRATION(12,
+        "CREATE TABLE IF NOT EXISTS plan_images("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "plan_id INTEGER NOT NULL REFERENCES plans(id),"
+        "url TEXT NOT NULL,"
+        "display_order INTEGER NOT NULL DEFAULT 0,"
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')))");
+    /* 予約にクーポン適用列 */
+    APPLY_MIGRATION(13, "ALTER TABLE bookings ADD COLUMN coupon_id INTEGER REFERENCES coupons(id)");
+    APPLY_MIGRATION(14, "ALTER TABLE bookings ADD COLUMN discount_amount INTEGER NOT NULL DEFAULT 0");
 #undef APPLY_MIGRATION
     /* FTS5 インデックスを既存データで再構築（INSERT トリガーで新規データは自動追加） */
     sqlite3_exec(db,

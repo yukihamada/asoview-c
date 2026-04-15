@@ -27,3 +27,8 @@ void platform_random(void *buf, size_t len);
 
 /* SHA-256 ダイジェスト — out に 32 バイト書き込む */
 void platform_sha256(const void *data, size_t data_len, unsigned char out[32]);
+
+/* HMAC-SHA1 (TOTP 用) — out に 20 バイト書き込む */
+void platform_hmac_sha1(const void   *key,  size_t key_len,
+                         const void   *data, size_t data_len,
+                         unsigned char out[20]);

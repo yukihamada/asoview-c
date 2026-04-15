@@ -36,3 +36,17 @@ void handle_admin_backup_db      (struct mg_connection *c, struct mg_http_messag
 void handle_admin_ui             (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
 /* Audit Logs */
 void handle_admin_audit_logs     (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+/* Sales Report CSV */
+void handle_admin_sales_report   (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+/* Webhooks */
+void handle_admin_list_webhooks  (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+void handle_admin_create_webhook (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+void handle_admin_delete_webhook (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id);
+/* Coupons */
+void handle_admin_list_coupons   (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+void handle_admin_create_coupon  (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+void handle_admin_delete_coupon  (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id);
+/* Plan Images */
+void handle_admin_list_plan_images  (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long plan_id);
+void handle_admin_create_plan_image (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long plan_id);
+void handle_admin_delete_plan_image (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long img_id);

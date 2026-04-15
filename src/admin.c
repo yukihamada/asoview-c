@@ -1696,3 +1696,311 @@ void handle_admin_audit_logs(struct mg_connection *c, struct mg_http_message *hm
     send_cjson_admin(c, 200, res);
     cJSON_Delete(res);
 }
+
+/* ─── GET /api/v1/admin/reports/sales ───────────────────────────────────── */
+
+void handle_admin_sales_report(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    if (!require_admin(c, hm)) return;
+
+    /* ?from=YYYY-MM-DD&to=YYYY-MM-DD */
+    char from_date[16] = "2000-01-01";
+    char to_date[16]   = "2099-12-31";
+    char tmp[16] = {0};
+    if (mg_http_get_var(&hm->query, "from", tmp, sizeof(tmp)) > 0)
+        strncpy(from_date, tmp, sizeof(from_date)-1);
+    memset(tmp, 0, sizeof(tmp));
+    if (mg_http_get_var(&hm->query, "to", tmp, sizeof(tmp)) > 0)
+        strncpy(to_date, tmp, sizeof(to_date)-1);
+
+    DbStmt *st = db_prepare(db,
+        "SELECT b.id, u.name, u.email, p.title, v.name, "
+        "s.date, s.start_time, b.total_price, b.discount_amount, b.status, b.created_at "
+        "FROM bookings b "
+        "JOIN users u ON u.id=b.user_id "
+        "JOIN plans p ON p.id=b.plan_id "
+        "JOIN venues v ON v.id=p.venue_id "
+        "JOIN schedules s ON s.id=b.schedule_id "
+        "WHERE b.status != 'cancelled' "
+        "AND date(b.created_at) >= ? AND date(b.created_at) <= ? "
+        "ORDER BY b.created_at DESC");
+    db_bind_text(st, 1, from_date);
+    db_bind_text(st, 2, to_date);
+
+    /* CSV バッファ */
+    size_t cap = 65536, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) { db_finalize(st); send_error_json(c, 500, "OOM"); return; }
+
+#define CSV(fmt, ...) do { \
+    int _n = snprintf(buf + len, cap - len, fmt, ##__VA_ARGS__); \
+    if (_n > 0) len += (size_t)_n; \
+    if (len + 512 > cap) { cap *= 2; char *_r = realloc(buf, cap); if (_r) buf = _r; } \
+} while(0)
+
+    CSV("booking_id,customer_name,customer_email,plan_title,venue_name,"
+        "schedule_date,start_time,total_price,discount_amount,status,created_at\r\n");
+
+    long grand_total = 0, row_count = 0;
+    while (db_step(st) == 1) {
+        long price    = db_col_int(st, 7);
+        long discount = db_col_int(st, 8);
+        grand_total  += price;
+        row_count++;
+        CSV("\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",%ld,%ld,\"%s\",\"%s\"\r\n",
+            db_col_text(st, 0)  ? db_col_text(st, 0)  : "",
+            db_col_text(st, 1)  ? db_col_text(st, 1)  : "",
+            db_col_text(st, 2)  ? db_col_text(st, 2)  : "",
+            db_col_text(st, 3)  ? db_col_text(st, 3)  : "",
+            db_col_text(st, 4)  ? db_col_text(st, 4)  : "",
+            db_col_text(st, 5)  ? db_col_text(st, 5)  : "",
+            db_col_text(st, 6)  ? db_col_text(st, 6)  : "",
+            price, discount,
+            db_col_text(st, 9)  ? db_col_text(st, 9)  : "",
+            db_col_text(st, 10) ? db_col_text(st, 10) : "");
+    }
+    db_finalize(st);
+    CSV("\r\n# 集計,件数,%ld,合計売上,%ld\r\n", row_count, grand_total);
+#undef CSV
+
+    time_t now = time(NULL);
+    char date_str[16];
+    strftime(date_str, sizeof(date_str), "%Y-%m-%d", gmtime(&now));
+    char disp[64];
+    snprintf(disp, sizeof(disp), "attachment; filename=\"sales_%s.csv\"", date_str);
+
+    char hdrs[256];
+    snprintf(hdrs, sizeof(hdrs),
+        "Content-Type: text/csv; charset=UTF-8\r\n"
+        "Content-Disposition: %s\r\n"
+        "Access-Control-Allow-Origin: *\r\n", disp);
+    mg_http_reply(c, 200, hdrs, "%.*s", (int)len, buf);
+    free(buf);
+}
+
+/* ─── Webhook エンドポイント CRUD ────────────────────────────────────────── */
+
+void handle_admin_list_webhooks(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    if (!require_admin(c, hm)) return;
+    DbStmt *st = db_prepare(db,
+        "SELECT id,url,events,is_active,created_at FROM webhook_endpoints ORDER BY id DESC");
+    cJSON *arr = cJSON_CreateArray();
+    while (db_step(st) == 1) {
+        cJSON *w = cJSON_CreateObject();
+        cJSON_AddNumberToObject(w, "id",         db_col_int(st, 0));
+        cJSON_AddStringToObject(w, "url",        db_col_text(st, 1) ? db_col_text(st, 1) : "");
+        cJSON_AddStringToObject(w, "events",     db_col_text(st, 2) ? db_col_text(st, 2) : "[]");
+        cJSON_AddBoolToObject(w,   "is_active",  (int)db_col_int(st, 3));
+        cJSON_AddStringToObject(w, "created_at", db_col_text(st, 4) ? db_col_text(st, 4) : "");
+        cJSON_AddItemToArray(arr, w);
+    }
+    db_finalize(st);
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddItemToObject(res, "webhooks", arr);
+    send_cjson_admin(c, 200, res);
+    cJSON_Delete(res);
+}
+
+void handle_admin_create_webhook(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    if (!require_admin(c, hm)) return;
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
+
+    const char *url    = cJSON_GetStringValue(cJSON_GetObjectItem(body, "url"));
+    cJSON *events_arr  = cJSON_GetObjectItem(body, "events");
+    if (!url || !events_arr) {
+        cJSON_Delete(body); send_error_json(c, 400, "url と events は必須です"); return;
+    }
+
+    /* ランダムな Webhook シークレット生成（32 バイト hex） */
+    unsigned char raw[16];
+    extern void platform_random(void *buf, size_t len);
+    platform_random(raw, sizeof(raw));
+    char secret[33] = {0};
+    for (int i = 0; i < 16; i++) snprintf(secret + i*2, 3, "%02x", raw[i]);
+
+    char *events_str = cJSON_PrintUnformatted(events_arr);
+    DbStmt *ins = db_prepare(db,
+        "INSERT INTO webhook_endpoints(url,secret,events) VALUES(?,?,?)");
+    db_bind_text(ins, 1, url);
+    db_bind_text(ins, 2, secret);
+    db_bind_text(ins, 3, events_str ? events_str : "[]");
+    db_step(ins); db_finalize(ins);
+    cJSON_free(events_str);
+
+    long wid = (long)db_last_id(db);
+    cJSON_Delete(body);
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddNumberToObject(res, "id",     wid);
+    cJSON_AddStringToObject(res, "secret", secret);
+    cJSON_AddStringToObject(res, "message", "Webhook エンドポイントを登録しました");
+    send_cjson_admin(c, 201, res);
+    cJSON_Delete(res);
+}
+
+void handle_admin_delete_webhook(struct mg_connection *c, struct mg_http_message *hm,
+                                  DbConn *db, long id) {
+    if (!require_admin(c, hm)) return;
+    DbStmt *del = db_prepare(db, "DELETE FROM webhook_endpoints WHERE id=?");
+    db_bind_int(del, 1, id);
+    db_step(del); db_finalize(del);
+    send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"Webhook エンドポイントを削除しました\"}");
+}
+
+/* ─── クーポン CRUD ─────────────────────────────────────────────────────── */
+
+void handle_admin_list_coupons(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    if (!require_admin(c, hm)) return;
+    DbStmt *st = db_prepare(db,
+        "SELECT id,code,description,discount_type,discount_value,"
+        "max_uses,used_count,expires_at,is_active,created_at "
+        "FROM coupons ORDER BY id DESC");
+    cJSON *arr = cJSON_CreateArray();
+    while (db_step(st) == 1) {
+        cJSON *cp = cJSON_CreateObject();
+        cJSON_AddNumberToObject(cp, "id",             db_col_int(st, 0));
+        cJSON_AddStringToObject(cp, "code",           db_col_text(st, 1) ? db_col_text(st, 1) : "");
+        if (!db_col_is_null(st, 2)) cJSON_AddStringToObject(cp, "description", db_col_text(st, 2));
+        cJSON_AddStringToObject(cp, "discount_type",  db_col_text(st, 3) ? db_col_text(st, 3) : "percent");
+        cJSON_AddNumberToObject(cp, "discount_value", db_col_int(st, 4));
+        if (!db_col_is_null(st, 5)) cJSON_AddNumberToObject(cp, "max_uses", db_col_int(st, 5));
+        cJSON_AddNumberToObject(cp, "used_count",     db_col_int(st, 6));
+        if (!db_col_is_null(st, 7)) cJSON_AddStringToObject(cp, "expires_at", db_col_text(st, 7));
+        cJSON_AddBoolToObject(cp,   "is_active",      (int)db_col_int(st, 8));
+        cJSON_AddStringToObject(cp, "created_at",     db_col_text(st, 9) ? db_col_text(st, 9) : "");
+        cJSON_AddItemToArray(arr, cp);
+    }
+    db_finalize(st);
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddItemToObject(res, "coupons", arr);
+    send_cjson_admin(c, 200, res);
+    cJSON_Delete(res);
+}
+
+void handle_admin_create_coupon(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    if (!require_admin(c, hm)) return;
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
+
+    const char *code  = cJSON_GetStringValue(cJSON_GetObjectItem(body, "code"));
+    const char *dtype = cJSON_GetStringValue(cJSON_GetObjectItem(body, "discount_type"));
+    long dval         = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "discount_value"));
+    const char *desc  = cJSON_GetStringValue(cJSON_GetObjectItem(body, "description"));
+    long max_uses     = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "max_uses"));
+    const char *exp   = cJSON_GetStringValue(cJSON_GetObjectItem(body, "expires_at"));
+
+    if (!code || !dtype || dval <= 0) {
+        cJSON_Delete(body);
+        send_error_json(c, 400, "code, discount_type, discount_value は必須です"); return;
+    }
+
+    /* Copy strings before cJSON_Delete(body) invalidates the pointers */
+    char code_buf[64]  = {0};
+    char dtype_buf[32] = {0};
+    char desc_buf[256] = {0};
+    char exp_buf[32]   = {0};
+    strncpy(code_buf,  code,          sizeof(code_buf)-1);
+    strncpy(dtype_buf, dtype,         sizeof(dtype_buf)-1);
+    if (desc) strncpy(desc_buf, desc, sizeof(desc_buf)-1);
+    if (exp)  strncpy(exp_buf,  exp,  sizeof(exp_buf)-1);
+    cJSON_Delete(body);
+
+    DbStmt *ins = db_prepare(db,
+        "INSERT INTO coupons(code,description,discount_type,discount_value,max_uses,expires_at)"
+        " VALUES(?,?,?,?,?,?)");
+    db_bind_text(ins, 1, code_buf);
+    db_bind_text(ins, 2, desc_buf);
+    db_bind_text(ins, 3, dtype_buf);
+    db_bind_int(ins,  4, dval);
+    db_bind_int(ins,  5, max_uses);  /* 0 = unlimited */
+    db_bind_text(ins, 6, exp_buf);
+    int rc = db_step(ins); db_finalize(ins);
+
+    if (rc == -1) { send_error_json(c, 409, "クーポンコードが重複しています"); return; }
+
+    long cid = (long)db_last_id(db);
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddNumberToObject(res, "id",   cid);
+    cJSON_AddStringToObject(res, "code", code_buf);
+    cJSON_AddStringToObject(res, "message", "クーポンを作成しました");
+    send_cjson_admin(c, 201, res);
+    cJSON_Delete(res);
+}
+
+void handle_admin_delete_coupon(struct mg_connection *c, struct mg_http_message *hm,
+                                 DbConn *db, long id) {
+    if (!require_admin(c, hm)) return;
+    DbStmt *del = db_prepare(db, "DELETE FROM coupons WHERE id=?");
+    db_bind_int(del, 1, id);
+    db_step(del); db_finalize(del);
+    send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"クーポンを削除しました\"}");
+}
+
+/* ─── プラン追加画像 CRUD ────────────────────────────────────────────────── */
+
+void handle_admin_create_plan_image(struct mg_connection *c, struct mg_http_message *hm,
+                                     DbConn *db, long plan_id) {
+    if (!require_admin(c, hm)) return;
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
+
+    const char *url_ptr = cJSON_GetStringValue(cJSON_GetObjectItem(body, "url"));
+    long order          = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "display_order"));
+    if (!url_ptr) { cJSON_Delete(body); send_error_json(c, 400, "url は必須です"); return; }
+
+    /* Copy before cJSON_Delete invalidates the pointer */
+    char url_buf[1024] = {0};
+    strncpy(url_buf, url_ptr, sizeof(url_buf)-1);
+    cJSON_Delete(body);
+
+    DbStmt *ins = db_prepare(db,
+        "INSERT INTO plan_images(plan_id,url,display_order) VALUES(?,?,?)");
+    db_bind_int(ins,  1, plan_id);
+    db_bind_text(ins, 2, url_buf);
+    db_bind_int(ins,  3, order);
+    db_step(ins); db_finalize(ins);
+    long img_id = (long)db_last_id(db);
+
+    audit_log(db, "admin", "plan_image.create", "plan_image", NULL, url_buf, NULL);
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddNumberToObject(res, "id",       img_id);
+    cJSON_AddNumberToObject(res, "plan_id",  plan_id);
+    cJSON_AddStringToObject(res, "url",      url_buf);
+    cJSON_AddNumberToObject(res, "display_order", order);
+    cJSON_AddStringToObject(res, "message",  "画像を追加しました");
+    send_cjson_admin(c, 201, res);
+    cJSON_Delete(res);
+}
+
+void handle_admin_delete_plan_image(struct mg_connection *c, struct mg_http_message *hm,
+                                     DbConn *db, long img_id) {
+    if (!require_admin(c, hm)) return;
+    DbStmt *del = db_prepare(db, "DELETE FROM plan_images WHERE id=?");
+    db_bind_int(del, 1, img_id);
+    db_step(del); db_finalize(del);
+    send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"画像を削除しました\"}");
+}
+
+void handle_admin_list_plan_images(struct mg_connection *c, struct mg_http_message *hm,
+                                    DbConn *db, long plan_id) {
+    if (!require_admin(c, hm)) return;
+    DbStmt *st = db_prepare(db,
+        "SELECT id,url,display_order,created_at FROM plan_images WHERE plan_id=? ORDER BY display_order,id");
+    db_bind_int(st, 1, plan_id);
+    cJSON *arr = cJSON_CreateArray();
+    while (db_step(st) == 1) {
+        cJSON *img = cJSON_CreateObject();
+        cJSON_AddNumberToObject(img, "id",            db_col_int(st, 0));
+        cJSON_AddStringToObject(img, "url",           db_col_text(st, 1) ? db_col_text(st, 1) : "");
+        cJSON_AddNumberToObject(img, "display_order", db_col_int(st, 2));
+        cJSON_AddStringToObject(img, "created_at",    db_col_text(st, 3) ? db_col_text(st, 3) : "");
+        cJSON_AddItemToArray(arr, img);
+    }
+    db_finalize(st);
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddNumberToObject(res, "plan_id", plan_id);
+    cJSON_AddItemToObject(res, "images", arr);
+    send_cjson_admin(c, 200, res);
+    cJSON_Delete(res);
+}

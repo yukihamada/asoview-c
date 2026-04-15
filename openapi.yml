@@ -1,0 +1,1505 @@
+openapi: 3.0.3
+
+info:
+  title: Asoview API
+  version: "0.4.0"
+  description: アクティビティ予約管理 REST API
+
+servers:
+  - url: http://localhost:3001
+    description: Local
+
+security: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+    AdminKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: "not found"
+
+    Venue:
+      type: object
+      required: [id, name, area_id, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1
+        name:
+          type: string
+          example: "海の体験センター"
+        description:
+          type: string
+          nullable: true
+          example: "シュノーケリングやカヤックを楽しめる施設です。"
+        area_id:
+          type: integer
+          format: int64
+          example: 2
+        address:
+          type: string
+          nullable: true
+          example: "沖縄県那覇市..."
+        lat:
+          type: number
+          format: double
+          nullable: true
+          example: 26.2124
+        lon:
+          type: number
+          format: double
+          nullable: true
+          example: 127.6809
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-04-14T09:00:00Z"
+
+    Plan:
+      type: object
+      required: [id, venue_id, title, price, capacity, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 10
+        venue_id:
+          type: integer
+          format: int64
+          example: 1
+        title:
+          type: string
+          example: "初心者シュノーケリング体験"
+        description:
+          type: string
+          nullable: true
+          example: "インストラクターが丁寧に指導します。"
+        category_id:
+          type: integer
+          format: int64
+          nullable: true
+          example: 3
+        price:
+          type: integer
+          description: "Price in JPY (yen)"
+          example: 5000
+        capacity:
+          type: integer
+          example: 10
+        duration_minutes:
+          type: integer
+          nullable: true
+          example: 90
+        images:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+                format: int64
+              url:
+                type: string
+                format: uri
+          example:
+            - id: 1
+              url: "https://example.com/images/plan10_1.jpg"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-04-14T09:00:00Z"
+
+    Schedule:
+      type: object
+      required: [id, plan_id, starts_at, available_slots]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 100
+        plan_id:
+          type: integer
+          format: int64
+          example: 10
+        starts_at:
+          type: string
+          format: date-time
+          example: "2026-05-01T10:00:00+09:00"
+        ends_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: "2026-05-01T11:30:00+09:00"
+        available_slots:
+          type: integer
+          example: 7
+        status:
+          type: string
+          enum: [open, full, cancelled]
+          example: open
+
+    Booking:
+      type: object
+      required: [id, user_id, schedule_id, num_people, status, total_price, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 500
+        user_id:
+          type: integer
+          format: int64
+          example: 42
+        schedule_id:
+          type: integer
+          format: int64
+          example: 100
+        num_people:
+          type: integer
+          example: 2
+        status:
+          type: string
+          enum: [pending, confirmed, cancelled, waitlisted, refunded]
+          example: confirmed
+        total_price:
+          type: integer
+          description: "Total in JPY"
+          example: 10000
+        coupon_code:
+          type: string
+          nullable: true
+          example: "SUMMER10"
+        discount_amount:
+          type: integer
+          nullable: true
+          example: 1000
+        stripe_session_id:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-04-14T09:30:00Z"
+        cancelled_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    User:
+      type: object
+      required: [id, email, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 42
+        email:
+          type: string
+          format: email
+          example: "user@example.com"
+        name:
+          type: string
+          nullable: true
+          example: "山田 太郎"
+        totp_enabled:
+          type: boolean
+          example: false
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-04-14T08:00:00Z"
+
+    Coupon:
+      type: object
+      required: [code, discount_type, discount_value, valid]
+      properties:
+        code:
+          type: string
+          example: "SUMMER10"
+        discount_type:
+          type: string
+          enum: [percent, fixed]
+          example: percent
+        discount_value:
+          type: integer
+          description: "Percent (1-100) or fixed JPY amount"
+          example: 10
+        max_uses:
+          type: integer
+          nullable: true
+          example: 100
+        uses_count:
+          type: integer
+          example: 3
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: "2026-08-31T23:59:59Z"
+        valid:
+          type: boolean
+          example: true
+
+    Webhook:
+      type: object
+      required: [id, url, events, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1
+        url:
+          type: string
+          format: uri
+          example: "https://partner.example.com/hooks/asoview"
+        events:
+          type: array
+          items:
+            type: string
+          example: ["booking.confirmed", "booking.cancelled"]
+        secret:
+          type: string
+          nullable: true
+          description: "HMAC signing secret (only returned on creation)"
+          example: "whsec_abc123"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-04-15T00:00:00Z"
+
+tags:
+  - name: public
+    description: Public unauthenticated endpoints
+  - name: auth
+    description: Authentication and session management
+  - name: bookings
+    description: Booking operations (requires user JWT)
+  - name: coupons
+    description: Coupon / promo code lookup
+  - name: admin
+    description: Admin-only management endpoints (requires X-Admin-Key)
+  - name: webhooks
+    description: Partner webhook registration (requires X-Admin-Key)
+
+paths:
+  # ── Public ──────────────────────────────────────────────────────────────────
+
+  /api/v1/health:
+    get:
+      tags: [public]
+      summary: Health check
+      operationId: getHealth
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  version:
+                    type: string
+                    example: "0.4.0"
+
+  /api/v1/venues:
+    get:
+      tags: [public]
+      summary: List venues
+      operationId: listVenues
+      parameters:
+        - name: q
+          in: query
+          description: Full-text search query
+          schema:
+            type: string
+        - name: area_id
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+        - name: after
+          in: query
+          description: Cursor (venue id) for pagination
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Paginated list of venues
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Venue"
+                  next_cursor:
+                    type: integer
+                    nullable: true
+
+  /api/v1/venues/{id}:
+    get:
+      tags: [public]
+      summary: Get venue by ID
+      operationId: getVenue
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Venue object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Venue"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/plans:
+    get:
+      tags: [public]
+      summary: List plans
+      operationId: listPlans
+      parameters:
+        - name: q
+          in: query
+          description: Full-text search query
+          schema:
+            type: string
+        - name: venue_id
+          in: query
+          schema:
+            type: integer
+        - name: category_id
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+        - name: after
+          in: query
+          description: Cursor (plan id) for pagination
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Paginated list of plans
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Plan"
+                  next_cursor:
+                    type: integer
+                    nullable: true
+
+  /api/v1/plans/{id}:
+    get:
+      tags: [public]
+      summary: Get plan by ID
+      operationId: getPlan
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Plan object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plan"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/plans/{id}/schedules:
+    get:
+      tags: [public]
+      summary: List schedules for a plan
+      operationId: listPlanSchedules
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: List of schedules
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Schedule"
+        "404":
+          description: Plan not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ── Auth ─────────────────────────────────────────────────────────────────────
+
+  /api/v1/users:
+    post:
+      tags: [auth]
+      summary: Register a new user
+      operationId: registerUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: "user@example.com"
+                password:
+                  type: string
+                  format: password
+                  minLength: 8
+                  example: "s3cur3P@ss"
+                name:
+                  type: string
+                  example: "山田 太郎"
+      responses:
+        "201":
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "409":
+          description: Email already registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Login and obtain JWT
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  format: password
+      responses:
+        "200":
+          description: Login successful (no 2FA) or 2FA required
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - description: Full token (2FA not enabled)
+                    type: object
+                    properties:
+                      token:
+                        type: string
+                        description: JWT access token
+                      user:
+                        $ref: "#/components/schemas/User"
+                  - description: Partial token requiring 2FA verification
+                    type: object
+                    properties:
+                      temp_token:
+                        type: string
+                        description: Short-lived token used in POST /auth/2fa/verify
+                      totp_required:
+                        type: boolean
+                        example: true
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Invalidate the current session token
+      operationId: logout
+      security:
+        - BearerAuth: []
+      responses:
+        "204":
+          description: Logged out successfully
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/auth/2fa/setup:
+    post:
+      tags: [auth]
+      summary: Begin TOTP 2FA setup — returns secret and QR URI
+      operationId: setup2fa
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: TOTP provisioning details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret:
+                    type: string
+                    description: Base32-encoded TOTP secret
+                    example: "JBSWY3DPEHPK3PXP"
+                  qr_uri:
+                    type: string
+                    description: otpauth:// URI for QR code generation
+                    example: "otpauth://totp/Asoview:user@example.com?secret=JBSWY3DPEHPK3PXP&issuer=Asoview"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/auth/2fa/enable:
+    post:
+      tags: [auth]
+      summary: Confirm and enable TOTP 2FA with a valid code
+      operationId: enable2fa
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  description: 6-digit TOTP code from authenticator app
+                  example: "123456"
+      responses:
+        "200":
+          description: 2FA enabled successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "2FA enabled"
+        "400":
+          description: Invalid TOTP code
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/auth/2fa/verify:
+    post:
+      tags: [auth]
+      summary: Verify TOTP code after partial login and receive full JWT
+      operationId: verify2fa
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [temp_token, code]
+              properties:
+                temp_token:
+                  type: string
+                  description: Temporary token returned by POST /auth/login when totp_required is true
+                code:
+                  type: string
+                  description: 6-digit TOTP code
+                  example: "654321"
+      responses:
+        "200":
+          description: Full JWT issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                  user:
+                    $ref: "#/components/schemas/User"
+        "401":
+          description: Invalid or expired temp_token / TOTP code
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ── Bookings ─────────────────────────────────────────────────────────────────
+
+  /api/v1/bookings:
+    post:
+      tags: [bookings]
+      summary: Create a booking
+      operationId: createBooking
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [schedule_id, num_people]
+              properties:
+                schedule_id:
+                  type: integer
+                  format: int64
+                  example: 100
+                num_people:
+                  type: integer
+                  minimum: 1
+                  example: 2
+                coupon_code:
+                  type: string
+                  nullable: true
+                  example: "SUMMER10"
+      responses:
+        "201":
+          description: Booking created (may be waitlisted if capacity exceeded)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Booking"
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Schedule not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/bookings/{id}:
+    get:
+      tags: [bookings]
+      summary: Get booking by ID
+      operationId: getBooking
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Booking object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Booking"
+        "403":
+          description: Forbidden — booking belongs to another user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/bookings/{id}/cancel:
+    patch:
+      tags: [bookings]
+      summary: Cancel a booking
+      operationId: cancelBooking
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Booking cancelled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Booking"
+        "400":
+          description: Booking cannot be cancelled (already cancelled or past event)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/bookings/{id}/ical:
+    get:
+      tags: [bookings]
+      summary: Download iCal file for a booking
+      operationId: getBookingIcal
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: iCalendar file
+          content:
+            text/calendar:
+              schema:
+                type: string
+                example: |
+                  BEGIN:VCALENDAR
+                  VERSION:2.0
+                  PRODID:-//Asoview//EN
+                  BEGIN:VEVENT
+                  ...
+                  END:VEVENT
+                  END:VCALENDAR
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ── Coupons ──────────────────────────────────────────────────────────────────
+
+  /api/v1/coupons/{code}:
+    get:
+      tags: [coupons]
+      summary: Validate and look up a coupon code
+      operationId: getCoupon
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+            example: "SUMMER10"
+      responses:
+        "200":
+          description: Coupon details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Coupon"
+        "404":
+          description: Coupon not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ── Admin — Venues ────────────────────────────────────────────────────────────
+
+  /api/v1/admin/venues:
+    get:
+      tags: [admin]
+      summary: List all venues (admin)
+      operationId: adminListVenues
+      security:
+        - AdminKey: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: after
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Paginated venue list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Venue"
+                  next_cursor:
+                    type: integer
+                    nullable: true
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    post:
+      tags: [admin]
+      summary: Create a venue
+      operationId: adminCreateVenue
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, area_id]
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                area_id:
+                  type: integer
+                address:
+                  type: string
+                lat:
+                  type: number
+                  format: double
+                lon:
+                  type: number
+                  format: double
+      responses:
+        "201":
+          description: Venue created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Venue"
+
+  # ── Admin — Plans ─────────────────────────────────────────────────────────────
+
+  /api/v1/admin/plans:
+    get:
+      tags: [admin]
+      summary: List all plans (admin)
+      operationId: adminListPlans
+      security:
+        - AdminKey: []
+      parameters:
+        - name: venue_id
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: after
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Paginated plan list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Plan"
+                  next_cursor:
+                    type: integer
+                    nullable: true
+
+    post:
+      tags: [admin]
+      summary: Create a plan
+      operationId: adminCreatePlan
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [venue_id, title, price, capacity]
+              properties:
+                venue_id:
+                  type: integer
+                title:
+                  type: string
+                description:
+                  type: string
+                category_id:
+                  type: integer
+                price:
+                  type: integer
+                capacity:
+                  type: integer
+                duration_minutes:
+                  type: integer
+      responses:
+        "201":
+          description: Plan created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plan"
+
+  /api/v1/admin/plans/{id}/images:
+    post:
+      tags: [admin]
+      summary: Upload an additional image for a plan
+      operationId: adminUploadPlanImage
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                  format: binary
+      responses:
+        "201":
+          description: Image uploaded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  url:
+                    type: string
+                    format: uri
+        "404":
+          description: Plan not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/admin/plan-images/{id}:
+    delete:
+      tags: [admin]
+      summary: Delete a plan image
+      operationId: adminDeletePlanImage
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Image deleted
+        "404":
+          description: Image not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ── Admin — Bookings ──────────────────────────────────────────────────────────
+
+  /api/v1/admin/bookings:
+    get:
+      tags: [admin]
+      summary: List all bookings (admin)
+      operationId: adminListBookings
+      security:
+        - AdminKey: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, confirmed, cancelled, waitlisted, refunded]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: after
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Paginated booking list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Booking"
+                  next_cursor:
+                    type: integer
+                    nullable: true
+
+  /api/v1/admin/bookings/{id}/refund:
+    post:
+      tags: [admin]
+      summary: Issue a refund for a booking via Stripe
+      operationId: adminRefundBooking
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount:
+                  type: integer
+                  description: "Partial refund amount in JPY. Omit for full refund."
+                  example: 5000
+      responses:
+        "200":
+          description: Refund issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Booking"
+        "400":
+          description: Booking not refundable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Booking not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ── Admin — Users ─────────────────────────────────────────────────────────────
+
+  /api/v1/admin/users:
+    get:
+      tags: [admin]
+      summary: List all users (admin)
+      operationId: adminListUsers
+      security:
+        - AdminKey: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: after
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Paginated user list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/User"
+                  next_cursor:
+                    type: integer
+                    nullable: true
+
+  # ── Admin — Backup & Audit ────────────────────────────────────────────────────
+
+  /api/v1/admin/backup:
+    get:
+      tags: [admin]
+      summary: Download a gzipped database backup
+      operationId: adminBackup
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          description: Gzipped SQLite backup
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+
+  /api/v1/admin/audit-logs:
+    get:
+      tags: [admin]
+      summary: List audit log entries
+      operationId: adminListAuditLogs
+      security:
+        - AdminKey: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+        - name: after
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Paginated audit log
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: integer
+                        actor_user_id:
+                          type: integer
+                          nullable: true
+                        action:
+                          type: string
+                          example: "booking.refund"
+                        target_type:
+                          type: string
+                          example: "booking"
+                        target_id:
+                          type: integer
+                          nullable: true
+                        ip:
+                          type: string
+                          example: "203.0.113.5"
+                        created_at:
+                          type: string
+                          format: date-time
+                  next_cursor:
+                    type: integer
+                    nullable: true
+
+  # ── Admin — Reports ───────────────────────────────────────────────────────────
+
+  /api/v1/admin/reports/sales:
+    get:
+      tags: [admin]
+      summary: Export sales report as CSV
+      operationId: adminSalesReport
+      security:
+        - AdminKey: []
+      parameters:
+        - name: from
+          in: query
+          required: true
+          description: Start date (inclusive) in ISO 8601 format
+          schema:
+            type: string
+            format: date
+            example: "2026-04-01"
+        - name: to
+          in: query
+          required: true
+          description: End date (inclusive) in ISO 8601 format
+          schema:
+            type: string
+            format: date
+            example: "2026-04-30"
+      responses:
+        "200":
+          description: CSV file with sales data
+          content:
+            text/csv:
+              schema:
+                type: string
+                example: |
+                  booking_id,plan_title,venue_name,num_people,total_price,status,created_at
+                  500,"初心者シュノーケリング体験","海の体験センター",2,10000,confirmed,2026-04-14T09:30:00Z
+
+  # ── Admin — Webhooks ──────────────────────────────────────────────────────────
+
+  /api/v1/admin/webhooks:
+    get:
+      tags: [webhooks]
+      summary: List registered webhooks
+      operationId: adminListWebhooks
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          description: List of webhooks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Webhook"
+
+    post:
+      tags: [webhooks]
+      summary: Register a new webhook
+      operationId: adminCreateWebhook
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url, events]
+              properties:
+                url:
+                  type: string
+                  format: uri
+                  example: "https://partner.example.com/hooks/asoview"
+                events:
+                  type: array
+                  items:
+                    type: string
+                    enum:
+                      - booking.confirmed
+                      - booking.cancelled
+                      - booking.waitlisted
+                      - booking.refunded
+                  example: ["booking.confirmed", "booking.cancelled"]
+      responses:
+        "201":
+          description: Webhook registered; signing secret included once
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Webhook"
+
+  /api/v1/admin/webhooks/{id}:
+    delete:
+      tags: [webhooks]
+      summary: Delete a webhook
+      operationId: adminDeleteWebhook
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Webhook deleted
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ── Admin — Coupons ───────────────────────────────────────────────────────────
+
+  /api/v1/admin/coupons:
+    get:
+      tags: [coupons]
+      summary: List all coupons (admin)
+      operationId: adminListCoupons
+      security:
+        - AdminKey: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: after
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Paginated coupon list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Coupon"
+                  next_cursor:
+                    type: integer
+                    nullable: true
+
+    post:
+      tags: [coupons]
+      summary: Create a coupon
+      operationId: adminCreateCoupon
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, discount_type, discount_value]
+              properties:
+                code:
+                  type: string
+                  example: "AUTUMN20"
+                discount_type:
+                  type: string
+                  enum: [percent, fixed]
+                discount_value:
+                  type: integer
+                  example: 20
+                max_uses:
+                  type: integer
+                  nullable: true
+                  example: 200
+                expires_at:
+                  type: string
+                  format: date-time
+                  nullable: true
+      responses:
+        "201":
+          description: Coupon created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Coupon"
+        "409":
+          description: Coupon code already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"

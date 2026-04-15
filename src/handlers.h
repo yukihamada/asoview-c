@@ -49,5 +49,16 @@ void handle_create_checkout_session(struct mg_connection *c, struct mg_http_mess
 void handle_delete_user_account(struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
 void handle_export_user_data   (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
 
+/* iCal エクスポート */
+void handle_ical_booking(struct mg_connection *c, struct mg_http_message *hm, DbConn *db, const char *id);
+
+/* クーポン */
+void handle_validate_coupon(struct mg_connection *c, struct mg_http_message *hm, DbConn *db, const char *code);
+
+/* 2FA TOTP */
+void handle_auth_2fa_setup (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+void handle_auth_2fa_enable(struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+void handle_auth_2fa_verify(struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+
 /* X-Request-ID（main.c から設定） */
 extern char g_request_id[40];
