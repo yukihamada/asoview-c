@@ -38,3 +38,5 @@ void handle_forgot_password  (struct mg_connection *c, struct mg_http_message *h
 void handle_reset_password   (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db);
 /* Reviews */
 void handle_delete_review    (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db, long id);
+/* Auth */
+void handle_auth_refresh     (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db);

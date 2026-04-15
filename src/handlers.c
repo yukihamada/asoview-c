@@ -7,8 +7,23 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CORS_HEADERS "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n"
 #define MAX_BUF 256
+
+/* ─── 動的 CORS ヘッダー（CORS_ORIGIN 環境変数対応） ──────────────────────── */
+
+static const char *get_cors_headers(void) {
+    static char buf[512] = {0};
+    if (!buf[0]) {
+        const char *origin = getenv("CORS_ORIGIN");
+        if (!origin || !*origin) origin = "*";
+        snprintf(buf, sizeof(buf),
+                 "Content-Type: application/json\r\n"
+                 "Access-Control-Allow-Origin: %s\r\n",
+                 origin);
+    }
+    return buf;
+}
+#define CORS_HEADERS get_cors_headers()
 
 /* ─── Helpers ────────────────────────────────────────────────────────────── */
 
@@ -440,6 +455,11 @@ void handle_create_user(struct mg_connection *c, struct mg_http_message *hm, sql
 
     if (!email || !*email || !name || !*name || !password || strlen(password) < 8) {
         send_error_json(c, 400, "email, name は必須。password は8文字以上");
+        cJSON_Delete(body);
+        return;
+    }
+    if (!is_valid_email(email)) {
+        send_error_json(c, 400, "メールアドレスの形式が正しくありません");
         cJSON_Delete(body);
         return;
     }
@@ -1231,7 +1251,11 @@ void handle_list_venue_plans(struct mg_connection *c, struct mg_http_message *hm
 
 void handle_get_user(struct mg_connection *c, struct mg_http_message *hm,
                      sqlite3 *db, long id) {
-    (void)hm;
+    long auth_uid = require_auth(c, hm);
+    if (auth_uid < 0) return;
+    if (auth_uid != id) {
+        send_error_json(c, 403, "他のユーザーのプロフィールは取得できません"); return;
+    }
     sqlite3_stmt *st;
     sqlite3_prepare_v2(db,
         "SELECT id,email,name,phone,created_at FROM users WHERE id=?",
@@ -1606,7 +1630,11 @@ void handle_forgot_password(struct mg_connection *c, struct mg_http_message *hm,
     for (int i = 0; uuid_str[i] && j < 32; i++)
         if (uuid_str[i] != '-') token[j++] = uuid_str[i];
 
-    /* 既存トークンを削除して新規挿入（1時間有効） */
+    /* 既存トークンを削除して新規挿入（1時間有効）
+       DB にはトークンの SHA-256 ハッシュを保存（平文漏洩対策）*/
+    char token_hash[65];
+    sha256_hex(token, strlen(token), token_hash);
+
     sqlite3_stmt *del;
     sqlite3_prepare_v2(db, "DELETE FROM password_reset_tokens WHERE user_id=?", -1, &del, NULL);
     sqlite3_bind_int64(del, 1, uid);
@@ -1617,11 +1645,11 @@ void handle_forgot_password(struct mg_connection *c, struct mg_http_message *hm,
         "INSERT INTO password_reset_tokens(token,user_id,expires_at)"
         " VALUES(?,?,datetime('now','+1 hour'))",
         -1, &ins, NULL);
-    sqlite3_bind_text(ins, 1, token, -1, SQLITE_STATIC);
+    sqlite3_bind_text(ins, 1, token_hash, -1, SQLITE_STATIC); /* ハッシュを保存 */
     sqlite3_bind_int64(ins, 2, uid);
     sqlite3_step(ins); sqlite3_finalize(ins);
 
-    /* メール送信（RESEND_API_KEY 未設定時はスキップ） */
+    /* メール送信（平文トークンをリンクに埋め込む）*/
     send_password_reset_email(email_lower, token);
 
     /* 開発環境では reset_token をレスポンスに含める（RESEND_API_KEY 未設定時のみ） */
@@ -1656,12 +1684,16 @@ void handle_reset_password(struct mg_connection *c, struct mg_http_message *hm, 
     char token[64] = {0};
     strncpy(token, token_raw, sizeof(token)-1);
 
+    /* 入力トークンをハッシュしてから DB と照合 */
+    char token_hash[65];
+    sha256_hex(token, strlen(token), token_hash);
+
     sqlite3_stmt *st;
     sqlite3_prepare_v2(db,
         "SELECT user_id FROM password_reset_tokens"
         " WHERE token=? AND used=0 AND expires_at > datetime('now')",
         -1, &st, NULL);
-    sqlite3_bind_text(st, 1, token, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 1, token_hash, -1, SQLITE_STATIC);
     if (sqlite3_step(st) != SQLITE_ROW) {
         sqlite3_finalize(st); cJSON_Delete(body);
         send_error_json(c, 400, "トークンが無効または期限切れです"); return;
@@ -1682,7 +1714,7 @@ void handle_reset_password(struct mg_connection *c, struct mg_http_message *hm, 
     sqlite3_stmt *mark;
     sqlite3_prepare_v2(db, "UPDATE password_reset_tokens SET used=1 WHERE token=?",
                         -1, &mark, NULL);
-    sqlite3_bind_text(mark, 1, token, -1, SQLITE_STATIC);
+    sqlite3_bind_text(mark, 1, token_hash, -1, SQLITE_STATIC); /* ハッシュで照合 */
     sqlite3_step(mark); sqlite3_finalize(mark);
 
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"パスワードをリセットしました\"}");
@@ -1717,4 +1749,25 @@ void handle_delete_review(struct mg_connection *c, struct mg_http_message *hm,
     sqlite3_step(del); sqlite3_finalize(del);
 
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"レビューを削除しました\"}");
+}
+
+/* ─── POST /api/v1/auth/refresh ─────────────────────────────────────────────
+   有効な JWT を受け取り、有効期限を延長した新しい JWT を返す              */
+
+void handle_auth_refresh(struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db) {
+    (void)db;
+    long uid = require_auth(c, hm);
+    if (uid < 0) return;
+
+    const char *secret = getenv("JWT_SECRET");
+    if (!secret || !*secret) secret = "asoview-jwt-secret-dev";
+
+    char *new_token = jwt_create(uid, secret);
+    if (!new_token) { send_error_json(c, 500, "token generation failed"); return; }
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddStringToObject(res, "token", new_token);
+    free(new_token);
+    send_cjson(c, 200, res);
+    cJSON_Delete(res);
 }

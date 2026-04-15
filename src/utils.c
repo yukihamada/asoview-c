@@ -1,5 +1,6 @@
 #include "utils.h"
 #include "platform.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -65,6 +66,27 @@ char *str_lower(char *s) {
 
 int str_starts_with(const char *s, const char *prefix) {
     return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+/* ─── Email validation ───────────────────────────────────────────────────── */
+
+int is_valid_email(const char *email) {
+    if (!email || !*email) return 0;
+    const char *at = strchr(email, '@');
+    if (!at || at == email) return 0;          /* '@' なし、または先頭が '@' */
+    const char *dot = strchr(at + 1, '.');
+    if (!dot || dot == at + 1 || !*(dot + 1)) return 0; /* ドメイン部に '.' なし */
+    if (strchr(dot + 1, '\0') == dot + 1) return 0;     /* TLD が空 */
+    return 1;
+}
+
+/* ─── SHA-256 hex ─────────────────────────────────────────────────────────── */
+
+void sha256_hex(const char *input, size_t input_len, char out[65]) {
+    unsigned char hash[32];
+    platform_sha256(input, input_len, hash);
+    for (int i = 0; i < 32; i++) snprintf(out + i*2, 3, "%02x", hash[i]);
+    out[64] = '\0';
 }
 
 /* ─── LIKE escape ────────────────────────────────────────────────────────── */

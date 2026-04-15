@@ -24,3 +24,6 @@ void platform_random(void *buf, size_t len);
 
 /* SHA-256 ダイジェスト長 */
 #define PLATFORM_SHA256_LEN 32
+
+/* SHA-256 ダイジェスト — out に 32 バイト書き込む */
+void platform_sha256(const void *data, size_t data_len, unsigned char out[32]);

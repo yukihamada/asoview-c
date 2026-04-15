@@ -2,7 +2,7 @@
 #include <string.h>
 #include <time.h>
 
-#define BUCKET_COUNT  512
+#define BUCKET_COUNT  4096
 #define WINDOW_SECS    60
 #define GENERAL_LIMIT 500
 #define AUTH_LIMIT     60

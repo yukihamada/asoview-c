@@ -1,6 +1,7 @@
 #include "mailer.h"
 #include "cJSON.h"
 #include <curl/curl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,23 +23,33 @@ static size_t mail_write_cb(void *ptr, size_t sz, size_t n, void *ud) {
     return add;
 }
 
-int send_email(const char *to, const char *subject, const char *html_body) {
+/* ─── 非同期送信スレッド ──────────────────────────────────────────────────── */
+
+typedef struct {
+    char to[256];
+    char subject[256];
+    char *html_body; /* heap allocated */
+} MailTask;
+
+static void *mail_thread(void *arg) {
+    MailTask *t = (MailTask *)arg;
+
     const char *api_key = getenv("RESEND_API_KEY");
     if (!api_key || !*api_key) {
-        fprintf(stderr, "[mailer] RESEND_API_KEY 未設定 — メール送信をスキップ: %s\n", to);
-        return -1;
+        fprintf(stderr, "[mailer] RESEND_API_KEY 未設定 — メール送信をスキップ: %s\n", t->to);
+        free(t->html_body); free(t); return NULL;
     }
     const char *from = getenv("RESEND_FROM");
     if (!from || !*from) from = "noreply@asoview.example.com";
 
     CURL *curl = curl_easy_init();
-    if (!curl) return -1;
+    if (!curl) { free(t->html_body); free(t); return NULL; }
 
     cJSON *j = cJSON_CreateObject();
     cJSON_AddStringToObject(j, "from",    from);
-    cJSON_AddStringToObject(j, "to",      to);
-    cJSON_AddStringToObject(j, "subject", subject);
-    cJSON_AddStringToObject(j, "html",    html_body);
+    cJSON_AddStringToObject(j, "to",      t->to);
+    cJSON_AddStringToObject(j, "subject", t->subject);
+    cJSON_AddStringToObject(j, "html",    t->html_body);
     char *body_str = cJSON_PrintUnformatted(j);
     cJSON_Delete(j);
 
@@ -66,16 +77,39 @@ int send_email(const char *to, const char *subject, const char *html_body) {
     cJSON_free(body_str);
     free(buf.data);
 
-    if (res != CURLE_OK) {
+    if (res != CURLE_OK)
         fprintf(stderr, "[mailer] curl エラー: %s\n", curl_easy_strerror(res));
+    else if (http_code < 200 || http_code >= 300)
+        fprintf(stderr, "[mailer] Resend API HTTP %ld → %s\n", http_code, t->to);
+
+    free(t->html_body);
+    free(t);
+    return NULL;
+}
+
+/* 非ブロッキング送信 — スレッドを生成してすぐリターン */
+int send_email(const char *to, const char *subject, const char *html_body) {
+    MailTask *t = calloc(1, sizeof(MailTask));
+    if (!t) return -1;
+    strncpy(t->to,      to,      sizeof(t->to)      - 1);
+    strncpy(t->subject, subject, sizeof(t->subject) - 1);
+    t->html_body = strdup(html_body);
+    if (!t->html_body) { free(t); return -1; }
+
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&tid, &attr, mail_thread, t) != 0) {
+        free(t->html_body); free(t);
+        pthread_attr_destroy(&attr);
         return -1;
     }
-    if (http_code < 200 || http_code >= 300) {
-        fprintf(stderr, "[mailer] Resend API HTTP %ld\n", http_code);
-        return -1;
-    }
+    pthread_attr_destroy(&attr);
     return 0;
 }
+
+/* ─── テンプレート ────────────────────────────────────────────────────────── */
 
 void send_password_reset_email(const char *to, const char *reset_token) {
     const char *frontend = getenv("FRONTEND_URL");

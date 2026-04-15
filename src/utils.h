@@ -22,3 +22,9 @@ long  jwt_verify(const char *token, const char *secret);
 /* LIKE パターンの % _ \ をエスケープ（バックスラッシュ方式）
    SQLite LIKE ... ESCAPE '\\' と組み合わせて使う */
 void escape_like(const char *src, char *dst, size_t dst_len);
+
+/* メールアドレスの簡易バリデーション */
+int is_valid_email(const char *email);
+
+/* SHA-256 ハッシュを 64 文字 hex 文字列に変換（out は 65 バイト以上必須） */
+void sha256_hex(const char *input, size_t input_len, char out[65]);

@@ -1,12 +1,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include "mongoose.h"
 #include "db.h"
 #include "seed.h"
 #include "handlers.h"
 #include "admin.h"
+#include "uploader.h"
 #include "rate_limit.h"
+
+#define MAX_BODY_BYTES (64 * 1024)  /* 64 KB リクエストボディ上限 */
+
+static volatile int g_quit = 0;
+static void handle_signal(int sig) { (void)sig; g_quit = 1; }
 
 static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     if (ev != MG_EV_HTTP_MSG) return;
@@ -19,6 +26,17 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     /* IP ベースレート制限 */
     char client_ip[48] = {0};
     mg_snprintf(client_ip, sizeof(client_ip), "%M", mg_print_ip, &c->rem);
+
+    /* リクエストログ */
+    fprintf(stderr, "[req] %.*s %s %s\n",
+            (int)hm->method.len, hm->method.buf, uri, client_ip);
+
+    /* リクエストボディサイズ上限 */
+    if (hm->body.len > MAX_BODY_BYTES) {
+        mg_http_reply(c, 413, "Content-Type: application/json\r\n",
+                      "{\"error\":\"リクエストボディが大きすぎます（上限 64KB）\"}");
+        return;
+    }
     /* auth/registration endpoints get strict limit; /users/:id/... uses general limit */
     int uri_is_users_exact = (strncmp(hm->uri.buf, "/api/v1/users", 13) == 0 &&
                                (hm->uri.len <= 13 || hm->uri.buf[13] != '/'));
@@ -31,12 +49,16 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     /* CORS プリフライト */
     if (mg_strcmp(hm->method, mg_str("OPTIONS")) == 0) {
-        mg_http_reply(c, 204,
-            "Access-Control-Allow-Origin: *\r\n"
+        const char *cors_origin = getenv("CORS_ORIGIN");
+        if (!cors_origin || !*cors_origin) cors_origin = "*";
+        char cors_hdrs[512];
+        snprintf(cors_hdrs, sizeof(cors_hdrs),
+            "Access-Control-Allow-Origin: %s\r\n"
             "Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n"
             "Access-Control-Allow-Headers: Content-Type, Authorization, X-Admin-Key\r\n"
             "Access-Control-Max-Age: 86400\r\n",
-            "");
+            cors_origin);
+        mg_http_reply(c, 204, cors_hdrs, "");
         return;
     }
 
@@ -115,6 +137,9 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (strcmp(uri, "/api/v1/auth/reset-password") == 0) {
         if (IS_POST) handle_reset_password(c, hm, db);
 
+    } else if (strcmp(uri, "/api/v1/auth/refresh") == 0) {
+        if (IS_POST) handle_auth_refresh(c, hm, db);
+
     } else if (strcmp(uri, "/api/v1/bookings") == 0) {
         if (IS_POST) handle_create_booking(c, hm, db);
 
@@ -190,6 +215,9 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (strcmp(uri, "/api/v1/admin/users") == 0) {
         if (IS_GET) handle_admin_list_users(c, hm, db);
 
+    } else if (strcmp(uri, "/api/v1/admin/upload-url") == 0) {
+        if (IS_POST) handle_admin_get_upload_url(c, hm, db);
+
     } else {
         mg_http_reply(c, 404, "Content-Type: application/json\r\n",
                       "{\"error\":\"not found\"}");
@@ -235,6 +263,9 @@ int main(int argc, char *argv[]) {
             "Webhooks will be rejected.\n");
     }
 
+    signal(SIGTERM, handle_signal);
+    signal(SIGINT,  handle_signal);
+
     sqlite3 *db = db_open(db_path);
     if (!db) return 1;
     seed_if_empty(db);
@@ -250,7 +281,9 @@ int main(int argc, char *argv[]) {
     }
     printf("[asoview-c] Listening on http://%s\n", listen_addr);
 
-    for (;;) mg_mgr_poll(&mgr, 100);
+    printf("[asoview-c] Press Ctrl-C to stop\n");
+    while (!g_quit) mg_mgr_poll(&mgr, 100);
+    printf("[asoview-c] Shutting down...\n");
 
     mg_mgr_free(&mgr);
     db_close(db);

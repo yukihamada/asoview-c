@@ -1346,6 +1346,92 @@ static void test_admin_list_users(void) {
     PASS();
 }
 
+/* ── Batch 3: セキュリティ・新機能テスト ─────────────────────────────── */
+
+/* GET /users/:id は JWT 必須、他人のプロフィールは 403 */
+static void test_get_user_auth(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/v1/users/1", BASE_URL);
+
+    /* 未認証 → 401 */
+    Resp r1 = http_get(url);
+    ASSERT(r1.status == 401, "no auth → 401");
+    resp_free(&r1);
+
+    /* 本人 (taro, id=1) → 200 */
+    Resp r2 = http_get_auth(url, g_token);
+    ASSERT(r2.status == 200, "own profile → 200");
+    cJSON *j = cJSON_Parse(r2.body);
+    ASSERT(cJSON_GetObjectItem(j, "email") != NULL, "has email");
+    cJSON_Delete(j); resp_free(&r2);
+
+    /* 他人 (hanako=id2 が id=1 を取得) → 403 */
+    Resp r3 = http_get_auth(url, g_token2);
+    ASSERT(r3.status == 403, "other user → 403");
+    resp_free(&r3);
+
+    PASS();
+}
+
+/* POST /users に無効なメールアドレス → 400 */
+static void test_create_user_invalid_email(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/v1/users", BASE_URL);
+
+    const char *cases[] = {
+        "{\"email\":\"notanemail\",\"name\":\"X\",\"password\":\"pass1234\"}",
+        "{\"email\":\"@example.com\",\"name\":\"X\",\"password\":\"pass1234\"}",
+        "{\"email\":\"user@\",\"name\":\"X\",\"password\":\"pass1234\"}",
+    };
+    for (int i = 0; i < 3; i++) {
+        Resp r = http_post(url, cases[i]);
+        ASSERT(r.status == 400, "invalid email → 400");
+        resp_free(&r);
+    }
+    PASS();
+}
+
+/* POST /auth/refresh — 有効なトークンで新しいトークンを発行 */
+static void test_auth_refresh(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/v1/auth/refresh", BASE_URL);
+
+    /* 有効なトークン → 200 + 新しいトークン */
+    Resp r = http_post_auth(url, "", g_token);
+    ASSERT(r.status == 200, "refresh with valid token → 200");
+    cJSON *j = cJSON_Parse(r.body);
+    const char *new_tok = cJSON_GetStringValue(cJSON_GetObjectItem(j, "token"));
+    ASSERT(new_tok && strlen(new_tok) > 10, "has new token");
+    cJSON_Delete(j); resp_free(&r);
+
+    /* 未認証 → 401 */
+    Resp r2 = http_post(url, "");
+    ASSERT(r2.status == 401, "no auth → 401");
+    resp_free(&r2);
+
+    PASS();
+}
+
+/* POST /admin/upload-url — S3 presigned URL 取得 */
+static void test_admin_upload_url(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/v1/admin/upload-url", BASE_URL);
+
+    /* S3 認証情報が未設定 → 503 */
+    const char *body = "{\"filename\":\"test.jpg\",\"content_type\":\"image/jpeg\"}";
+    Resp r = http_post_admin(url, body);
+    /* S3 env vars が設定されていなければ 503、設定されていれば 200 */
+    ASSERT(r.status == 503 || r.status == 200, "upload-url returns 503 or 200");
+    resp_free(&r);
+
+    /* 管理者キーなし → 403 */
+    Resp r2 = http_post(url, body);
+    ASSERT(r2.status == 403, "no admin key → 403");
+    resp_free(&r2);
+
+    PASS();
+}
+
 /* ─── Server startup (fork) ──────────────────────────────────────────── */
 
 static int wait_for_port(int port, int timeout_ms) {
@@ -1461,6 +1547,12 @@ int main(void) {
     test_admin_list_reviews();
     test_admin_delete_review();
     test_admin_list_users();
+
+    /* ── Batch 3: セキュリティ・新機能 ── */
+    test_get_user_auth();
+    test_create_user_invalid_email();
+    test_auth_refresh();
+    test_admin_upload_url();
 
     kill(pid, 15);
 
