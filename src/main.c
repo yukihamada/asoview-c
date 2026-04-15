@@ -548,7 +548,16 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     /* ── 決済完了・キャンセルページ ──────────────────────────────────────── */
     } else if (strcmp(uri, "/payment/success") == 0) {
-        if (IS_GET)
+        if (IS_GET) {
+            char amt_str[32] = {0};
+            mg_http_get_var(&hm->query, "amount", amt_str, sizeof(amt_str));
+            long amount = amt_str[0] ? atol(amt_str) : 0;
+            char amount_display[64];
+            if (amount > 0)
+                snprintf(amount_display, sizeof(amount_display),
+                         "&#165;%ld", amount);
+            else
+                snprintf(amount_display, sizeof(amount_display), "お支払い");
             mg_http_reply(c, 200,
                 "Content-Type: text/html; charset=UTF-8\r\n"
                 "Cache-Control: no-cache\r\n",
@@ -560,16 +569,18 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
                 "box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:480px;width:90%%;}"
                 "h1{color:#16a34a;font-size:2rem;margin-bottom:.5rem}"
                 "p{color:#555;margin:1rem 0 2rem}"
-                ".btn{display:inline-block;background:#e94560;color:#fff;padding:14px 32px;"
+                ".amount{font-size:2.5rem;font-weight:900;color:#16a34a;margin:1rem 0;}"
+                ".btn{display:inline-block;background:#7c3aed;color:#fff;padding:14px 32px;"
                 "border-radius:8px;text-decoration:none;font-weight:700;font-size:1rem}"
-                ".btn:hover{background:#c73552}</style></head>"
+                ".btn:hover{opacity:.85}</style></head>"
                 "<body><div class='box'>"
-                "<div style='font-size:3rem'>&#10003;</div>"
-                "<h1>お支払いが完了しました</h1>"
-                "<p>¥50,000 のお支払いを受け付けました。<br>"
-                "次のステップに進んでください。</p>"
-                "<a class='btn' href='/'>&#8594;&nbsp;次のページへ</a>"
-                "</div></body></html>%s", "");
+                "<div style='font-size:3.5rem;margin-bottom:.5rem'>&#9989;</div>"
+                "<h1>お支払い完了</h1>"
+                "<div class='amount'>%s</div>"
+                "<p>ご予約が確定しました。<br>確認メールをお送りします。</p>"
+                "<a class='btn' href='/ui'>&#8594;&nbsp;マイ予約を確認する</a>"
+                "</div></body></html>", amount_display);
+        }
 
     } else if (strcmp(uri, "/payment/cancel") == 0) {
         if (IS_GET)
