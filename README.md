@@ -2,7 +2,7 @@
 
 **Node.js/Python サーバーを捨てて、285KB のシングルバイナリに移行する話。**
 
-[![Tests](https://img.shields.io/badge/tests-85%2F85%20pass-brightgreen)](tests/test_api.c)
+[![Tests](https://img.shields.io/badge/tests-90%2F90%20pass-brightgreen)](tests/test_api.c)
 [![CI](https://github.com/yukihamada/asoview-c/actions/workflows/ci.yml/badge.svg)](../../actions)
 [![OpenAPI](https://img.shields.io/badge/OpenAPI-3.1.0-blue)](openapi.yaml)
 
@@ -224,6 +224,13 @@ FRONTEND_URL=https://yourdomain.com
 # Stripe 決済
 STRIPE_SECRET_KEY=sk_live_xxxxx
 STRIPE_WEBHOOK_SECRET=whsec_xxxxx
+
+# Google OAuth（ソーシャルログイン、任意）
+# 1. https://console.cloud.google.com → 認証情報 → OAuth 2.0 クライアントID を作成
+# 2. リダイレクト URI に https://yourdomain.com/auth/google/callback を追加
+GOOGLE_CLIENT_ID=<your_client_id>.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=<your_client_secret>
+GOOGLE_REDIRECT_URI=https://yourdomain.com/auth/google/callback
 ```
 
 ### 3. systemd に登録する

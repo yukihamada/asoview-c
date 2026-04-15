@@ -54,6 +54,12 @@ tags:
     description: Stripe Checkout（決済フロー）
   - name: waitlist
     description: ウェイトリスト
+  - name: gift_cards
+    description: ギフトカード
+  - name: staff
+    description: スタッフ向けAPI（Bearerトークン + role=staff/admin必須）
+  - name: oauth
+    description: Google OAuth 2.0 ソーシャルログイン
 
 paths:
   /api/v1/health:
@@ -1989,6 +1995,333 @@ paths:
         "404": { description: テナントが存在しない }
         "403": { description: 管理者キーエラー }
 
+  # ──────────────────────────────────────────
+  # Google OAuth
+  # ──────────────────────────────────────────
+  /auth/google:
+    get:
+      tags: [oauth]
+      summary: Google OAuth 認可画面へリダイレクト
+      description: |
+        `GOOGLE_CLIENT_ID` / `GOOGLE_REDIRECT_URI` が設定されていない場合は 503 を返す。
+      responses:
+        "302":
+          description: Google 認可エンドポイントへリダイレクト
+          headers:
+            Location: { schema: { type: string } }
+        "503":
+          description: OAuth 未設定
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/google/callback:
+    get:
+      tags: [oauth]
+      summary: Google OAuth コールバック（認可コード受け取り）
+      description: |
+        Google がリダイレクトしてくるエンドポイント。
+        `code` を使ってトークン交換 → ユーザー情報取得 → JWT 発行。
+        既存ユーザーはメールアドレスで紐付け。
+      parameters:
+        - in: query
+          name: code
+          required: true
+          schema: { type: string }
+          description: Google 認可コード
+        - in: query
+          name: state
+          schema: { type: string }
+          description: CSRF 対策の state 値
+      responses:
+        "200":
+          description: ログイン成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string, description: JWT access token }
+                  refresh_token: { type: string }
+                  user: { $ref: '#/components/schemas/User' }
+        "400": { description: code パラメーター欠落 }
+        "502": { description: Google API エラー }
+
+  # ──────────────────────────────────────────
+  # 予約リスケジュール
+  # ──────────────────────────────────────────
+  /api/v1/bookings/{id}/reschedule:
+    patch:
+      tags: [bookings]
+      summary: 予約日程変更
+      description: |
+        対象予約の `schedule_id` を別スケジュールに変更する。
+        - `confirmed` または `pending_payment` 状態の自分の予約のみ可
+        - 変更先スケジュールに空きがなければ 409
+        - 同じスケジュールへの変更は 400
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_schedule_id]
+              properties:
+                new_schedule_id: { type: integer, description: 変更先スケジュールID }
+      responses:
+        "200":
+          description: 変更成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        "400": { description: 同じスケジュールへの変更 }
+        "401": { description: 未認証 }
+        "403": { description: 他人の予約 }
+        "404": { description: 予約またはスケジュールが存在しない }
+        "409": { description: 変更先スケジュールの空き不足 }
+
+  # ──────────────────────────────────────────
+  # ギフトカード（公開）
+  # ──────────────────────────────────────────
+  /api/v1/gift-cards/{code}:
+    get:
+      tags: [gift_cards]
+      summary: ギフトカード検証・残高確認
+      description: コードが有効（is_active=1、期限内）であれば残高を返す。
+      parameters:
+        - in: path
+          name: code
+          required: true
+          schema: { type: string, minLength: 16, maxLength: 16 }
+          description: 16文字の英数字コード
+      responses:
+        "200":
+          description: 有効なギフトカード
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GiftCard' }
+        "404": { description: コードが存在しない、無効、または期限切れ }
+
+  # ──────────────────────────────────────────
+  # ギフトカード管理（Admin）
+  # ──────────────────────────────────────────
+  /api/v1/admin/gift-cards:
+    get:
+      tags: [gift_cards]
+      summary: ギフトカード一覧
+      security: [{ adminKey: [] }]
+      parameters:
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 50 }
+      responses:
+        "200":
+          description: ギフトカードリスト
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  gift_cards:
+                    type: array
+                    items: { $ref: '#/components/schemas/GiftCard' }
+                  total: { type: integer }
+    post:
+      tags: [gift_cards]
+      summary: ギフトカード発行
+      security: [{ adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [initial_amount]
+              properties:
+                initial_amount: { type: integer, description: 金額（円）, example: 5000 }
+                issued_to_email: { type: string, format: email, nullable: true }
+                expires_at: { type: string, format: date, nullable: true }
+      responses:
+        "201":
+          description: 発行成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GiftCard' }
+        "400": { description: パラメーターエラー }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/gift-cards/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: integer }
+    delete:
+      tags: [gift_cards]
+      summary: ギフトカード無効化
+      description: 論理削除（is_active=0）。既に使用済みのカードも無効化される。
+      security: [{ adminKey: [] }]
+      responses:
+        "200":
+          description: 無効化成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+        "404": { description: 存在しない }
+        "403": { description: 管理者キーエラー }
+
+  # ──────────────────────────────────────────
+  # スタッフ向けAPI
+  # ──────────────────────────────────────────
+  /api/v1/staff/bookings:
+    get:
+      tags: [staff]
+      summary: スタッフ担当会場の予約一覧
+      description: |
+        `staff_venues` で紐付いた会場の予約のみ返す（admin は全件）。
+        role が `user` のトークンでは 403。
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: venue_id
+          schema: { type: integer }
+          description: 会場絞り込み
+        - in: query
+          name: date
+          schema: { type: string, format: date }
+          description: 日付絞り込み
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+      responses:
+        "200":
+          description: 予約リスト
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bookings:
+                    type: array
+                    items: { $ref: '#/components/schemas/Booking' }
+                  total: { type: integer }
+        "401": { description: 未認証 }
+        "403": { description: role が user（スタッフ権限なし） }
+
+  /api/v1/staff/venues:
+    get:
+      tags: [staff]
+      summary: スタッフが担当する会場一覧
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: 担当会場リスト
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  venues:
+                    type: array
+                    items: { $ref: '#/components/schemas/Venue' }
+        "401": { description: 未認証 }
+        "403": { description: role が user }
+
+  # ──────────────────────────────────────────
+  # スタッフ管理（Admin）
+  # ──────────────────────────────────────────
+  /api/v1/admin/staff:
+    get:
+      tags: [staff]
+      summary: スタッフ一覧（role=staff または admin のユーザー）
+      security: [{ adminKey: [] }]
+      responses:
+        "200":
+          description: スタッフリスト
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  staff:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/User'
+                        - type: object
+                          properties:
+                            role: { type: string, enum: [staff, admin] }
+                            venues: { type: array, items: { type: integer }, description: 担当会場IDリスト }
+
+  /api/v1/admin/staff/venues:
+    post:
+      tags: [staff]
+      summary: スタッフに会場を割り当て
+      security: [{ adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, venue_id]
+              properties:
+                user_id: { type: integer }
+                venue_id: { type: integer }
+      responses:
+        "201":
+          description: 割り当て成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+        "400": { description: パラメーターエラーまたは重複 }
+        "403": { description: 管理者キーエラー }
+        "404": { description: ユーザーまたは会場が存在しない }
+
+  /api/v1/admin/staff/{user_id}/venues/{venue_id}:
+    parameters:
+      - in: path
+        name: user_id
+        required: true
+        schema: { type: integer }
+      - in: path
+        name: venue_id
+        required: true
+        schema: { type: integer }
+    delete:
+      tags: [staff]
+      summary: スタッフの会場割り当てを解除
+      security: [{ adminKey: [] }]
+      responses:
+        "200":
+          description: 解除成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+        "404": { description: 割り当てが存在しない }
+        "403": { description: 管理者キーエラー }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -2058,6 +2391,9 @@ components:
         images: { type: array, items: { type: string } }
         tags: { type: array, items: { type: string } }
         is_active: { type: boolean }
+        cancel_days_full: { type: integer, nullable: true, description: 全額返金期限（予約日の何日前まで） }
+        cancel_days_partial: { type: integer, nullable: true, description: 部分返金期限（予約日の何日前まで） }
+        cancel_pct_partial: { type: integer, nullable: true, description: 部分返金率（%） }
         prices:
           type: array
           items: { $ref: "#/components/schemas/Price" }
@@ -2098,6 +2434,8 @@ components:
           enum: [pending_payment, confirmed, cancelled]
         total_price: { type: integer }
         note: { type: string, nullable: true }
+        gift_card_id: { type: integer, nullable: true, description: 適用したギフトカードID }
+        gift_discount: { type: integer, description: ギフトカード割引額（円） }
         participants:
           type: array
           items:
@@ -2127,6 +2465,8 @@ components:
         email: { type: string, format: email }
         name: { type: string }
         phone: { type: string, nullable: true }
+        role: { type: string, enum: [user, staff, admin], default: user }
+        google_id: { type: string, nullable: true, description: Google OAuth のユーザーID }
         created_at: { type: string, format: date-time }
 
     Bookmark:
@@ -2153,4 +2493,16 @@ components:
         api_key: { type: string, description: "テナント API キー（作成時のみ返却）" }
         plan_limit: { type: integer }
         is_active: { type: integer, enum: [0, 1] }
+        created_at: { type: string, format: date-time }
+
+    GiftCard:
+      type: object
+      properties:
+        id: { type: integer }
+        code: { type: string, minLength: 16, maxLength: 16, description: 16文字英数字コード }
+        initial_amount: { type: integer, description: 初期金額（円） }
+        remaining_balance: { type: integer, description: 残高（円） }
+        issued_to_email: { type: string, format: email, nullable: true }
+        expires_at: { type: string, format: date, nullable: true }
+        is_active: { type: boolean }
         created_at: { type: string, format: date-time }
