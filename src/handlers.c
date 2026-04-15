@@ -1,6 +1,7 @@
 #include "handlers.h"
 #include "utils.h"
 #include "stripe.h"
+#include "mailer.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -803,6 +804,29 @@ void handle_create_booking(struct mg_connection *c, struct mg_http_message *hm, 
     }
     sqlite3_finalize(sel);
 
+    /* Stripe 未使用時 (status='confirmed') はここで確定メールを送信
+     * Stripe 使用時は payment_intent.succeeded webhook で送信 */
+    if (!stripe_ok && bk) {
+        char umail[256] = {0};
+        sqlite3_stmt *eml;
+        sqlite3_prepare_v2(db, "SELECT email FROM users WHERE id=?", -1, &eml, NULL);
+        sqlite3_bind_int64(eml, 1, auth_uid);
+        if (sqlite3_step(eml) == SQLITE_ROW) {
+            const char *em = (const char*)sqlite3_column_text(eml, 0);
+            if (em) strncpy(umail, em, sizeof(umail) - 1);
+        }
+        sqlite3_finalize(eml);
+        if (umail[0]) {
+            send_booking_confirmation_email(
+                umail,
+                cJSON_GetStringValue(cJSON_GetObjectItem(bk, "id")),
+                cJSON_GetStringValue(cJSON_GetObjectItem(bk, "plan_title")),
+                cJSON_GetStringValue(cJSON_GetObjectItem(bk, "schedule_date")),
+                cJSON_GetStringValue(cJSON_GetObjectItem(bk, "schedule_start_time")),
+                (long)cJSON_GetNumberValue(cJSON_GetObjectItem(bk, "total_price")));
+        }
+    }
+
     if (bk) { send_cjson(c, 201, bk); cJSON_Delete(bk); }
     else      send_error_json(c, 500, "failed to fetch booking");
 }
@@ -1047,7 +1071,12 @@ void handle_cancel_booking(struct mg_connection *c, struct mg_http_message *hm,
 
     sqlite3_stmt *st;
     sqlite3_prepare_v2(db,
-        "SELECT user_id, status, schedule_id FROM bookings WHERE id=?",
+        "SELECT b.user_id, b.status, b.schedule_id, b.stripe_payment_intent_id, "
+        "u.email, p.title "
+        "FROM bookings b "
+        "JOIN users u ON u.id = b.user_id "
+        "JOIN plans p ON p.id = b.plan_id "
+        "WHERE b.id=?",
         -1, &st, NULL);
     sqlite3_bind_text(st, 1, id, -1, SQLITE_STATIC);
     if (sqlite3_step(st) != SQLITE_ROW) {
@@ -1059,6 +1088,15 @@ void handle_cancel_booking(struct mg_connection *c, struct mg_http_message *hm,
     const char *sv = (const char*)sqlite3_column_text(st, 1);
     strncpy(status_buf, sv ? sv : "", sizeof(status_buf)-1);
     long sched_id = sqlite3_column_int64(st, 2);
+    char pi_id[128] = {0};
+    const char *piv = (const char*)sqlite3_column_text(st, 3);
+    if (piv) strncpy(pi_id, piv, sizeof(pi_id)-1);
+    char user_email[256] = {0};
+    const char *uev = (const char*)sqlite3_column_text(st, 4);
+    if (uev) strncpy(user_email, uev, sizeof(user_email)-1);
+    char plan_title[256] = {0};
+    const char *ptv = (const char*)sqlite3_column_text(st, 5);
+    if (ptv) strncpy(plan_title, ptv, sizeof(plan_title)-1);
     sqlite3_finalize(st);
 
     if (owner_id != auth_uid) {
@@ -1091,7 +1129,24 @@ void handle_cancel_booking(struct mg_connection *c, struct mg_http_message *hm,
     sqlite3_bind_int64(dec, 2, sched_id);
     sqlite3_step(dec); sqlite3_finalize(dec);
 
-    send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"予約をキャンセルしました\"}");
+    /* Stripe 返金（payment_intent_id がある場合） */
+    int refunded = 0;
+    if (pi_id[0]) {
+        refunded = (stripe_create_refund(pi_id) == 0) ? 1 : 0;
+        if (refunded)
+            fprintf(stdout, "[stripe] refund issued for booking %s (pi=%s)\n", id, pi_id);
+    }
+
+    /* キャンセルメール送信 */
+    if (user_email[0]) {
+        send_booking_cancellation_email(user_email, id, plan_title, refunded);
+    }
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddStringToObject(res, "message", "予約をキャンセルしました");
+    if (refunded) cJSON_AddBoolToObject(res, "refunded", 1);
+    send_cjson(c, 200, res);
+    cJSON_Delete(res);
 }
 
 /* ─── GET /api/v1/plans/:id/reviews ────────────────────────────────────────── */
@@ -1304,8 +1359,32 @@ void handle_stripe_webhook(struct mg_connection *c, struct mg_http_message *hm,
                 -1, &upd, NULL);
             sqlite3_bind_text(upd, 1, booking_id, -1, SQLITE_STATIC);
             sqlite3_step(upd);
+            int changed = sqlite3_changes(db);
             sqlite3_finalize(upd);
             fprintf(stdout, "[stripe] booking %s confirmed via webhook\n", booking_id);
+
+            /* 支払い確定メール送信 */
+            if (changed > 0) {
+                sqlite3_stmt *info;
+                sqlite3_prepare_v2(db,
+                    "SELECT u.email, p.title, s.date, s.start_time, b.total_price "
+                    "FROM bookings b JOIN users u ON u.id=b.user_id "
+                    "JOIN plans p ON p.id=b.plan_id "
+                    "JOIN schedules s ON s.id=b.schedule_id "
+                    "WHERE b.id=?",
+                    -1, &info, NULL);
+                sqlite3_bind_text(info, 1, booking_id, -1, SQLITE_STATIC);
+                if (sqlite3_step(info) == SQLITE_ROW) {
+                    const char *email = (const char*)sqlite3_column_text(info, 0);
+                    const char *title = (const char*)sqlite3_column_text(info, 1);
+                    const char *date  = (const char*)sqlite3_column_text(info, 2);
+                    const char *stime = (const char*)sqlite3_column_text(info, 3);
+                    long total = sqlite3_column_int64(info, 4);
+                    if (email)
+                        send_booking_confirmation_email(email, booking_id, title, date, stime, total);
+                }
+                sqlite3_finalize(info);
+            }
         }
 
     } else if (strcmp(evt_type, "payment_intent.payment_failed") == 0) {
@@ -1542,10 +1621,16 @@ void handle_forgot_password(struct mg_connection *c, struct mg_http_message *hm,
     sqlite3_bind_int64(ins, 2, uid);
     sqlite3_step(ins); sqlite3_finalize(ins);
 
-    /* 本番はメール送信。開発環境ではレスポンスにトークンを含める */
+    /* メール送信（RESEND_API_KEY 未設定時はスキップ） */
+    send_password_reset_email(email_lower, token);
+
+    /* 開発環境では reset_token をレスポンスに含める（RESEND_API_KEY 未設定時のみ） */
     cJSON *res = cJSON_CreateObject();
     cJSON_AddStringToObject(res, "message", "登録済みの場合はリセット手順をメールで送信しました");
-    cJSON_AddStringToObject(res, "reset_token", token); /* 開発用 */
+    const char *api_key = getenv("RESEND_API_KEY");
+    if (!api_key || !*api_key) {
+        cJSON_AddStringToObject(res, "reset_token", token); /* 開発用 */
+    }
     send_cjson(c, 200, res);
     cJSON_Delete(res);
 }
@@ -1601,4 +1686,35 @@ void handle_reset_password(struct mg_connection *c, struct mg_http_message *hm, 
     sqlite3_step(mark); sqlite3_finalize(mark);
 
     send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"パスワードをリセットしました\"}");
+}
+
+/* ─── DELETE /api/v1/reviews/:id ────────────────────────────────────────────── */
+
+void handle_delete_review(struct mg_connection *c, struct mg_http_message *hm,
+                           sqlite3 *db, long id) {
+    long auth_uid = require_auth(c, hm);
+    if (auth_uid < 0) return;
+
+    /* 存在確認 + オーナー確認 */
+    sqlite3_stmt *chk;
+    sqlite3_prepare_v2(db, "SELECT user_id FROM reviews WHERE id=?", -1, &chk, NULL);
+    sqlite3_bind_int64(chk, 1, id);
+    if (sqlite3_step(chk) != SQLITE_ROW) {
+        sqlite3_finalize(chk);
+        send_error_json(c, 404, "review not found"); return;
+    }
+    long owner_id = sqlite3_column_int64(chk, 0);
+    sqlite3_finalize(chk);
+
+    if (owner_id != auth_uid) {
+        send_error_json(c, 403, "このレビューを削除する権限がありません"); return;
+    }
+
+    /* DELETE（DELETE トリガーが venue の review_count/avg を自動更新） */
+    sqlite3_stmt *del;
+    sqlite3_prepare_v2(db, "DELETE FROM reviews WHERE id=?", -1, &del, NULL);
+    sqlite3_bind_int64(del, 1, id);
+    sqlite3_step(del); sqlite3_finalize(del);
+
+    send_json_str(c, 200, CORS_HEADERS, "{\"message\":\"レビューを削除しました\"}");
 }

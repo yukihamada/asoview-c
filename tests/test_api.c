@@ -1065,6 +1065,287 @@ static void test_delete_bookmark(void) {
     PASS();
 }
 
+/* ─── DELETE /reviews/:id ────────────────────────────────────────────── */
+
+static long g_review_id = 0; /* test_delete_review で設定 */
+
+static void test_delete_review(void) {
+    /* g_token (taro) で予約を作成してレビューを投稿し、削除する */
+    /* まず予約 */
+    char burl[256]; snprintf(burl, sizeof(burl), "%s/api/v1/bookings", BASE_URL);
+    Resp rb = http_post_auth(burl,
+        "{\"plan_id\":2,\"schedule_id\":15,"
+        "\"participants\":[{\"participant_type\":\"adult\",\"count\":1}]}",
+        g_token);
+    ASSERT(rb.status == 201, "booking for review test 201");
+    cJSON *bj = cJSON_Parse(rb.body);
+    const char *bid = cJSON_GetStringValue(cJSON_GetObjectItem(bj, "id"));
+    char bid_buf[64] = {0};
+    if (bid) strncpy(bid_buf, bid, sizeof(bid_buf)-1);
+    cJSON_Delete(bj); resp_free(&rb);
+
+    /* レビュー投稿 */
+    char rev_body[256];
+    snprintf(rev_body, sizeof(rev_body),
+        "{\"plan_id\":2,\"rating\":4,\"comment\":\"削除テスト\",\"booking_id\":\"%s\"}", bid_buf);
+    char rurl[256]; snprintf(rurl, sizeof(rurl), "%s/api/v1/reviews", BASE_URL);
+    Resp rr = http_post_auth(rurl, rev_body, g_token);
+    ASSERT(rr.status == 201, "create review for delete test");
+    cJSON *rj = cJSON_Parse(rr.body);
+    g_review_id = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(rj, "id"));
+    ASSERT(g_review_id > 0, "review id > 0");
+    cJSON_Delete(rj); resp_free(&rr);
+
+    /* 他人が削除しようとする → 403 */
+    char del_url[256]; snprintf(del_url, sizeof(del_url), "%s/api/v1/reviews/%ld", BASE_URL, g_review_id);
+    Resp r403 = http_delete_auth(del_url, g_token2);
+    ASSERT(r403.status == 403, "other user delete → 403");
+    resp_free(&r403);
+
+    /* 本人が削除 → 200 */
+    Resp r200 = http_delete_auth(del_url, g_token);
+    ASSERT(r200.status == 200, "own review delete → 200");
+    resp_free(&r200);
+
+    /* 再度削除 → 404 */
+    Resp r404 = http_delete_auth(del_url, g_token);
+    ASSERT(r404.status == 404, "already deleted → 404");
+    resp_free(&r404);
+
+    /* 認証なし → 401 */
+    Resp r401;
+    CURL *c = curl_easy_init();
+    Buf b401 = { malloc(1), 0 };
+    curl_easy_setopt(c, CURLOPT_URL, del_url);
+    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "DELETE");
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &b401);
+    curl_easy_perform(c);
+    r401.body = b401.data;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r401.status);
+    curl_easy_cleanup(c);
+    ASSERT(r401.status == 401, "no auth → 401");
+    resp_free(&r401);
+    PASS();
+}
+
+/* ─── GET /admin/bookings ─────────────────────────────────────────────── */
+
+static void test_admin_list_bookings(void) {
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/admin/bookings", BASE_URL);
+    Resp r = http_get_with_header(url, "X-Admin-Key", "asoview-admin-dev");
+    ASSERT(r.status == 200, "admin list bookings 200");
+    cJSON *j = cJSON_Parse(r.body);
+    ASSERT(cJSON_GetObjectItem(j, "bookings") != NULL, "has bookings");
+    ASSERT(cJSON_GetObjectItem(j, "total")    != NULL, "has total");
+    long tot = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(j, "total"));
+    ASSERT(tot > 0, "at least 1 booking");
+
+    /* status フィルタ */
+    char furl[256]; snprintf(furl, sizeof(furl), "%s/api/v1/admin/bookings?status=cancelled", BASE_URL);
+    Resp rf = http_get_with_header(furl, "X-Admin-Key", "asoview-admin-dev");
+    ASSERT(rf.status == 200, "filter by status 200");
+    cJSON *jf = cJSON_Parse(rf.body);
+    cJSON *arr = cJSON_GetObjectItem(jf, "bookings");
+    int n = cJSON_GetArraySize(arr);
+    for (int i = 0; i < n; i++) {
+        cJSON *b = cJSON_GetArrayItem(arr, i);
+        const char *st = cJSON_GetStringValue(cJSON_GetObjectItem(b, "status"));
+        ASSERT(st && strcmp(st, "cancelled") == 0, "all status=cancelled");
+    }
+
+    /* auth なし → 403 */
+    Resp ra = http_get(url);
+    ASSERT(ra.status == 403, "no admin key → 403");
+
+    cJSON_Delete(j); cJSON_Delete(jf); resp_free(&r); resp_free(&rf); resp_free(&ra);
+    PASS();
+}
+
+/* ─── PATCH /admin/schedules/:id ─────────────────────────────────────── */
+
+static long g_test_schedule_id = 0;
+
+static void test_admin_update_schedule(void) {
+    /* 既存スケジュール(id=1)の capacity を更新する */
+    g_test_schedule_id = 1;
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/admin/schedules/%ld", BASE_URL, g_test_schedule_id);
+
+    /* capacity を 999 に更新 */
+    CURL *curl = curl_easy_init();
+    Buf buf = { malloc(1), 0 };
+    struct curl_slist *hdrs = curl_slist_append(NULL, "Content-Type: application/json");
+    hdrs = curl_slist_append(hdrs, "X-Admin-Key: asoview-admin-dev");
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "{\"capacity\":999}");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_perform(curl);
+    Resp r = { buf.data, 0 };
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
+    curl_slist_free_all(hdrs); curl_easy_cleanup(curl);
+    ASSERT(r.status == 200, "update schedule capacity → 200");
+    resp_free(&r);
+
+    /* 容量を booked_count (0) 未満の -1 にしようとする → 400 */
+    CURL *c2 = curl_easy_init();
+    Buf b2 = { malloc(1), 0 };
+    struct curl_slist *h2 = curl_slist_append(NULL, "Content-Type: application/json");
+    h2 = curl_slist_append(h2, "X-Admin-Key: asoview-admin-dev");
+    curl_easy_setopt(c2, CURLOPT_URL, url);
+    curl_easy_setopt(c2, CURLOPT_HTTPHEADER, h2);
+    curl_easy_setopt(c2, CURLOPT_CUSTOMREQUEST, "PATCH");
+    curl_easy_setopt(c2, CURLOPT_POSTFIELDS, "{\"capacity\":-1}");
+    curl_easy_setopt(c2, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(c2, CURLOPT_WRITEDATA, &b2);
+    curl_easy_perform(c2);
+    Resp r2 = { b2.data, 0 };
+    curl_easy_getinfo(c2, CURLINFO_RESPONSE_CODE, &r2.status);
+    curl_slist_free_all(h2); curl_easy_cleanup(c2);
+    ASSERT(r2.status == 400, "capacity below booked → 400");
+    resp_free(&r2);
+
+    /* 存在しないスケジュール */
+    char nourl[256]; snprintf(nourl, sizeof(nourl), "%s/api/v1/admin/schedules/999999", BASE_URL);
+    CURL *c3 = curl_easy_init();
+    Buf b3 = { malloc(1), 0 };
+    struct curl_slist *h3 = curl_slist_append(NULL, "Content-Type: application/json");
+    h3 = curl_slist_append(h3, "X-Admin-Key: asoview-admin-dev");
+    curl_easy_setopt(c3, CURLOPT_URL, nourl);
+    curl_easy_setopt(c3, CURLOPT_HTTPHEADER, h3);
+    curl_easy_setopt(c3, CURLOPT_CUSTOMREQUEST, "PATCH");
+    curl_easy_setopt(c3, CURLOPT_POSTFIELDS, "{\"capacity\":10}");
+    curl_easy_setopt(c3, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(c3, CURLOPT_WRITEDATA, &b3);
+    curl_easy_perform(c3);
+    Resp r3 = { b3.data, 0 };
+    curl_easy_getinfo(c3, CURLINFO_RESPONSE_CODE, &r3.status);
+    curl_slist_free_all(h3); curl_easy_cleanup(c3);
+    ASSERT(r3.status == 404, "nonexistent schedule → 404");
+    resp_free(&r3);
+    PASS();
+}
+
+/* ─── GET /admin/reviews ──────────────────────────────────────────────── */
+
+static void test_admin_list_reviews(void) {
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/admin/reviews", BASE_URL);
+    Resp r = http_get_with_header(url, "X-Admin-Key", "asoview-admin-dev");
+    ASSERT(r.status == 200, "admin list reviews 200");
+    cJSON *j = cJSON_Parse(r.body);
+    ASSERT(cJSON_GetObjectItem(j, "reviews") != NULL, "has reviews array");
+    ASSERT(cJSON_GetObjectItem(j, "total")   != NULL, "has total");
+
+    /* rating フィルタ */
+    char furl[256]; snprintf(furl, sizeof(furl), "%s/api/v1/admin/reviews?rating=5", BASE_URL);
+    Resp rf = http_get_with_header(furl, "X-Admin-Key", "asoview-admin-dev");
+    ASSERT(rf.status == 200, "rating filter 200");
+    cJSON *jf = cJSON_Parse(rf.body);
+    cJSON *arr = cJSON_GetObjectItem(jf, "reviews");
+    for (int i = 0; i < cJSON_GetArraySize(arr); i++) {
+        cJSON *rv = cJSON_GetArrayItem(arr, i);
+        ASSERT((long)cJSON_GetNumberValue(cJSON_GetObjectItem(rv, "rating")) == 5,
+               "all rating=5");
+    }
+
+    /* 認証なし → 403 */
+    Resp ra = http_get(url);
+    ASSERT(ra.status == 403, "no admin key → 403");
+
+    cJSON_Delete(j); cJSON_Delete(jf); resp_free(&r); resp_free(&rf); resp_free(&ra);
+    PASS();
+}
+
+/* ─── DELETE /admin/reviews/:id ──────────────────────────────────────── */
+
+static void test_admin_delete_review(void) {
+    /* まずレビューを1件作成してから削除する */
+    char burl[256]; snprintf(burl, sizeof(burl), "%s/api/v1/bookings", BASE_URL);
+    Resp rb = http_post_auth(burl,
+        "{\"plan_id\":3,\"schedule_id\":21,"
+        "\"participants\":[{\"participant_type\":\"adult\",\"count\":1}]}",
+        g_token);
+    ASSERT(rb.status == 201, "booking for admin delete review");
+    cJSON *bj = cJSON_Parse(rb.body);
+    const char *bid = cJSON_GetStringValue(cJSON_GetObjectItem(bj, "id"));
+    char bid_buf[64] = {0};
+    if (bid) strncpy(bid_buf, bid, sizeof(bid_buf)-1);
+    cJSON_Delete(bj); resp_free(&rb);
+
+    char rev_body[256];
+    snprintf(rev_body, sizeof(rev_body),
+        "{\"plan_id\":3,\"rating\":2,\"comment\":\"管理者削除テスト\",\"booking_id\":\"%s\"}", bid_buf);
+    char rurl[256]; snprintf(rurl, sizeof(rurl), "%s/api/v1/reviews", BASE_URL);
+    Resp rr = http_post_auth(rurl, rev_body, g_token);
+    ASSERT(rr.status == 201, "review created 201");
+    cJSON *rj = cJSON_Parse(rr.body);
+    long rid = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(rj, "id"));
+    ASSERT(rid > 0, "review id > 0");
+    cJSON_Delete(rj); resp_free(&rr);
+
+    /* 管理者が削除 */
+    char del_url[256]; snprintf(del_url, sizeof(del_url), "%s/api/v1/admin/reviews/%ld", BASE_URL, rid);
+    Resp rd = http_delete_admin(del_url);
+    ASSERT(rd.status == 200, "admin delete review → 200");
+    resp_free(&rd);
+
+    /* 再削除 → 404 */
+    Resp rd2 = http_delete_admin(del_url);
+    ASSERT(rd2.status == 404, "already deleted → 404");
+    resp_free(&rd2);
+
+    /* 認証なし → 403 */
+    CURL *c = curl_easy_init();
+    Buf b = { malloc(1), 0 };
+    curl_easy_setopt(c, CURLOPT_URL, del_url);
+    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "DELETE");
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
+    curl_easy_perform(c);
+    long st403; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &st403);
+    curl_easy_cleanup(c); free(b.data);
+    ASSERT(st403 == 403, "no admin key → 403");
+    PASS();
+}
+
+/* ─── GET /admin/users ────────────────────────────────────────────────── */
+
+static void test_admin_list_users(void) {
+    char url[256]; snprintf(url, sizeof(url), "%s/api/v1/admin/users", BASE_URL);
+    Resp r = http_get_with_header(url, "X-Admin-Key", "asoview-admin-dev");
+    ASSERT(r.status == 200, "admin list users 200");
+    cJSON *j = cJSON_Parse(r.body);
+    ASSERT(cJSON_GetObjectItem(j, "users") != NULL, "has users array");
+    long tot = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(j, "total"));
+    ASSERT(tot > 0, "at least 1 user");
+
+    cJSON *users = cJSON_GetObjectItem(j, "users");
+    cJSON *first = cJSON_GetArrayItem(users, 0);
+    ASSERT(cJSON_GetObjectItem(first, "email")         != NULL, "has email");
+    ASSERT(cJSON_GetObjectItem(first, "booking_count") != NULL, "has booking_count");
+
+    /* email 検索 */
+    char furl[256]; snprintf(furl, sizeof(furl), "%s/api/v1/admin/users?q=taro", BASE_URL);
+    Resp rf = http_get_with_header(furl, "X-Admin-Key", "asoview-admin-dev");
+    ASSERT(rf.status == 200, "email search 200");
+    cJSON *jf = cJSON_Parse(rf.body);
+    cJSON *arr = cJSON_GetObjectItem(jf, "users");
+    for (int i = 0; i < cJSON_GetArraySize(arr); i++) {
+        const char *email = cJSON_GetStringValue(
+            cJSON_GetObjectItem(cJSON_GetArrayItem(arr, i), "email"));
+        ASSERT(email && strstr(email, "taro"), "email contains 'taro'");
+    }
+
+    /* 認証なし → 403 */
+    Resp ra = http_get(url);
+    ASSERT(ra.status == 403, "no admin key → 403");
+
+    cJSON_Delete(j); cJSON_Delete(jf); resp_free(&r); resp_free(&rf); resp_free(&ra);
+    PASS();
+}
+
 /* ─── Server startup (fork) ──────────────────────────────────────────── */
 
 static int wait_for_port(int port, int timeout_ms) {
@@ -1173,6 +1454,13 @@ int main(void) {
     test_admin_list_plans();
     test_change_password();
     test_forgot_reset_password();
+    /* ── 新機能 (Batch 2) ── */
+    test_delete_review();
+    test_admin_list_bookings();
+    test_admin_update_schedule();
+    test_admin_list_reviews();
+    test_admin_delete_review();
+    test_admin_list_users();
 
     kill(pid, 15);
 

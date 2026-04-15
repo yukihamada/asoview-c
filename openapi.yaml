@@ -11,8 +11,8 @@ info:
     - **管理者**: `X-Admin-Key: <admin-key>`
 
     ## レート制限
-    - 一般エンドポイント: 120 req/min/IP
-    - 認証・登録エンドポイント: 30 req/min/IP
+    - 一般エンドポイント: 500 req/min/IP
+    - 認証・登録エンドポイント: 60 req/min/IP
     - 超過時: `429 Too Many Requests`
 
 servers:
@@ -593,6 +593,22 @@ paths:
         "401": { description: 認証エラー }
         "403": { description: 未予約ユーザー }
 
+  /api/v1/reviews/{id}:
+    delete:
+      tags: [reviews]
+      summary: レビュー削除（自分のレビューのみ）
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { description: 削除成功 }
+        "401": { description: 認証エラー }
+        "403": { description: 他ユーザーのレビュー }
+        "404": { description: レビューが存在しない }
+
   /api/v1/bookmarks:
     post:
       tags: [bookmarks]
@@ -927,6 +943,31 @@ paths:
         "403": { description: 管理者キーエラー }
 
   /api/v1/admin/schedules/{id}:
+    patch:
+      tags: [admin, schedules]
+      summary: スケジュール更新（容量・日時）
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                capacity: { type: integer, description: "現在の予約数以上である必要あり" }
+                date: { type: string, format: date }
+                start_time: { type: string, example: "09:00" }
+                end_time: { type: string, example: "11:00" }
+      responses:
+        "200": { description: 更新成功 }
+        "400": { description: "capacityが予約数を下回る" }
+        "403": { description: 管理者キーエラー }
+        "404": { description: スケジュールが存在しない }
     delete:
       tags: [admin, schedules]
       summary: スケジュール削除
@@ -938,6 +979,126 @@ paths:
           schema: { type: integer }
       responses:
         "200": { description: 削除成功 }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/bookings:
+    get:
+      tags: [admin, bookings]
+      summary: 予約一覧（管理者）
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: plan_id
+          in: query
+          schema: { type: integer }
+        - name: user_id
+          in: query
+          schema: { type: integer }
+        - name: status
+          in: query
+          schema: { type: string, enum: [pending_payment, confirmed, cancelled] }
+        - name: date
+          in: query
+          schema: { type: string, format: date }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+      responses:
+        "200":
+          description: 予約一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Booking" }
+                  total: { type: integer }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/reviews:
+    get:
+      tags: [admin, reviews]
+      summary: レビュー一覧（管理者）
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: plan_id
+          in: query
+          schema: { type: integer }
+        - name: rating
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 5 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+      responses:
+        "200":
+          description: レビュー一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Review" }
+                  total: { type: integer }
+        "403": { description: 管理者キーエラー }
+
+  /api/v1/admin/reviews/{id}:
+    delete:
+      tags: [admin, reviews]
+      summary: レビュー削除（管理者）
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { description: 削除成功 }
+        "403": { description: 管理者キーエラー }
+        "404": { description: レビューが存在しない }
+
+  /api/v1/admin/users:
+    get:
+      tags: [admin, users]
+      summary: ユーザー一覧（管理者）
+      security: [{ adminKey: [] }]
+      parameters:
+        - name: email
+          in: query
+          schema: { type: string }
+          description: メールアドレスの部分一致検索
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+      responses:
+        "200":
+          description: ユーザー一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      allOf:
+                        - { $ref: "#/components/schemas/User" }
+                        - type: object
+                          properties:
+                            booking_count: { type: integer }
+                  total: { type: integer }
         "403": { description: 管理者キーエラー }
 
 components:

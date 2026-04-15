@@ -150,6 +150,16 @@ BEGIN
     WHERE id = (SELECT venue_id FROM plans WHERE id = NEW.plan_id);
 END;
 
+-- レビュー削除時に venue の集計を自動更新
+CREATE TRIGGER IF NOT EXISTS update_venue_review_stats_delete
+AFTER DELETE ON reviews
+BEGIN
+    UPDATE venues SET
+        review_count = COALESCE((SELECT COUNT(*) FROM reviews r JOIN plans p ON p.id = r.plan_id WHERE p.venue_id = (SELECT venue_id FROM plans WHERE id = OLD.plan_id)), 0),
+        review_avg   = COALESCE((SELECT ROUND(AVG(r.rating), 1) FROM reviews r JOIN plans p ON p.id = r.plan_id WHERE p.venue_id = (SELECT venue_id FROM plans WHERE id = OLD.plan_id)), 0.0)
+    WHERE id = (SELECT venue_id FROM plans WHERE id = OLD.plan_id);
+END;
+
 -- スケジュール booked_count 自動更新
 CREATE TRIGGER IF NOT EXISTS update_schedule_booked_count
 AFTER INSERT ON booking_participants

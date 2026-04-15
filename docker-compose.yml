@@ -1,0 +1,21 @@
+services:
+  asoview:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    volumes:
+      - db_data:/data
+    env_file: .env
+    environment:
+      DATABASE_URL: /data/asoview.db
+      PORT: "3001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  db_data:

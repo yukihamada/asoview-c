@@ -14,7 +14,7 @@ endif
 
 SRCS    = deps/mongoose.c deps/cJSON.c \
           src/utils.c src/db.c src/seed.c src/handlers.c src/admin.c \
-          src/stripe.c src/rate_limit.c src/platform.c
+          src/stripe.c src/mailer.c src/rate_limit.c src/platform.c
 
 BIN     = asoview-c
 TEST    = tests/run_tests

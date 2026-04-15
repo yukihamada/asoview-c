@@ -36,3 +36,5 @@ void handle_list_user_bookmarks(struct mg_connection *c, struct mg_http_message 
 void handle_change_password  (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db);
 void handle_forgot_password  (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db);
 void handle_reset_password   (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db);
+/* Reviews */
+void handle_delete_review    (struct mg_connection *c, struct mg_http_message *hm, sqlite3 *db, long id);

@@ -17,6 +17,13 @@ int stripe_create_payment_intent(long amount_jpy,
                                  char *client_secret_out, size_t cs_size);
 
 /*
+ * stripe_create_refund
+ *   payment_intent_id : pi_xxx ... (キャンセル対象の PaymentIntent)
+ * 返り値: 0=成功, -1=失敗/スキップ
+ */
+int stripe_create_refund(const char *payment_intent_id);
+
+/*
  * stripe_verify_webhook
  *   sig_header     : Stripe-Signature ヘッダー値 (t=...,v1=...)
  *   payload        : リクエストボディ（生バイト）

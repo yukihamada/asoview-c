@@ -4,8 +4,8 @@
 
 #define BUCKET_COUNT  512
 #define WINDOW_SECS    60
-#define GENERAL_LIMIT 120
-#define AUTH_LIMIT     30
+#define GENERAL_LIMIT 500
+#define AUTH_LIMIT     60
 
 typedef struct {
     char  ip[48];        /* IPv4/IPv6 文字列 */

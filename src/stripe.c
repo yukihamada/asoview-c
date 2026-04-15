@@ -109,6 +109,55 @@ int stripe_create_payment_intent(long amount_jpy,
     return ok ? 0 : -1;
 }
 
+/* ─── Stripe Refund 作成 ──────────────────────────────────────────── */
+
+int stripe_create_refund(const char *payment_intent_id) {
+    const char *sk = getenv("STRIPE_SECRET_KEY");
+    if (!sk || !*sk || !payment_intent_id || !*payment_intent_id) return -1;
+
+    CURL *curl = curl_easy_init();
+    if (!curl) return -1;
+
+    char post[256];
+    snprintf(post, sizeof(post), "payment_intent=%s", payment_intent_id);
+
+    char auth_hdr[256];
+    snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s", sk);
+
+    struct curl_slist *hdrs = NULL;
+    hdrs = curl_slist_append(hdrs, auth_hdr);
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/x-www-form-urlencoded");
+
+    Buf buf = { calloc(1, 512), 0, 512 };
+
+    curl_easy_setopt(curl, CURLOPT_URL, "https://api.stripe.com/v1/refunds");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+
+    int ok = (res == CURLE_OK);
+    if (ok && buf.data) {
+        cJSON *j = cJSON_Parse(buf.data);
+        if (j) {
+            cJSON *err = cJSON_GetObjectItem(j, "error");
+            if (err) {
+                const char *msg = cJSON_GetStringValue(cJSON_GetObjectItem(err, "message"));
+                fprintf(stderr, "[stripe] refund error: %s\n", msg ? msg : "(unknown)");
+                ok = 0;
+            }
+            cJSON_Delete(j);
+        }
+    }
+    free(buf.data);
+    return ok ? 0 : -1;
+}
+
 /* ─── Webhook 署名検証 ────────────────────────────────────────────── */
 
 static void hex_encode(const unsigned char *src, size_t len, char *out) {

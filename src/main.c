@@ -144,6 +144,9 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (sscanf(uri, "/api/v1/bookmarks/%ld", &id) == 1) {
         if (IS_DELETE) handle_delete_bookmark(c, hm, db, id);
 
+    } else if (sscanf(uri, "/api/v1/reviews/%ld", &id) == 1) {
+        if (IS_DELETE) handle_delete_review(c, hm, db, id);
+
     /* Admin endpoints: /api/v1/admin/ ──────────────────────── */
     } else if (strcmp(uri, "/api/v1/admin/venues") == 0) {
         if (IS_GET)  handle_admin_list_venues(c, hm, db);
@@ -172,7 +175,20 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
         else if (IS_DELETE) handle_admin_delete_plan(c, hm, db, id);
 
     } else if (sscanf(uri, "/api/v1/admin/schedules/%ld", &id) == 1) {
-        if (IS_DELETE) handle_admin_delete_schedule(c, hm, db, id);
+        if (IS_PATCH)  handle_admin_update_schedule(c, hm, db, id);
+        else if (IS_DELETE) handle_admin_delete_schedule(c, hm, db, id);
+
+    } else if (strcmp(uri, "/api/v1/admin/bookings") == 0) {
+        if (IS_GET) handle_admin_list_bookings(c, hm, db);
+
+    } else if (strcmp(uri, "/api/v1/admin/reviews") == 0) {
+        if (IS_GET) handle_admin_list_reviews(c, hm, db);
+
+    } else if (sscanf(uri, "/api/v1/admin/reviews/%ld", &id) == 1) {
+        if (IS_DELETE) handle_admin_delete_review(c, hm, db, id);
+
+    } else if (strcmp(uri, "/api/v1/admin/users") == 0) {
+        if (IS_GET) handle_admin_list_users(c, hm, db);
 
     } else {
         mg_http_reply(c, 404, "Content-Type: application/json\r\n",
