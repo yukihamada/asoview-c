@@ -95,7 +95,8 @@ test: $(BIN) $(TEST)
 	./$(TEST)
 
 # ASAN / UBSAN ビルド＆テスト（メモリ安全性チェック）
-$(ASAN_TEST): $(SRCS) tests/test_api.c src/schema_embed.h
+# $(BIN) を先にビルド: テストランナーがサーバーバイナリ ./asoview-c を起動するため
+$(ASAN_TEST): $(BIN) $(SRCS) tests/test_api.c src/schema_embed.h
 	$(CC) $(STD) $(WARN) $(INC) $(DEFS) -O0 -g \
 	    -fsanitize=address,undefined -fno-omit-frame-pointer \
 	    $(SRCS) tests/test_api.c $(LDFLAGS) -o $@

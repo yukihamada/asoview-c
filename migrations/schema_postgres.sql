@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS plans (
     min_age          INTEGER,
     images           TEXT NOT NULL DEFAULT '[]',
     tags             TEXT NOT NULL DEFAULT '[]',
-    is_active        BOOLEAN NOT NULL DEFAULT TRUE,
+    is_active        SMALLINT NOT NULL DEFAULT 1,
     created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS password_reset_tokens (
     token      TEXT PRIMARY KEY,
     user_id    INTEGER NOT NULL REFERENCES users(id),
     expires_at TIMESTAMP NOT NULL,
-    used       BOOLEAN NOT NULL DEFAULT FALSE,
+    used       SMALLINT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS waitlist (
     id          SERIAL PRIMARY KEY,
     user_id     INTEGER NOT NULL REFERENCES users(id),
     schedule_id INTEGER NOT NULL REFERENCES schedules(id),
-    notified    BOOLEAN NOT NULL DEFAULT FALSE,
+    notified    SMALLINT NOT NULL DEFAULT 0,
     created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, schedule_id)
 );
@@ -173,7 +173,7 @@ CREATE INDEX IF NOT EXISTS plans_search_idx ON plans USING GIN(search_vector);
 CREATE OR REPLACE FUNCTION plans_search_update() RETURNS trigger AS $$
 BEGIN
     NEW.search_vector :=
-        to_tsvector('japanese', COALESCE(NEW.title,'') || ' ' || COALESCE(NEW.description,''));
+        to_tsvector('simple', COALESCE(NEW.title,'') || ' ' || COALESCE(NEW.description,''));
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
