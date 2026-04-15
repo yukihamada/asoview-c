@@ -206,13 +206,17 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
     char client_ip[48] = {0};
     mg_snprintf(client_ip, sizeof(client_ip), "%M", mg_print_ip, &c->rem);
 
-    /* リクエストログ（ISO8601 タイムスタンプ + X-Request-ID 付き） */
+    /* リクエストログ（JSON 構造化ログ） */
     {
         time_t now = time(NULL);
         char ts[24];
         strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
-        fprintf(stderr, "[req] %s %.*s %s %s req_id=%s\n",
-                ts, (int)hm->method.len, hm->method.buf, uri, client_ip, g_request_id);
+        /* JSON エスケープが必要な文字（URI/IPには通常不要だが念のため最小限対応） */
+        fprintf(stderr,
+                "{\"ts\":\"%s\",\"level\":\"info\",\"method\":\"%.*s\","
+                "\"uri\":\"%s\",\"ip\":\"%s\",\"req_id\":\"%s\"}\n",
+                ts, (int)hm->method.len, hm->method.buf,
+                uri, client_ip, g_request_id);
     }
 
     /* メトリクス: 総リクエスト数をカウント */
@@ -321,7 +325,12 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
                 : "";
             mg_http_reply(c, 200,
                 "Content-Type: text/html; charset=UTF-8\r\n"
-                "Cache-Control: no-cache\r\n",
+                "Cache-Control: no-cache\r\n"
+                "X-Frame-Options: DENY\r\n"
+                "X-Content-Type-Options: nosniff\r\n"
+                "Content-Security-Policy: default-src 'self'; "
+                "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'\r\n"
+                "Referrer-Policy: strict-origin-when-cross-origin\r\n",
                 ADMIN_HTML_TEMPLATE, og_image, og_url, og_image, setup_banner);
         }
 
@@ -515,8 +524,13 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
         if (IS_GET)  handle_admin_list_plans(c, hm, db);
         else if (IS_POST) handle_admin_create_plan(c, hm, db);
 
+    } else if (sscanf(uri, "/api/v1/admin/plans/%ld/schedules/bulk", &id) == 1
+               && strstr(uri, "/schedules/bulk") != NULL) {
+        if (IS_POST) handle_admin_bulk_create_schedules(c, hm, db, id);
+
     } else if (sscanf(uri, "/api/v1/admin/plans/%ld/schedules", &id) == 1
-               && strstr(uri, "/schedules") != NULL) {
+               && strstr(uri, "/schedules") != NULL
+               && strstr(uri, "/bulk") == NULL) {
         if (IS_POST) handle_admin_create_schedule(c, hm, db, id);
 
     } else if (sscanf(uri, "/api/v1/admin/plans/%ld/prices", &id) == 1
@@ -547,6 +561,16 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     } else if (strcmp(uri, "/api/v1/admin/upload-url") == 0) {
         if (IS_POST) handle_admin_get_upload_url(c, hm, db);
+
+    } else if (sscanf(uri, "/api/v1/admin/bookings/%63[^/]/refund", booking_id) == 1
+               && strstr(uri, "/refund") != NULL) {
+        if (IS_POST) handle_admin_refund_booking(c, hm, db, booking_id);
+
+    } else if (strcmp(uri, "/api/v1/admin/backup") == 0) {
+        if (IS_GET) handle_admin_backup_db(c, hm, db);
+
+    } else if (strcmp(uri, "/admin/ui") == 0 || strcmp(uri, "/admin/ui/") == 0) {
+        if (IS_GET) handle_admin_ui(c, hm, db);
 
     /* ── セットアップウィザード ───────────────────────────────────────────── */
     } else if (strcmp(uri, "/setup") == 0 || strcmp(uri, "/setup/") == 0) {

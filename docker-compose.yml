@@ -1,21 +1,157 @@
+version: "3.9"
+
+# ─── Asoview — ワンコマンド起動 ─────────────────────────────────────────────
+#
+# SQLite (デフォルト):
+#   docker compose up
+#
+# PostgreSQL:
+#   docker compose --profile postgres up
+#
+# MySQL:
+#   docker compose --profile mysql up
+#
+# キー設定後に再起動:
+#   docker compose restart asoview
+#
+# セットアップ画面: http://localhost:3001/setup
+# 管理画面:         http://localhost:3001/admin
+# 管理UI:           http://localhost:3001/admin/ui
+# ──────────────────────────────────────────────────────────────────────────────
+
 services:
+  # ─── SQLite バックエンド（デフォルト） ─────────────────────────────────────
   asoview:
-    build: .
+    build:
+      context: .
+      args:
+        DB: sqlite
+    image: asoview-c:latest
+    container_name: asoview
     restart: unless-stopped
     ports:
       - "3001:3001"
     volumes:
-      - db_data:/data
-    env_file: .env
+      - asoview_data:/data
+    env_file:
+      - path: .env
+        required: false
     environment:
-      DATABASE_URL: /data/asoview.db
       PORT: "3001"
+      DATABASE_URL: "/data/asoview.db"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3001/api/v1/health"]
+      test: ["CMD", "curl", "-fs", "http://localhost:3001/api/v1/health"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
 
+  # ─── PostgreSQL バックエンド ────────────────────────────────────────────────
+  asoview-pg:
+    build:
+      context: .
+      args:
+        DB: postgres
+    image: asoview-c:postgres
+    container_name: asoview-pg
+    restart: unless-stopped
+    ports:
+      - "3002:3001"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: "3001"
+      DATABASE_URL: "postgres://asoview:asoview@postgres:5432/asoview"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:3001/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    profiles:
+      - postgres
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: asoview-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       asoview
+      POSTGRES_USER:     asoview
+      POSTGRES_PASSWORD: asoview
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/schema_postgres.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U asoview -d asoview"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - postgres
+
+  # ─── MySQL/MariaDB バックエンド ─────────────────────────────────────────────
+  asoview-mysql:
+    build:
+      context: .
+      args:
+        DB: mysql
+    image: asoview-c:mysql
+    container_name: asoview-mysql
+    restart: unless-stopped
+    ports:
+      - "3003:3001"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: "3001"
+      MYSQL_HOST:     mysql
+      MYSQL_USER:     asoview
+      MYSQL_PASSWORD: asoview
+      MYSQL_DATABASE: asoview
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:3001/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    profiles:
+      - mysql
+
+  mysql:
+    image: mysql:8.0
+    container_name: asoview-mysql-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE:      asoview
+      MYSQL_USER:          asoview
+      MYSQL_PASSWORD:      asoview
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./migrations/schema_mysql.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --log_bin_trust_function_creators=1
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "asoview", "-pasoview"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - mysql
+
 volumes:
-  db_data:
+  asoview_data:
+  postgres_data:
+  mysql_data:

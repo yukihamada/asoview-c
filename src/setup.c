@@ -83,7 +83,11 @@ void handle_setup_page(struct mg_connection *c, struct mg_http_message *hm, DbCo
 
     mg_http_reply(c, 200,
         "Content-Type: text/html; charset=UTF-8\r\n"
-        "Cache-Control: no-cache\r\n",
+        "Cache-Control: no-cache\r\n"
+        "X-Frame-Options: DENY\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "Content-Security-Policy: default-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'\r\n",
         "<!DOCTYPE html><html lang='ja'><head>"
         "<meta charset='UTF-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"

@@ -261,10 +261,13 @@ static cJSON *venue_row(DbStmt *st) {
 }
 
 void handle_list_venues(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
-    long page    = query_long(hm, "page", 1);  if (page < 1) page = 1;
     long limit   = query_long(hm, "limit", 20); if (limit > 100) limit = 100;
-    long offset  = (page - 1) * limit;
     long area_id = query_long(hm, "area_id", 0);
+    long after   = query_long(hm, "after", 0);  /* cursor: id > after */
+
+    /* offset-based fallback (backward compat) */
+    long page   = query_long(hm, "page", 1);  if (page < 1) page = 1;
+    long offset = after > 0 ? 0 : (page - 1) * limit;
 
     /* total */
     DbStmt *ct = NULL;
@@ -277,18 +280,33 @@ void handle_list_venues(struct mg_connection *c, struct mg_http_message *hm, DbC
     db_finalize(ct);
 
     DbStmt *st = NULL;
-    st = db_prepare(db,
-        "SELECT v.id,v.name,v.description,v.area_id,a.name,"
-        "v.address,v.latitude,v.longitude,v.review_count,v.review_avg,v.created_at "
-        "FROM venues v LEFT JOIN areas a ON a.id=v.area_id "
-        "WHERE (? = 0 OR v.area_id = ?) ORDER BY v.id LIMIT ? OFFSET ?");
-    db_bind_int(st, 1, area_id);
-    db_bind_int(st, 2, area_id);
-    db_bind_int(st, 3, limit);
-    db_bind_int(st, 4, offset);
+    if (after > 0) {
+        /* cursor-based: WHERE id > after */
+        st = db_prepare(db,
+            "SELECT v.id,v.name,v.description,v.area_id,a.name,"
+            "v.address,v.latitude,v.longitude,v.review_count,v.review_avg,v.created_at "
+            "FROM venues v LEFT JOIN areas a ON a.id=v.area_id "
+            "WHERE v.id > ? AND (? = 0 OR v.area_id = ?) ORDER BY v.id LIMIT ?");
+        db_bind_int(st, 1, after);
+        db_bind_int(st, 2, area_id);
+        db_bind_int(st, 3, area_id);
+        db_bind_int(st, 4, limit);
+    } else {
+        st = db_prepare(db,
+            "SELECT v.id,v.name,v.description,v.area_id,a.name,"
+            "v.address,v.latitude,v.longitude,v.review_count,v.review_avg,v.created_at "
+            "FROM venues v LEFT JOIN areas a ON a.id=v.area_id "
+            "WHERE (? = 0 OR v.area_id = ?) ORDER BY v.id LIMIT ? OFFSET ?");
+        db_bind_int(st, 1, area_id);
+        db_bind_int(st, 2, area_id);
+        db_bind_int(st, 3, limit);
+        db_bind_int(st, 4, offset);
+    }
 
     cJSON *venues = cJSON_CreateArray();
+    long last_id = 0;
     while (db_step(st) == 1) {
+        last_id = db_col_int(st, 0);
         cJSON_AddItemToArray(venues, venue_row(st));
     }
     db_finalize(st);
@@ -298,6 +316,12 @@ void handle_list_venues(struct mg_connection *c, struct mg_http_message *hm, DbC
     cJSON_AddNumberToObject(res, "total", total);
     cJSON_AddNumberToObject(res, "page",  page);
     cJSON_AddNumberToObject(res, "limit", limit);
+    /* cursor for next page */
+    long cnt = (long)cJSON_GetArraySize(cJSON_GetObjectItem(res, "venues"));
+    if (cnt == limit && last_id > 0)
+        cJSON_AddNumberToObject(res, "next_after", last_id);
+    else
+        cJSON_AddNullToObject(res, "next_after");
     send_cjson_etag(c, hm, res);
     cJSON_Delete(res);
 }
@@ -366,58 +390,101 @@ static const char *PLAN_SELECT =
     "JOIN categories c ON c.id=p.category_id";
 
 void handle_list_plans(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
-    long page      = query_long(hm, "page", 1);     if (page < 1) page = 1;
     long limit     = query_long(hm, "limit", 20);   if (limit > 100) limit = 100;
-    long offset    = (page - 1) * limit;
     long area_id   = query_long(hm, "area_id", 0);
     long cat_id    = query_long(hm, "category_id", 0);
     long adults    = query_long(hm, "adults", 0);
     long children  = query_long(hm, "children", 0);
     long required  = (adults + children) > 0 ? adults + children : 1;
+    long after     = query_long(hm, "after", 0);   /* cursor-based pagination */
     char date[32]  = {0};
     int has_date   = query_str(hm, "date", date, sizeof(date));
 
-    char cnt_sql[512], qsql[1024];
-    snprintf(cnt_sql, sizeof(cnt_sql),
-        "SELECT COUNT(DISTINCT p.id) FROM plans p "
-        "JOIN venues v ON v.id=p.venue_id "
-        "WHERE p.is_active=1 "
-        "AND (? = 0 OR p.category_id = ?) "
-        "AND (? = 0 OR v.area_id = ?) "
-        "AND (? = 0 OR EXISTS (SELECT 1 FROM schedules s "
-        "  WHERE s.plan_id=p.id AND s.date=? AND (s.capacity-s.booked_count)>=?))");
+    /* offset-based fallback (backward compat) */
+    long page   = query_long(hm, "page", 1);  if (page < 1) page = 1;
+    long offset = after > 0 ? 0 : (page - 1) * limit;
 
-    snprintf(qsql, sizeof(qsql),
-        "%s WHERE p.is_active=1 "
-        "AND (? = 0 OR p.category_id = ?) "
-        "AND (? = 0 OR v.area_id = ?) "
-        "AND (? = 0 OR EXISTS (SELECT 1 FROM schedules s "
-        "  WHERE s.plan_id=p.id AND s.date=? AND (s.capacity-s.booked_count)>=?)) "
-        "ORDER BY p.id LIMIT ? OFFSET ?", PLAN_SELECT);
+    char cnt_sql[512], qsql[1200];
+
+    if (after > 0) {
+        /* cursor-based: WHERE p.id > after */
+        snprintf(cnt_sql, sizeof(cnt_sql),
+            "SELECT COUNT(DISTINCT p.id) FROM plans p "
+            "JOIN venues v ON v.id=p.venue_id "
+            "WHERE p.is_active=1 AND p.id > ? "
+            "AND (? = 0 OR p.category_id = ?) "
+            "AND (? = 0 OR v.area_id = ?) "
+            "AND (? = 0 OR EXISTS (SELECT 1 FROM schedules s "
+            "  WHERE s.plan_id=p.id AND s.date=? AND (s.capacity-s.booked_count)>=?))");
+        snprintf(qsql, sizeof(qsql),
+            "%s WHERE p.is_active=1 AND p.id > ? "
+            "AND (? = 0 OR p.category_id = ?) "
+            "AND (? = 0 OR v.area_id = ?) "
+            "AND (? = 0 OR EXISTS (SELECT 1 FROM schedules s "
+            "  WHERE s.plan_id=p.id AND s.date=? AND (s.capacity-s.booked_count)>=?)) "
+            "ORDER BY p.id LIMIT ?", PLAN_SELECT);
+    } else {
+        snprintf(cnt_sql, sizeof(cnt_sql),
+            "SELECT COUNT(DISTINCT p.id) FROM plans p "
+            "JOIN venues v ON v.id=p.venue_id "
+            "WHERE p.is_active=1 "
+            "AND (? = 0 OR p.category_id = ?) "
+            "AND (? = 0 OR v.area_id = ?) "
+            "AND (? = 0 OR EXISTS (SELECT 1 FROM schedules s "
+            "  WHERE s.plan_id=p.id AND s.date=? AND (s.capacity-s.booked_count)>=?))");
+        snprintf(qsql, sizeof(qsql),
+            "%s WHERE p.is_active=1 "
+            "AND (? = 0 OR p.category_id = ?) "
+            "AND (? = 0 OR v.area_id = ?) "
+            "AND (? = 0 OR EXISTS (SELECT 1 FROM schedules s "
+            "  WHERE s.plan_id=p.id AND s.date=? AND (s.capacity-s.booked_count)>=?)) "
+            "ORDER BY p.id LIMIT ? OFFSET ?", PLAN_SELECT);
+    }
 
     DbStmt *ct = NULL;
     ct = db_prepare(db, cnt_sql);
-    db_bind_int(ct, 1, cat_id); db_bind_int(ct, 2, cat_id);
-    db_bind_int(ct, 3, area_id); db_bind_int(ct, 4, area_id);
-    db_bind_int(ct, 5, has_date ? 1 : 0);
-    db_bind_text(ct, 6, date);
-    db_bind_int(ct, 7, required);
+    if (after > 0) {
+        db_bind_int(ct, 1, after);
+        db_bind_int(ct, 2, cat_id); db_bind_int(ct, 3, cat_id);
+        db_bind_int(ct, 4, area_id); db_bind_int(ct, 5, area_id);
+        db_bind_int(ct, 6, has_date ? 1 : 0);
+        db_bind_text(ct, 7, date);
+        db_bind_int(ct, 8, required);
+    } else {
+        db_bind_int(ct, 1, cat_id); db_bind_int(ct, 2, cat_id);
+        db_bind_int(ct, 3, area_id); db_bind_int(ct, 4, area_id);
+        db_bind_int(ct, 5, has_date ? 1 : 0);
+        db_bind_text(ct, 6, date);
+        db_bind_int(ct, 7, required);
+    }
     db_step(ct);
     long total = db_col_int(ct, 0);
     db_finalize(ct);
 
     DbStmt *st = NULL;
     st = db_prepare(db, qsql);
-    db_bind_int(st, 1, cat_id); db_bind_int(st, 2, cat_id);
-    db_bind_int(st, 3, area_id); db_bind_int(st, 4, area_id);
-    db_bind_int(st, 5, has_date ? 1 : 0);
-    db_bind_text(st, 6, date);
-    db_bind_int(st, 7, required);
-    db_bind_int(st, 8, limit); db_bind_int(st, 9, offset);
+    if (after > 0) {
+        db_bind_int(st, 1, after);
+        db_bind_int(st, 2, cat_id); db_bind_int(st, 3, cat_id);
+        db_bind_int(st, 4, area_id); db_bind_int(st, 5, area_id);
+        db_bind_int(st, 6, has_date ? 1 : 0);
+        db_bind_text(st, 7, date);
+        db_bind_int(st, 8, required);
+        db_bind_int(st, 9, limit);
+    } else {
+        db_bind_int(st, 1, cat_id); db_bind_int(st, 2, cat_id);
+        db_bind_int(st, 3, area_id); db_bind_int(st, 4, area_id);
+        db_bind_int(st, 5, has_date ? 1 : 0);
+        db_bind_text(st, 6, date);
+        db_bind_int(st, 7, required);
+        db_bind_int(st, 8, limit); db_bind_int(st, 9, offset);
+    }
 
     cJSON *plans = cJSON_CreateArray();
+    long last_id = 0;
     while (db_step(st) == 1) {
         long plan_id = db_col_int(st, 0);
+        last_id = plan_id;
         cJSON *p = plan_row(st);
         cJSON_AddItemToObject(p, "prices", fetch_prices(db, plan_id));
         cJSON_AddItemToArray(plans, p);
@@ -429,6 +496,12 @@ void handle_list_plans(struct mg_connection *c, struct mg_http_message *hm, DbCo
     cJSON_AddNumberToObject(res, "total", total);
     cJSON_AddNumberToObject(res, "page",  page);
     cJSON_AddNumberToObject(res, "limit", limit);
+    /* cursor for next page */
+    long cnt = (long)cJSON_GetArraySize(cJSON_GetObjectItem(res, "plans"));
+    if (cnt == limit && last_id > 0)
+        cJSON_AddNumberToObject(res, "next_after", last_id);
+    else
+        cJSON_AddNullToObject(res, "next_after");
     send_cjson_etag(c, hm, res);
     cJSON_Delete(res);
 }

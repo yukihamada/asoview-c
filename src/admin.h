@@ -26,3 +26,11 @@ void handle_admin_list_reviews   (struct mg_connection *c, struct mg_http_messag
 void handle_admin_delete_review  (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long id);
 /* Users */
 void handle_admin_list_users     (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+/* Bulk schedule generation */
+void handle_admin_bulk_create_schedules(struct mg_connection *c, struct mg_http_message *hm, DbConn *db, long plan_id);
+/* Refund */
+void handle_admin_refund_booking (struct mg_connection *c, struct mg_http_message *hm, DbConn *db, const char *id);
+/* DB Backup */
+void handle_admin_backup_db      (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);
+/* Admin WebUI */
+void handle_admin_ui             (struct mg_connection *c, struct mg_http_message *hm, DbConn *db);

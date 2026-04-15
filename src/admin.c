@@ -1,10 +1,13 @@
 #include "admin.h"
 #include "handlers.h"   /* send_json_str, send_error_json */
 #include "cJSON.h"
+#include "stripe.h"
+#include "mailer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 /* JSON の数値フィールドを安全に long に変換（NaN/inf → 0） */
 static long cjson_long(cJSON *item) {
@@ -845,4 +848,752 @@ void handle_admin_list_users(struct mg_connection *c, struct mg_http_message *hm
     cJSON_AddNumberToObject(res, "limit", limit);
     send_cjson_admin(c, 200, res);
     cJSON_Delete(res);
+}
+
+/* ─── POST /api/v1/admin/plans/:id/schedules/bulk ──────────────────────────── */
+
+void handle_admin_bulk_create_schedules(struct mg_connection *c, struct mg_http_message *hm,
+                                        DbConn *db, long plan_id) {
+    if (!require_admin(c, hm)) return;
+    cJSON *body = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+    if (!body) { send_error_json(c, 400, "invalid JSON"); return; }
+
+    const char *start_date_s = cJSON_GetStringValue(cJSON_GetObjectItem(body, "start_date"));
+    const char *end_date_s   = cJSON_GetStringValue(cJSON_GetObjectItem(body, "end_date"));
+    const char *start_time   = cJSON_GetStringValue(cJSON_GetObjectItem(body, "start_time"));
+    const char *end_time     = cJSON_GetStringValue(cJSON_GetObjectItem(body, "end_time"));
+    long cap = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(body, "capacity"));
+    cJSON *weekdays_arr = cJSON_GetObjectItem(body, "weekdays");
+
+    if (!start_date_s || !end_date_s || !start_time || cap <= 0) {
+        cJSON_Delete(body);
+        send_error_json(c, 400, "start_date, end_date, start_time, capacity は必須です");
+        return;
+    }
+
+    /* Parse start and end dates */
+    int sy, sm, sd, ey, em, ed;
+    if (sscanf(start_date_s, "%d-%d-%d", &sy, &sm, &sd) != 3 ||
+        sscanf(end_date_s,   "%d-%d-%d", &ey, &em, &ed) != 3) {
+        cJSON_Delete(body);
+        send_error_json(c, 400, "日付形式は YYYY-MM-DD で指定してください");
+        return;
+    }
+
+    /* Build weekdays bitmask: bit N set means day N (0=Sun) is allowed */
+    int weekday_filter = 0;
+    int use_weekday_filter = 0;
+    if (weekdays_arr && cJSON_IsArray(weekdays_arr) && cJSON_GetArraySize(weekdays_arr) > 0) {
+        use_weekday_filter = 1;
+        int wn = cJSON_GetArraySize(weekdays_arr);
+        for (int i = 0; i < wn; i++) {
+            cJSON *wd = cJSON_GetArrayItem(weekdays_arr, i);
+            if (cJSON_IsNumber(wd)) {
+                int d = (int)cJSON_GetNumberValue(wd);
+                if (d >= 0 && d <= 6) weekday_filter |= (1 << d);
+            }
+        }
+    }
+
+    /* Iterate dates from start to end (inclusive), up to 366 */
+    struct tm t = {0};
+    t.tm_year = sy - 1900; t.tm_mon = sm - 1; t.tm_mday = sd;
+    t.tm_isdst = -1;
+    mktime(&t);
+
+    struct tm tend = {0};
+    tend.tm_year = ey - 1900; tend.tm_mon = em - 1; tend.tm_mday = ed;
+    tend.tm_isdst = -1;
+    time_t end_epoch = mktime(&tend);
+
+    long created = 0;
+    char date_buf[12];
+
+    while (created < 366) {
+        time_t cur_epoch = mktime(&t);
+        if (cur_epoch > end_epoch) break;
+
+        /* Check weekday filter */
+        if (!use_weekday_filter || (weekday_filter & (1 << t.tm_wday))) {
+            strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &t);
+
+            DbStmt *ins = NULL;
+            ins = db_prepare(db,
+                "INSERT INTO schedules(plan_id,date,start_time,end_time,capacity)"
+                " VALUES(?,?,?,?,?)");
+            db_bind_int(ins, 1, plan_id);
+            db_bind_text(ins, 2, date_buf);
+            db_bind_text(ins, 3, start_time);
+            db_bind_text(ins, 4, end_time ? end_time : "");
+            db_bind_int(ins, 5, cap);
+            db_step(ins); db_finalize(ins);
+            created++;
+        }
+
+        /* Advance by 1 day */
+        t.tm_mday++;
+        t.tm_isdst = -1;
+        mktime(&t);
+    }
+    cJSON_Delete(body);
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddNumberToObject(res, "created", created);
+    send_cjson_admin(c, 201, res);
+    cJSON_Delete(res);
+}
+
+/* ─── POST /api/v1/admin/bookings/:id/refund ────────────────────────────────── */
+
+void handle_admin_refund_booking(struct mg_connection *c, struct mg_http_message *hm,
+                                  DbConn *db, const char *id) {
+    if (!require_admin(c, hm)) return;
+
+    /* Look up booking */
+    DbStmt *st = NULL;
+    st = db_prepare(db,
+        "SELECT status, stripe_payment_intent_id FROM bookings WHERE id=?");
+    db_bind_text(st, 1, id);
+    if (db_step(st) != 1) {
+        db_finalize(st);
+        send_error_json(c, 404, "booking not found"); return;
+    }
+    const char *status_raw = db_col_text(st, 0);
+    char status[32] = {0};
+    if (status_raw) strncpy(status, status_raw, sizeof(status) - 1);
+
+    const char *pi_raw = db_col_text(st, 1);
+    char pi_id[256] = {0};
+    if (pi_raw) strncpy(pi_id, pi_raw, sizeof(pi_id) - 1);
+    db_finalize(st);
+
+    /* Guard: already cancelled or refunded */
+    if (strcmp(status, "cancelled") == 0 || strcmp(status, "refunded") == 0) {
+        send_error_json(c, 400, "この予約はすでにキャンセル済みまたは返金済みです");
+        return;
+    }
+
+    /* Guard: no Stripe PI */
+    if (!pi_id[0]) {
+        send_error_json(c, 400, "Stripe決済情報がありません");
+        return;
+    }
+
+    /* Call Stripe refund */
+    if (stripe_create_refund(pi_id) != 0) {
+        send_error_json(c, 502, "Stripe返金に失敗しました");
+        return;
+    }
+
+    /* Update booking status */
+    DbStmt *upd = NULL;
+    upd = db_prepare(db, "UPDATE bookings SET status='refunded' WHERE id=?");
+    db_bind_text(upd, 1, id);
+    db_step(upd); db_finalize(upd);
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddBoolToObject(res, "refunded", 1);
+    cJSON_AddStringToObject(res, "booking_id", id);
+    send_cjson_admin(c, 200, res);
+    cJSON_Delete(res);
+}
+
+/* ─── GET /api/v1/admin/backup ──────────────────────────────────────────────── */
+
+void handle_admin_backup_db(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    if (!require_admin(c, hm)) return;
+
+#ifdef USE_SQLITE
+    /* Generate backup filename with timestamp */
+    time_t now = time(NULL);
+    struct tm *tm_now = gmtime(&now);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", tm_now);
+    char backup_path[128];
+    snprintf(backup_path, sizeof(backup_path), "/tmp/asoview_backup_%s.db", ts);
+
+    /* SQLite online backup API */
+    sqlite3 *dest = NULL;
+    if (sqlite3_open(backup_path, &dest) != SQLITE_OK) {
+        if (dest) sqlite3_close(dest);
+        send_error_json(c, 500, "バックアップファイルの作成に失敗しました");
+        return;
+    }
+
+    sqlite3_backup *bk = sqlite3_backup_init(dest, "main", (sqlite3 *)db, "main");
+    if (!bk) {
+        sqlite3_close(dest);
+        send_error_json(c, 500, "バックアップの初期化に失敗しました");
+        return;
+    }
+    sqlite3_backup_step(bk, -1);  /* copy all pages */
+    sqlite3_backup_finish(bk);
+    sqlite3_close(dest);
+
+    /* Read backup file into memory */
+    FILE *f = fopen(backup_path, "rb");
+    if (!f) {
+        remove(backup_path);
+        send_error_json(c, 500, "バックアップファイルの読み込みに失敗しました");
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    /* Max 50 MB guard */
+    if (fsize > 50L * 1024 * 1024) {
+        fclose(f);
+        remove(backup_path);
+        send_error_json(c, 413, "バックアップファイルが50MBを超えています");
+        return;
+    }
+
+    char *buf = (char *)malloc((size_t)fsize);
+    if (!buf) {
+        fclose(f);
+        remove(backup_path);
+        send_error_json(c, 500, "メモリ確保に失敗しました");
+        return;
+    }
+    size_t nread = fread(buf, 1, (size_t)fsize, f);
+    fclose(f);
+    remove(backup_path);
+
+    /* Build filename for Content-Disposition */
+    char disp_fn[128];
+    snprintf(disp_fn, sizeof(disp_fn), "asoview_backup_%s.db", ts);
+
+    char headers[512];
+    snprintf(headers, sizeof(headers),
+             "Content-Type: application/octet-stream\r\n"
+             "Content-Disposition: attachment; filename=\"%s\"\r\n"
+             "Content-Length: %ld\r\n"
+             "Access-Control-Allow-Origin: *\r\n",
+             disp_fn, (long)nread);
+
+    mg_printf(c,
+              "HTTP/1.1 200 OK\r\n"
+              "%s\r\n", headers);
+    mg_send(c, buf, nread);
+    free(buf);
+
+#else
+    (void)db;
+    send_error_json(c, 501, "バックアップはSQLiteバックエンドのみサポートされています");
+#endif
+}
+
+/* ─── GET /admin/ui ─────────────────────────────────────────────────────────── */
+
+void handle_admin_ui(struct mg_connection *c, struct mg_http_message *hm, DbConn *db) {
+    (void)hm; (void)db;
+
+    static const char HTML[] =
+"<!DOCTYPE html>\n"
+"<html lang='ja'>\n"
+"<head>\n"
+"<meta charset='UTF-8'>\n"
+"<meta name='viewport' content='width=device-width,initial-scale=1'>\n"
+"<title>Asoview Admin</title>\n"
+"<style>\n"
+":root{--bg:#0f0f23;--sidebar:#1a1a2e;--accent:#e94560;--text:#eee;--muted:#999;--card:#1e1e3a;--border:#2a2a4a;--input:#16213e;--success:#4caf50;--danger:#e94560;}\n"
+"*{box-sizing:border-box;margin:0;padding:0;}\n"
+"body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;display:flex;height:100vh;overflow:hidden;}\n"
+"#sidebar{width:200px;background:var(--sidebar);display:flex;flex-direction:column;border-right:1px solid var(--border);flex-shrink:0;}\n"
+"#sidebar h1{padding:20px 16px;font-size:18px;font-weight:700;color:var(--accent);border-bottom:1px solid var(--border);}\n"
+"#sidebar nav a{display:block;padding:12px 16px;color:var(--muted);text-decoration:none;font-size:14px;transition:background 0.15s,color 0.15s;}\n"
+"#sidebar nav a:hover,#sidebar nav a.active{background:var(--bg);color:var(--text);border-left:3px solid var(--accent);}\n"
+"#main{flex:1;display:flex;flex-direction:column;overflow:hidden;}\n"
+"#topbar{background:var(--sidebar);padding:10px 20px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border);}\n"
+"#topbar label{font-size:13px;color:var(--muted);}\n"
+"#topbar input{background:var(--input);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:4px;font-size:13px;width:260px;}\n"
+"#topbar button{padding:6px 12px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;}\n"
+"#content{flex:1;overflow-y:auto;padding:20px;}\n"
+".tab{display:none;}.tab.active{display:block;}\n"
+"h2{font-size:20px;margin-bottom:16px;color:var(--text);}\n"
+"table{width:100%;border-collapse:collapse;font-size:13px;}\n"
+"th{background:var(--card);padding:8px 12px;text-align:left;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);}\n"
+"td{padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:top;}\n"
+"tr:hover td{background:rgba(233,69,96,0.05);}\n"
+".btn{padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;}\n"
+".btn-primary{background:var(--accent);color:#fff;}\n"
+".btn-secondary{background:var(--card);color:var(--text);border:1px solid var(--border);}\n"
+".btn-danger{background:#c0392b;color:#fff;}\n"
+".btn-success{background:#27ae60;color:#fff;}\n"
+".actions{display:flex;gap:6px;}\n"
+".toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;}\n"
+".toolbar input{background:var(--input);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:4px;font-size:13px;width:200px;}\n"
+"/* Modal */\n"
+".overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:100;justify-content:center;align-items:center;}\n"
+".overlay.open{display:flex;}\n"
+".modal{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:24px;min-width:400px;max-width:600px;max-height:90vh;overflow-y:auto;}\n"
+".modal h3{margin-bottom:16px;font-size:16px;}\n"
+".form-group{margin-bottom:12px;}\n"
+".form-group label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;}\n"
+".form-group input,.form-group select,.form-group textarea{width:100%;background:var(--input);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:4px;font-size:13px;}\n"
+".form-group textarea{min-height:80px;resize:vertical;}\n"
+".form-row{display:flex;gap:10px;}.form-row .form-group{flex:1;}\n"
+".modal-footer{display:flex;justify-content:flex-end;gap:8px;margin-top:16px;}\n"
+".msg{padding:8px 12px;border-radius:4px;font-size:13px;margin-bottom:12px;}\n"
+".msg.ok{background:#1b4332;color:#52c41a;}\n"
+".msg.err{background:#4a1020;color:#ff6b6b;}\n"
+".badge{padding:2px 8px;border-radius:12px;font-size:11px;}\n"
+".badge-green{background:#1b4332;color:#52c41a;}\n"
+".badge-red{background:#4a1020;color:#ff6b6b;}\n"
+".badge-blue{background:#0d2b45;color:#5bc0eb;}\n"
+".badge-grey{background:#2a2a4a;color:#999;}\n"
+"</style>\n"
+"</head>\n"
+"<body>\n"
+"<div id='sidebar'>\n"
+"  <h1>&#9965; Asoview</h1>\n"
+"  <nav>\n"
+"    <a href='#' onclick='showTab(\"venues\")' id='nav-venues'>Venues</a>\n"
+"    <a href='#' onclick='showTab(\"plans\")' id='nav-plans'>Plans</a>\n"
+"    <a href='#' onclick='showTab(\"schedules\")' id='nav-schedules'>Schedules</a>\n"
+"    <a href='#' onclick='showTab(\"bookings\")' id='nav-bookings'>Bookings</a>\n"
+"    <a href='#' onclick='showTab(\"users\")' id='nav-users'>Users</a>\n"
+"  </nav>\n"
+"</div>\n"
+"<div id='main'>\n"
+"  <div id='topbar'>\n"
+"    <label>Admin Key:</label>\n"
+"    <input type='password' id='admin-key' placeholder='X-Admin-Key を入力...'>\n"
+"    <button onclick='saveKey()'>保存</button>\n"
+"    <button class='btn btn-secondary' onclick='clearKey()' style='padding:6px 10px;'>クリア</button>\n"
+"  </div>\n"
+"  <div id='content'>\n"
+"\n"
+"  <!-- VENUES TAB -->\n"
+"  <div class='tab' id='tab-venues'>\n"
+"    <div id='venues-msg'></div>\n"
+"    <div class='toolbar'>\n"
+"      <h2>Venues</h2>\n"
+"      <button class='btn btn-primary' onclick='openVenueModal()'>+ 追加</button>\n"
+"    </div>\n"
+"    <table id='venues-table'><thead><tr><th>ID</th><th>Name</th><th>Area</th><th>Address</th><th>Actions</th></tr></thead><tbody></tbody></table>\n"
+"  </div>\n"
+"\n"
+"  <!-- PLANS TAB -->\n"
+"  <div class='tab' id='tab-plans'>\n"
+"    <div id='plans-msg'></div>\n"
+"    <div class='toolbar'>\n"
+"      <h2>Plans</h2>\n"
+"      <button class='btn btn-primary' onclick='openPlanModal()'>+ 追加</button>\n"
+"    </div>\n"
+"    <table id='plans-table'><thead><tr><th>ID</th><th>Title</th><th>Venue</th><th>Active</th><th>Actions</th></tr></thead><tbody></tbody></table>\n"
+"  </div>\n"
+"\n"
+"  <!-- SCHEDULES TAB -->\n"
+"  <div class='tab' id='tab-schedules'>\n"
+"    <div id='schedules-msg'></div>\n"
+"    <div class='toolbar'>\n"
+"      <h2>Schedules</h2>\n"
+"      <div style='display:flex;gap:8px;align-items:center;'>\n"
+"        <select id='sched-plan-sel' onchange='loadSchedules()' style='background:var(--input);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:4px;font-size:13px;'><option value=''>-- Plan を選択 --</option></select>\n"
+"        <button class='btn btn-primary' onclick='openSchedModal()'>+ 追加</button>\n"
+"        <button class='btn btn-secondary' onclick='openBulkModal()'>Bulk生成</button>\n"
+"      </div>\n"
+"    </div>\n"
+"    <table id='schedules-table'><thead><tr><th>ID</th><th>Date</th><th>Start</th><th>End</th><th>Capacity</th><th>Booked</th><th>Actions</th></tr></thead><tbody></tbody></table>\n"
+"  </div>\n"
+"\n"
+"  <!-- BOOKINGS TAB -->\n"
+"  <div class='tab' id='tab-bookings'>\n"
+"    <div class='toolbar'>\n"
+"      <h2>Bookings</h2>\n"
+"      <input type='text' id='bookings-search' placeholder='検索...' oninput='loadBookings()'>\n"
+"    </div>\n"
+"    <table id='bookings-table'><thead><tr><th>ID</th><th>User</th><th>Schedule</th><th>Status</th><th>Amount</th><th>Created</th><th>Actions</th></tr></thead><tbody></tbody></table>\n"
+"  </div>\n"
+"\n"
+"  <!-- USERS TAB -->\n"
+"  <div class='tab' id='tab-users'>\n"
+"    <div class='toolbar'>\n"
+"      <h2>Users</h2>\n"
+"      <input type='text' id='users-search' placeholder='検索...' oninput='loadUsers()'>\n"
+"    </div>\n"
+"    <table id='users-table'><thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Bookings</th><th>Created</th></tr></thead><tbody></tbody></table>\n"
+"  </div>\n"
+"\n"
+"  </div><!-- /content -->\n"
+"</div><!-- /main -->\n"
+"\n"
+"<!-- VENUE MODAL -->\n"
+"<div class='overlay' id='venue-modal'>\n"
+"  <div class='modal'>\n"
+"    <h3 id='venue-modal-title'>施設を追加</h3>\n"
+"    <div id='venue-modal-msg'></div>\n"
+"    <input type='hidden' id='venue-id'>\n"
+"    <div class='form-row'>\n"
+"      <div class='form-group'><label>名前 *</label><input id='venue-name' type='text'></div>\n"
+"      <div class='form-group'><label>Area ID *</label><input id='venue-area-id' type='number'></div>\n"
+"    </div>\n"
+"    <div class='form-group'><label>住所</label><input id='venue-address' type='text'></div>\n"
+"    <div class='form-row'>\n"
+"      <div class='form-group'><label>電話</label><input id='venue-phone' type='text'></div>\n"
+"      <div class='form-group'><label>Website</label><input id='venue-website' type='text'></div>\n"
+"    </div>\n"
+"    <div class='form-group'><label>説明</label><textarea id='venue-desc'></textarea></div>\n"
+"    <div class='modal-footer'>\n"
+"      <button class='btn btn-secondary' onclick='closeModal(\"venue-modal\")'>キャンセル</button>\n"
+"      <button class='btn btn-primary' onclick='saveVenue()'>保存</button>\n"
+"    </div>\n"
+"  </div>\n"
+"</div>\n"
+"\n"
+"<!-- PLAN MODAL -->\n"
+"<div class='overlay' id='plan-modal'>\n"
+"  <div class='modal'>\n"
+"    <h3 id='plan-modal-title'>プランを追加</h3>\n"
+"    <div id='plan-modal-msg'></div>\n"
+"    <input type='hidden' id='plan-id'>\n"
+"    <div class='form-row'>\n"
+"      <div class='form-group'><label>Venue ID *</label><input id='plan-venue-id' type='number'></div>\n"
+"      <div class='form-group'><label>Category ID *</label><input id='plan-cat-id' type='number'></div>\n"
+"    </div>\n"
+"    <div class='form-group'><label>タイトル *</label><input id='plan-title' type='text'></div>\n"
+"    <div class='form-group'><label>説明</label><textarea id='plan-desc'></textarea></div>\n"
+"    <div class='form-row'>\n"
+"      <div class='form-group'><label>所要時間(分)</label><input id='plan-dur' type='number'></div>\n"
+"      <div class='form-group'><label>最小人数</label><input id='plan-minp' type='number'></div>\n"
+"      <div class='form-group'><label>最大人数</label><input id='plan-maxp' type='number'></div>\n"
+"    </div>\n"
+"    <div class='modal-footer'>\n"
+"      <button class='btn btn-secondary' onclick='closeModal(\"plan-modal\")'>キャンセル</button>\n"
+"      <button class='btn btn-primary' onclick='savePlan()'>保存</button>\n"
+"    </div>\n"
+"  </div>\n"
+"</div>\n"
+"\n"
+"<!-- SCHEDULE MODAL -->\n"
+"<div class='overlay' id='sched-modal'>\n"
+"  <div class='modal'>\n"
+"    <h3>スケジュールを追加</h3>\n"
+"    <div id='sched-modal-msg'></div>\n"
+"    <div class='form-row'>\n"
+"      <div class='form-group'><label>日付 *</label><input id='sched-date' type='date'></div>\n"
+"      <div class='form-group'><label>定員 *</label><input id='sched-cap' type='number' value='10'></div>\n"
+"    </div>\n"
+"    <div class='form-row'>\n"
+"      <div class='form-group'><label>開始時刻 *</label><input id='sched-start' type='time'></div>\n"
+"      <div class='form-group'><label>終了時刻</label><input id='sched-end' type='time'></div>\n"
+"    </div>\n"
+"    <div class='modal-footer'>\n"
+"      <button class='btn btn-secondary' onclick='closeModal(\"sched-modal\")'>キャンセル</button>\n"
+"      <button class='btn btn-primary' onclick='saveSched()'>保存</button>\n"
+"    </div>\n"
+"  </div>\n"
+"</div>\n"
+"\n"
+"<!-- BULK SCHEDULE MODAL -->\n"
+"<div class='overlay' id='bulk-modal'>\n"
+"  <div class='modal'>\n"
+"    <h3>一括スケジュール生成</h3>\n"
+"    <div id='bulk-modal-msg'></div>\n"
+"    <div class='form-row'>\n"
+"      <div class='form-group'><label>開始日 *</label><input id='bulk-start-date' type='date'></div>\n"
+"      <div class='form-group'><label>終了日 *</label><input id='bulk-end-date' type='date'></div>\n"
+"    </div>\n"
+"    <div class='form-group'><label>曜日フィルタ（空=全日）</label>\n"
+"      <div style='display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;font-size:13px;'>\n"
+"        <label><input type='checkbox' name='wd' value='0'> 日</label>\n"
+"        <label><input type='checkbox' name='wd' value='1'> 月</label>\n"
+"        <label><input type='checkbox' name='wd' value='2'> 火</label>\n"
+"        <label><input type='checkbox' name='wd' value='3'> 水</label>\n"
+"        <label><input type='checkbox' name='wd' value='4'> 木</label>\n"
+"        <label><input type='checkbox' name='wd' value='5'> 金</label>\n"
+"        <label><input type='checkbox' name='wd' value='6'> 土</label>\n"
+"      </div>\n"
+"    </div>\n"
+"    <div class='form-row'>\n"
+"      <div class='form-group'><label>開始時刻 *</label><input id='bulk-start' type='time' value='10:00'></div>\n"
+"      <div class='form-group'><label>終了時刻</label><input id='bulk-end' type='time'></div>\n"
+"      <div class='form-group'><label>定員 *</label><input id='bulk-cap' type='number' value='10'></div>\n"
+"    </div>\n"
+"    <div class='modal-footer'>\n"
+"      <button class='btn btn-secondary' onclick='closeModal(\"bulk-modal\")'>キャンセル</button>\n"
+"      <button class='btn btn-primary' onclick='saveBulk()'>生成</button>\n"
+"    </div>\n"
+"  </div>\n"
+"</div>\n"
+"\n"
+"<script>\n"
+"// ─── Key Management ──────────────────────────────────────────────────────────\n"
+"let adminKey = localStorage.getItem('asoview_admin_key') || '';\n"
+"document.getElementById('admin-key').value = adminKey;\n"
+"function saveKey() {\n"
+"  adminKey = document.getElementById('admin-key').value.trim();\n"
+"  localStorage.setItem('asoview_admin_key', adminKey);\n"
+"  showTab(currentTab || 'venues');\n"
+"}\n"
+"function clearKey() {\n"
+"  adminKey = ''; localStorage.removeItem('asoview_admin_key');\n"
+"  document.getElementById('admin-key').value = '';\n"
+"}\n"
+"function headers() { return {'Content-Type':'application/json','X-Admin-Key':adminKey}; }\n"
+"async function api(method, path, body) {\n"
+"  const opts = {method, headers: headers()};\n"
+"  if (body) opts.body = JSON.stringify(body);\n"
+"  const r = await fetch(path, opts);\n"
+"  return {ok: r.ok, status: r.status, data: await r.json().catch(()=>{})};\n"
+"}\n"
+"\n"
+"// ─── Tab Navigation ───────────────────────────────────────────────────────────\n"
+"let currentTab = 'venues';\n"
+"function showTab(tab) {\n"
+"  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));\n"
+"  document.querySelectorAll('#sidebar nav a').forEach(a => a.classList.remove('active'));\n"
+"  document.getElementById('tab-' + tab).classList.add('active');\n"
+"  document.getElementById('nav-' + tab).classList.add('active');\n"
+"  currentTab = tab;\n"
+"  if (tab === 'venues')    loadVenues();\n"
+"  if (tab === 'plans')     { loadPlans(); loadPlanSelect(); }\n"
+"  if (tab === 'schedules') { loadPlanSelect(); }\n"
+"  if (tab === 'bookings')  loadBookings();\n"
+"  if (tab === 'users')     loadUsers();\n"
+"}\n"
+"\n"
+"// ─── Modal helpers ────────────────────────────────────────────────────────────\n"
+"function openModal(id) { document.getElementById(id).classList.add('open'); }\n"
+"function closeModal(id) { document.getElementById(id).classList.remove('open'); }\n"
+"function showMsg(elId, ok, txt) {\n"
+"  const el = document.getElementById(elId);\n"
+"  if (!el) return;\n"
+"  el.innerHTML = `<div class='msg ${ok?'ok':'err'}'>${txt}</div>`;\n"
+"  setTimeout(() => { el.innerHTML = ''; }, 4000);\n"
+"}\n"
+"function statusBadge(s) {\n"
+"  const cls = s==='confirmed'?'badge-green':s==='cancelled'||s==='refunded'?'badge-red':'badge-blue';\n"
+"  return `<span class='badge ${cls}'>${s}</span>`;\n"
+"}\n"
+"\n"
+"// ─── VENUES ───────────────────────────────────────────────────────────────────\n"
+"async function loadVenues() {\n"
+"  const r = await api('GET', '/api/v1/admin/venues?limit=200');\n"
+"  if (!r.ok) { showMsg('venues-msg', false, r.data?.error || 'エラー'); return; }\n"
+"  const tbody = document.querySelector('#venues-table tbody');\n"
+"  tbody.innerHTML = (r.data.venues || []).map(v =>\n"
+"    `<tr><td>${v.id}</td><td>${v.name}</td><td>${v.area_name||v.area_id}</td><td>${v.address||''}</td>\n"
+"     <td class='actions'>\n"
+"       <button class='btn btn-secondary' onclick='editVenue(${v.id},${JSON.stringify(v).replace(/\"/g,\"&quot;\")})'>編集</button>\n"
+"       <button class='btn btn-danger' onclick='deleteVenue(${v.id})'>削除</button>\n"
+"     </td></tr>`\n"
+"  ).join('');\n"
+"}\n"
+"function openVenueModal() {\n"
+"  document.getElementById('venue-id').value = '';\n"
+"  document.getElementById('venue-modal-title').textContent = '施設を追加';\n"
+"  ['venue-name','venue-area-id','venue-address','venue-phone','venue-website','venue-desc'].forEach(id => document.getElementById(id).value = '');\n"
+"  openModal('venue-modal');\n"
+"}\n"
+"function editVenue(id, v) {\n"
+"  document.getElementById('venue-id').value = id;\n"
+"  document.getElementById('venue-modal-title').textContent = '施設を編集';\n"
+"  document.getElementById('venue-name').value = v.name || '';\n"
+"  document.getElementById('venue-area-id').value = v.area_id || '';\n"
+"  document.getElementById('venue-address').value = v.address || '';\n"
+"  document.getElementById('venue-phone').value = v.phone || '';\n"
+"  document.getElementById('venue-website').value = v.website || '';\n"
+"  document.getElementById('venue-desc').value = v.description || '';\n"
+"  openModal('venue-modal');\n"
+"}\n"
+"async function saveVenue() {\n"
+"  const id = document.getElementById('venue-id').value;\n"
+"  const body = {\n"
+"    name: document.getElementById('venue-name').value,\n"
+"    area_id: +document.getElementById('venue-area-id').value,\n"
+"    address: document.getElementById('venue-address').value,\n"
+"    phone: document.getElementById('venue-phone').value,\n"
+"    website: document.getElementById('venue-website').value,\n"
+"    description: document.getElementById('venue-desc').value\n"
+"  };\n"
+"  const r = id ? await api('PATCH',`/api/v1/admin/venues/${id}`,body)\n"
+"               : await api('POST','/api/v1/admin/venues',body);\n"
+"  showMsg('venue-modal-msg', r.ok, r.ok ? '保存しました' : (r.data?.error || 'エラー'));\n"
+"  if (r.ok) { closeModal('venue-modal'); loadVenues(); }\n"
+"}\n"
+"async function deleteVenue(id) {\n"
+"  if (!confirm('この施設を削除しますか？')) return;\n"
+"  const r = await api('DELETE', `/api/v1/admin/venues/${id}`);\n"
+"  showMsg('venues-msg', r.ok, r.ok ? '削除しました' : (r.data?.error || 'エラー'));\n"
+"  if (r.ok) loadVenues();\n"
+"}\n"
+"\n"
+"// ─── PLANS ────────────────────────────────────────────────────────────────────\n"
+"async function loadPlans() {\n"
+"  const r = await api('GET', '/api/v1/admin/plans?limit=200');\n"
+"  if (!r.ok) { showMsg('plans-msg', false, r.data?.error || 'エラー'); return; }\n"
+"  const tbody = document.querySelector('#plans-table tbody');\n"
+"  tbody.innerHTML = (r.data.plans || []).map(p =>\n"
+"    `<tr><td>${p.id}</td><td>${p.title}</td><td>${p.venue_name||p.venue_id}</td>\n"
+"     <td>${p.is_active?`<span class='badge badge-green'>Yes</span>`:`<span class='badge badge-grey'>No</span>`}</td>\n"
+"     <td class='actions'>\n"
+"       <button class='btn btn-secondary' onclick='editPlan(${p.id},${JSON.stringify(p).replace(/\"/g,\"&quot;\")})'>編集</button>\n"
+"       <button class='btn btn-danger' onclick='deletePlan(${p.id})'>削除</button>\n"
+"     </td></tr>`\n"
+"  ).join('');\n"
+"}\n"
+"async function loadPlanSelect() {\n"
+"  const r = await api('GET', '/api/v1/admin/plans?limit=200');\n"
+"  if (!r.ok) return;\n"
+"  const sel = document.getElementById('sched-plan-sel');\n"
+"  const cur = sel.value;\n"
+"  sel.innerHTML = '<option value=\"\">-- Plan を選択 --</option>' +\n"
+"    (r.data.plans || []).map(p => `<option value='${p.id}'>${p.id}: ${p.title}</option>`).join('');\n"
+"  if (cur) sel.value = cur;\n"
+"}\n"
+"function openPlanModal() {\n"
+"  document.getElementById('plan-id').value = '';\n"
+"  document.getElementById('plan-modal-title').textContent = 'プランを追加';\n"
+"  ['plan-venue-id','plan-cat-id','plan-title','plan-desc','plan-dur','plan-minp','plan-maxp'].forEach(id => document.getElementById(id).value = '');\n"
+"  openModal('plan-modal');\n"
+"}\n"
+"function editPlan(id, p) {\n"
+"  document.getElementById('plan-id').value = id;\n"
+"  document.getElementById('plan-modal-title').textContent = 'プランを編集';\n"
+"  document.getElementById('plan-venue-id').value = p.venue_id || '';\n"
+"  document.getElementById('plan-cat-id').value = p.category_id || '';\n"
+"  document.getElementById('plan-title').value = p.title || '';\n"
+"  document.getElementById('plan-desc').value = p.description || '';\n"
+"  document.getElementById('plan-dur').value = p.duration_minutes || '';\n"
+"  document.getElementById('plan-minp').value = p.min_participants || '';\n"
+"  document.getElementById('plan-maxp').value = p.max_participants || '';\n"
+"  openModal('plan-modal');\n"
+"}\n"
+"async function savePlan() {\n"
+"  const id = document.getElementById('plan-id').value;\n"
+"  const body = {\n"
+"    venue_id: +document.getElementById('plan-venue-id').value,\n"
+"    category_id: +document.getElementById('plan-cat-id').value,\n"
+"    title: document.getElementById('plan-title').value,\n"
+"    description: document.getElementById('plan-desc').value,\n"
+"    duration_minutes: +document.getElementById('plan-dur').value,\n"
+"    min_participants: +document.getElementById('plan-minp').value,\n"
+"    max_participants: +document.getElementById('plan-maxp').value\n"
+"  };\n"
+"  const r = id ? await api('PATCH',`/api/v1/admin/plans/${id}`,body)\n"
+"               : await api('POST','/api/v1/admin/plans',body);\n"
+"  showMsg('plan-modal-msg', r.ok, r.ok ? '保存しました' : (r.data?.error || 'エラー'));\n"
+"  if (r.ok) { closeModal('plan-modal'); loadPlans(); }\n"
+"}\n"
+"async function deletePlan(id) {\n"
+"  if (!confirm('このプランを非公開にしますか？')) return;\n"
+"  const r = await api('DELETE', `/api/v1/admin/plans/${id}`);\n"
+"  showMsg('plans-msg', r.ok, r.ok ? '非公開にしました' : (r.data?.error || 'エラー'));\n"
+"  if (r.ok) loadPlans();\n"
+"}\n"
+"\n"
+"// ─── SCHEDULES ────────────────────────────────────────────────────────────────\n"
+"async function loadSchedules() {\n"
+"  const pid = document.getElementById('sched-plan-sel').value;\n"
+"  if (!pid) return;\n"
+"  const r = await api('GET', `/api/v1/plans/${pid}/schedules`);\n"
+"  const tbody = document.querySelector('#schedules-table tbody');\n"
+"  tbody.innerHTML = (!r.ok ? '<tr><td colspan=7>読み込みエラー</td></tr>' :\n"
+"    (r.data.schedules || []).map(s =>\n"
+"      `<tr><td>${s.id}</td><td>${s.date}</td><td>${s.start_time}</td><td>${s.end_time||''}</td>\n"
+"       <td>${s.capacity}</td><td>${s.booked_count||0}</td>\n"
+"       <td class='actions'>\n"
+"         <button class='btn btn-danger' onclick='deleteSched(${s.id})'>削除</button>\n"
+"       </td></tr>`\n"
+"    ).join('') || '<tr><td colspan=7>データなし</td></tr>'\n"
+"  );\n"
+"}\n"
+"function openSchedModal() {\n"
+"  const pid = document.getElementById('sched-plan-sel').value;\n"
+"  if (!pid) { alert('先に Plan を選択してください'); return; }\n"
+"  ['sched-date','sched-start','sched-end'].forEach(id => document.getElementById(id).value = '');\n"
+"  document.getElementById('sched-cap').value = '10';\n"
+"  openModal('sched-modal');\n"
+"}\n"
+"async function saveSched() {\n"
+"  const pid = document.getElementById('sched-plan-sel').value;\n"
+"  const body = {\n"
+"    date: document.getElementById('sched-date').value,\n"
+"    start_time: document.getElementById('sched-start').value,\n"
+"    end_time: document.getElementById('sched-end').value || null,\n"
+"    capacity: +document.getElementById('sched-cap').value\n"
+"  };\n"
+"  const r = await api('POST', `/api/v1/admin/plans/${pid}/schedules`, body);\n"
+"  showMsg('sched-modal-msg', r.ok, r.ok ? '追加しました' : (r.data?.error || 'エラー'));\n"
+"  if (r.ok) { closeModal('sched-modal'); loadSchedules(); }\n"
+"}\n"
+"async function deleteSched(id) {\n"
+"  if (!confirm('このスケジュールを削除しますか？')) return;\n"
+"  const r = await api('DELETE', `/api/v1/admin/schedules/${id}`);\n"
+"  showMsg('schedules-msg', r.ok, r.ok ? '削除しました' : (r.data?.error || 'エラー'));\n"
+"  if (r.ok) loadSchedules();\n"
+"}\n"
+"function openBulkModal() {\n"
+"  const pid = document.getElementById('sched-plan-sel').value;\n"
+"  if (!pid) { alert('先に Plan を選択してください'); return; }\n"
+"  document.querySelectorAll('input[name=wd]').forEach(cb => cb.checked = false);\n"
+"  ['bulk-start-date','bulk-end-date','bulk-end'].forEach(id => document.getElementById(id).value = '');\n"
+"  document.getElementById('bulk-start').value = '10:00';\n"
+"  document.getElementById('bulk-cap').value = '10';\n"
+"  openModal('bulk-modal');\n"
+"}\n"
+"async function saveBulk() {\n"
+"  const pid = document.getElementById('sched-plan-sel').value;\n"
+"  const wds = [...document.querySelectorAll('input[name=wd]:checked')].map(cb => +cb.value);\n"
+"  const body = {\n"
+"    start_date: document.getElementById('bulk-start-date').value,\n"
+"    end_date: document.getElementById('bulk-end-date').value,\n"
+"    start_time: document.getElementById('bulk-start').value,\n"
+"    end_time: document.getElementById('bulk-end').value || null,\n"
+"    capacity: +document.getElementById('bulk-cap').value\n"
+"  };\n"
+"  if (wds.length > 0) body.weekdays = wds;\n"
+"  const r = await api('POST', `/api/v1/admin/plans/${pid}/schedules/bulk`, body);\n"
+"  showMsg('bulk-modal-msg', r.ok,\n"
+"    r.ok ? `${r.data.created} 件生成しました` : (r.data?.error || 'エラー'));\n"
+"  if (r.ok) { closeModal('bulk-modal'); loadSchedules(); }\n"
+"}\n"
+"\n"
+"// ─── BOOKINGS ─────────────────────────────────────────────────────────────────\n"
+"async function loadBookings() {\n"
+"  const q = document.getElementById('bookings-search').value;\n"
+"  const r = await api('GET', `/api/v1/admin/bookings?limit=100${q?'&q='+encodeURIComponent(q):''}`);\n"
+"  if (!r.ok) return;\n"
+"  const tbody = document.querySelector('#bookings-table tbody');\n"
+"  tbody.innerHTML = (r.data.bookings || []).map(b =>\n"
+"    `<tr><td style='font-size:11px;max-width:100px;overflow:hidden;text-overflow:ellipsis;'>${b.id}</td>\n"
+"     <td>${b.user_email||b.user_id||''}</td>\n"
+"     <td>${b.schedule_id}</td>\n"
+"     <td>${statusBadge(b.status)}</td>\n"
+"     <td>${b.total_amount!=null?'¥'+b.total_amount.toLocaleString():''}</td>\n"
+"     <td style='font-size:11px;'>${(b.created_at||'').slice(0,16)}</td>\n"
+"     <td class='actions'>\n"
+"       ${b.status!=='refunded'&&b.status!=='cancelled'?`<button class='btn btn-secondary' onclick='refundBooking(\"${b.id}\")'>返金</button>`:''}\n"
+"     </td></tr>`\n"
+"  ).join('');\n"
+"}\n"
+"async function refundBooking(id) {\n"
+"  if (!confirm('この予約を返金しますか？（取り消せません）')) return;\n"
+"  const r = await api('POST', `/api/v1/admin/bookings/${id}/refund`);\n"
+"  alert(r.ok ? '返金しました' : (r.data?.error || '返金エラー'));\n"
+"  if (r.ok) loadBookings();\n"
+"}\n"
+"\n"
+"// ─── USERS ────────────────────────────────────────────────────────────────────\n"
+"async function loadUsers() {\n"
+"  const q = document.getElementById('users-search').value;\n"
+"  const r = await api('GET', `/api/v1/admin/users?limit=100${q?'&q='+encodeURIComponent(q):''}`);\n"
+"  if (!r.ok) return;\n"
+"  const tbody = document.querySelector('#users-table tbody');\n"
+"  tbody.innerHTML = (r.data.users || []).map(u =>\n"
+"    `<tr><td>${u.id}</td><td>${u.name||''}</td><td>${u.email}</td>\n"
+"     <td>${u.booking_count}</td>\n"
+"     <td style='font-size:11px;'>${(u.created_at||'').slice(0,10)}</td></tr>`\n"
+"  ).join('');\n"
+"}\n"
+"\n"
+"// ─── Init ─────────────────────────────────────────────────────────────────────\n"
+"showTab('venues');\n"
+"</script>\n"
+"</body></html>\n";
+
+    mg_http_reply(c, 200, "Content-Type: text/html; charset=utf-8\r\n", "%s", HTML);
 }

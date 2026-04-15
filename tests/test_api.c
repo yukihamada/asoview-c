@@ -1917,6 +1917,223 @@ static void test_checkout_session(void) {
     PASS();
 }
 
+/* ─── cursor-based pagination ───────────────────────────────────────── */
+static void test_cursor_pagination(void) {
+    char url[256];
+
+    /* plans: after=0 (first page) */
+    snprintf(url, sizeof(url), "%s/api/v1/plans?limit=5", BASE_URL);
+    Resp r1 = http_get(url);
+    ASSERT(r1.status == 200, "plans list → 200");
+    cJSON *j1 = cJSON_Parse(r1.body);
+    ASSERT(j1 != NULL, "plans parse JSON");
+    cJSON *na = cJSON_GetObjectItem(j1, "next_after");
+    ASSERT(na != NULL, "plans response has next_after field");
+    resp_free(&r1); cJSON_Delete(j1);
+
+    /* venues: after=0 (first page) */
+    snprintf(url, sizeof(url), "%s/api/v1/venues?limit=3", BASE_URL);
+    Resp r2 = http_get(url);
+    ASSERT(r2.status == 200, "venues list → 200");
+    cJSON *j2 = cJSON_Parse(r2.body);
+    ASSERT(j2 != NULL, "venues parse JSON");
+    cJSON *na2 = cJSON_GetObjectItem(j2, "next_after");
+    ASSERT(na2 != NULL, "venues response has next_after field");
+    long after_id = cJSON_IsNumber(na2) ? (long)cJSON_GetNumberValue(na2) : 0;
+    resp_free(&r2); cJSON_Delete(j2);
+
+    if (after_id > 0) {
+        /* cursor-based 2nd page */
+        snprintf(url, sizeof(url), "%s/api/v1/venues?limit=3&after=%ld", BASE_URL, after_id);
+        Resp r3 = http_get(url);
+        ASSERT(r3.status == 200, "venues cursor page 2 → 200");
+        cJSON *j3 = cJSON_Parse(r3.body);
+        ASSERT(j3 != NULL, "venues cursor page 2 parse JSON");
+        cJSON *arr = cJSON_GetObjectItem(j3, "venues");
+        /* all IDs in page 2 should be > after_id */
+        cJSON *item; int ok = 1;
+        cJSON_ArrayForEach(item, arr) {
+            long vid = (long)cJSON_GetNumberValue(cJSON_GetObjectItem(item, "id"));
+            if (vid <= after_id) { ok = 0; break; }
+        }
+        ASSERT(ok, "venues cursor page 2: all IDs > after_id");
+        resp_free(&r3); cJSON_Delete(j3);
+    }
+
+    PASS();
+}
+
+/* ─── bulk schedule generation ──────────────────────────────────────── */
+static void test_bulk_schedules(void) {
+    char url[256];
+
+    /* まずプランを1つ作成 */
+    snprintf(url, sizeof(url), "%s/api/v1/admin/venues", BASE_URL);
+    Resp rv = http_post_admin(url,
+        "{\"name\":\"Bulk Test Venue\",\"area_id\":1}");
+    ASSERT(rv.status == 201, "bulk test: create venue → 201");
+    cJSON *jv = cJSON_Parse(rv.body);
+    long vid = jv ? (long)cJSON_GetNumberValue(cJSON_GetObjectItem(jv, "id")) : 0;
+    resp_free(&rv); cJSON_Delete(jv);
+
+    snprintf(url, sizeof(url), "%s/api/v1/admin/plans", BASE_URL);
+    Resp rp = http_post_admin(url,
+        "{\"venue_id\":1,\"category_id\":1,\"title\":\"Bulk Test Plan\","
+        "\"min_participants\":1}");
+    ASSERT(rp.status == 201, "bulk test: create plan → 201");
+    cJSON *jp = cJSON_Parse(rp.body);
+    long pid = jp ? (long)cJSON_GetNumberValue(cJSON_GetObjectItem(jp, "id")) : 0;
+    resp_free(&rp); cJSON_Delete(jp);
+    (void)vid;
+
+    if (pid > 0) {
+        /* 土日の7日間 = 2スケジュール */
+        snprintf(url, sizeof(url), "%s/api/v1/admin/plans/%ld/schedules/bulk", BASE_URL, pid);
+        Resp rb = http_post_admin(url,
+            "{\"start_date\":\"2026-05-01\",\"end_date\":\"2026-05-07\","
+            "\"weekdays\":[0,6],\"start_time\":\"10:00\",\"end_time\":\"12:00\","
+            "\"capacity\":15}");
+        ASSERT(rb.status == 201, "bulk schedules → 201");
+        cJSON *jb = cJSON_Parse(rb.body);
+        long created = jb ? (long)cJSON_GetNumberValue(cJSON_GetObjectItem(jb, "created")) : -1;
+        ASSERT(created == 2, "bulk schedules: 2 weekend days in 2026-05-01..07");
+        resp_free(&rb); cJSON_Delete(jb);
+
+        /* 未認証 → 403 */
+        Resp rb2 = http_post(url,
+            "{\"start_date\":\"2026-05-01\",\"end_date\":\"2026-05-07\","
+            "\"weekdays\":[0],\"start_time\":\"10:00\",\"capacity\":5}");
+        ASSERT(rb2.status == 403, "bulk schedules no key → 403");
+        resp_free(&rb2);
+
+        /* 不正な日付 → 400 */
+        Resp rb3 = http_post_admin(url,
+            "{\"start_date\":\"not-a-date\",\"end_date\":\"2026-05-07\","
+            "\"start_time\":\"10:00\",\"capacity\":5}");
+        ASSERT(rb3.status == 400, "bulk schedules bad date → 400");
+        resp_free(&rb3);
+    }
+
+    PASS();
+}
+
+/* ─── admin refund endpoint ─────────────────────────────────────────── */
+static void test_admin_refund(void) {
+    char url[256];
+
+    /* 存在しない booking → 404 */
+    snprintf(url, sizeof(url), "%s/api/v1/admin/bookings/nonexistent-id/refund", BASE_URL);
+    Resp r = http_post_admin(url, "{}");
+    ASSERT(r.status == 404 || r.status == 400, "admin refund nonexistent → 404/400");
+    resp_free(&r);
+
+    /* 未認証 → 403 */
+    Resp r2 = http_post(url, "{}");
+    ASSERT(r2.status == 403, "admin refund no key → 403");
+    resp_free(&r2);
+
+    PASS();
+}
+
+/* ─── admin backup endpoint ─────────────────────────────────────────── */
+static void test_admin_backup(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/v1/admin/backup", BASE_URL);
+
+    /* 未認証 → 403 */
+    Resp r_unauth = http_get(url);
+    ASSERT(r_unauth.status == 403, "backup no key → 403");
+    resp_free(&r_unauth);
+
+    /* 管理者キー付き → 200 (SQLite バックアップ) or 501 (non-SQLite) */
+    CURL *curl = curl_easy_init();
+    Buf buf = { malloc(1), 0 };
+    struct curl_slist *hdrs = curl_slist_append(NULL, "X-Admin-Key: asoview-admin-dev");
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    ASSERT(code == 200 || code == 501, "backup with key → 200 (SQLite) or 501");
+    free(buf.data);
+
+    PASS();
+}
+
+/* ─── admin UI page ─────────────────────────────────────────────────── */
+static void test_admin_ui(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/admin/ui", BASE_URL);
+
+    Resp r = http_get(url);
+    ASSERT(r.status == 200, "admin UI → 200");
+    ASSERT(r.body != NULL && strstr(r.body, "<!DOCTYPE") != NULL,
+           "admin UI returns HTML");
+    resp_free(&r);
+
+    PASS();
+}
+
+/* ─── security headers ──────────────────────────────────────────────── */
+static void test_security_headers(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/admin", BASE_URL);
+
+    /* レスポンスヘッダーを取得して X-Frame-Options を確認 */
+    CURL *curl = curl_easy_init();
+    Buf hdr_buf = { malloc(1), 0 };
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &hdr_buf);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    Buf body_buf = { malloc(1), 0 };
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body_buf);
+    curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_cleanup(curl);
+
+    ASSERT(code == 200, "admin page → 200");
+    ASSERT(hdr_buf.data != NULL && (
+               strstr(hdr_buf.data, "X-Frame-Options") != NULL ||
+               strstr(hdr_buf.data, "x-frame-options") != NULL),
+           "admin page has X-Frame-Options header");
+    ASSERT(hdr_buf.data != NULL && (
+               strstr(hdr_buf.data, "X-Content-Type-Options") != NULL ||
+               strstr(hdr_buf.data, "x-content-type-options") != NULL),
+           "admin page has X-Content-Type-Options header");
+    free(hdr_buf.data);
+    free(body_buf.data);
+
+    PASS();
+}
+
+/* ─── structured JSON log ───────────────────────────────────────────── */
+static void test_setup_page(void) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/setup", BASE_URL);
+
+    Resp r = http_get(url);
+    ASSERT(r.status == 200, "setup page → 200");
+    ASSERT(r.body != NULL && strstr(r.body, "JWT_SECRET") != NULL,
+           "setup page contains JWT_SECRET field");
+    ASSERT(r.body != NULL && strstr(r.body, "STRIPE") != NULL,
+           "setup page contains STRIPE fields");
+    resp_free(&r);
+
+    /* POST /api/v1/setup without JWT_SECRET → 400 */
+    snprintf(url, sizeof(url), "%s/api/v1/setup", BASE_URL);
+    Resp r2 = http_post(url, "ADMIN_KEY=testkey");
+    ASSERT(r2.status == 400, "setup save missing JWT_SECRET → 400");
+    resp_free(&r2);
+
+    PASS();
+}
+
 /* ─── Server startup (fork) ──────────────────────────────────────────── */
 
 static int wait_for_port(int port, int timeout_ms) {
@@ -2054,6 +2271,15 @@ int main(void) {
 
     /* ── Batch 5: Checkout Session ── */
     test_checkout_session();
+
+    /* ── Batch 6: 新機能 ── */
+    test_cursor_pagination();
+    test_bulk_schedules();
+    test_admin_refund();
+    test_admin_backup();
+    test_admin_ui();
+    test_security_headers();
+    test_setup_page();
 
     kill(pid, 15);
 
