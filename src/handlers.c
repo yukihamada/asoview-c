@@ -533,7 +533,8 @@ void handle_create_user(struct mg_connection *c, struct mg_http_message *hm, DbC
 
     if (rc == -1) {
         const char *errmsg = db_errmsg(db);
-        if (errmsg && strstr(errmsg, "UNIQUE"))
+        if (errmsg && (strstr(errmsg, "UNIQUE") || strstr(errmsg, "unique") ||
+                       strstr(errmsg, "duplicate") || strstr(errmsg, "Duplicate")))
             send_error_json(c, 409, "このメールアドレスは既に登録されています");
         else
             send_error_json(c, 500, "database error");
@@ -1268,9 +1269,10 @@ void handle_cancel_booking(struct mg_connection *c, struct mg_http_message *hm,
 
     DbStmt *dec = NULL;
     dec = db_prepare(db,
-        "UPDATE schedules SET booked_count = MAX(0, booked_count - ?) WHERE id=?");
+        "UPDATE schedules SET booked_count = CASE WHEN booked_count > ? THEN booked_count - ? ELSE 0 END WHERE id=?");
     db_bind_int(dec, 1, total_people);
-    db_bind_int(dec, 2, sched_id);
+    db_bind_int(dec, 2, total_people);
+    db_bind_int(dec, 3, sched_id);
     db_step(dec); db_finalize(dec);
 
     /* Stripe 返金（payment_intent_id がある場合） */

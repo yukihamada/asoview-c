@@ -14,6 +14,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* my_bool was removed in MySQL 8.0.26+ / MariaDB Connector/C 3.x */
+#ifndef my_bool
+typedef char my_bool;
+#endif
+
 /* ─── 内部構造体 ─────────────────────────────────────────────────────────── */
 
 #define MAX_COLS   64
